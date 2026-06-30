@@ -150,6 +150,36 @@ impl AppState {
         !self.ed25519_pubkeys.is_empty()
     }
 
+    /// The object store backing this state's spaces.
+    pub fn object_store(&self) -> Arc<dyn ObjectStore> {
+        self.object_store.clone()
+    }
+
+    /// Removes a space entry from the in-process cache. Used by the eval
+    /// harness after a run-scoped space is closed and its objects deleted,
+    /// so nothing can reopen a half-removed space through the cache.
+    pub async fn evict_space(&self, space_id: &str) {
+        self.spaces.write().await.remove(space_id);
+    }
+
+    /// A sibling `AppState` over a different object store, sharing model and
+    /// management configuration but with an empty space cache. Used by the
+    /// eval harness to open forked space copies in isolation.
+    pub fn fork_with_store(&self, object_store: Arc<dyn ObjectStore>) -> AppState {
+        AppState {
+            spaces: Arc::new(RwLock::new(BTreeMap::new())),
+            object_store,
+            db_config: self.db_config.clone(),
+            http_client: self.http_client.clone(),
+            models: self.models.clone(),
+            ed25519_pubkeys: self.ed25519_pubkeys.clone(),
+            management: self.management.clone(),
+            app_name: self.app_name.clone(),
+            app_version: self.app_version.clone(),
+            sharding: self.sharding,
+        }
+    }
+
     // 平台管理员权限
     pub fn check_admin(
         &self,
@@ -1177,6 +1207,77 @@ impl Space {
     }
 }
 
+impl Space {
+    /// One-shot completion on this space's model, used only by the eval
+    /// harness (judge, user simulator, prompt optimizer). Not exposed over
+    /// HTTP/MCP.
+    pub(crate) async fn eval_complete(
+        &self,
+        req: anda_core::CompletionRequest,
+    ) -> Result<AgentOutput, BoxError> {
+        use anda_core::CompletionFeatures;
+
+        let ctx = self.engine.ctx_with(
+            SELF_USER_ID,
+            RecallAgent::NAME,
+            RecallAgent::NAME,
+            Default::default(),
+        )?;
+        ctx.completion(req, Vec::new()).await
+    }
+}
+
+/// Copies every object of a space (`{space_id}/**`) from one object store to
+/// another, preserving paths. This is the eval fork primitive: AndaDB
+/// metadata embeds its own base path, so a space must keep its id and be
+/// forked into a *different* store — never renamed inside the same store.
+pub async fn copy_space_objects(
+    src: &Arc<dyn ObjectStore>,
+    dst: &Arc<dyn ObjectStore>,
+    space_id: &str,
+) -> Result<u64, BoxError> {
+    use futures::TryStreamExt;
+    use object_store::ObjectStoreExt;
+
+    let prefix = object_store::path::Path::from(space_id);
+    let mut objects = src.list(Some(&prefix));
+    let mut copied = 0u64;
+    while let Some(meta) = objects.try_next().await? {
+        let payload = src.get(&meta.location).await?.bytes().await?;
+        dst.put(&meta.location, payload.into()).await?;
+        copied += 1;
+    }
+    if copied == 0 {
+        return Err(format!("space {space_id} has no objects to copy").into());
+    }
+    Ok(copied)
+}
+
+/// Deletes every object of a space (`{space_id}/**`) from the store. Used by
+/// the eval harness to remove run-scoped spaces after a run; the space must
+/// be closed first.
+pub async fn delete_space_objects(
+    store: &Arc<dyn ObjectStore>,
+    space_id: &str,
+) -> Result<u64, BoxError> {
+    use futures::TryStreamExt;
+    use object_store::ObjectStoreExt;
+
+    let prefix = object_store::path::Path::from(space_id);
+    // Collect before deleting: mutating while listing can invalidate the
+    // stream on some backends.
+    let locations: Vec<_> = store
+        .list(Some(&prefix))
+        .map_ok(|meta| meta.location)
+        .try_collect()
+        .await?;
+    let deleted = locations.len() as u64;
+    for location in locations {
+        store.delete(&location).await?;
+    }
+    Ok(deleted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1372,6 +1473,93 @@ mod tests {
         .unwrap();
 
         app.load_space(id, false).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn copy_space_objects_forks_space_into_isolated_store() {
+        let app = test_app_state("fork_src");
+        let space = create_loaded_space(&app, "fork_space").await;
+        space
+            .update(
+                UpdateSpaceInput {
+                    name: Some("before fork".to_string()),
+                    description: None,
+                    public: None,
+                },
+                unix_ms(),
+            )
+            .await
+            .unwrap();
+        space.db.close().await.unwrap();
+
+        let fork_store: Arc<dyn super::ObjectStore> = Arc::new(InMemory::new());
+        let copied = super::copy_space_objects(&app.object_store(), &fork_store, "fork_space")
+            .await
+            .unwrap();
+        assert!(copied > 0);
+
+        // Copying a missing space fails loudly instead of forking nothing.
+        let empty: Arc<dyn super::ObjectStore> = Arc::new(InMemory::new());
+        assert!(
+            super::copy_space_objects(&app.object_store(), &empty, "missing_space")
+                .await
+                .is_err()
+        );
+
+        // The fork opens under the same id in its own store, sees the same
+        // state, and mutations do not leak back to the source store.
+        let fork_state = app.fork_with_store(fork_store);
+        let fork = fork_state.load_space("fork_space", true).await.unwrap();
+        assert_eq!(fork.get_info().name.as_deref(), Some("before fork"));
+        fork.update(
+            UpdateSpaceInput {
+                name: Some("after fork".to_string()),
+                description: None,
+                public: None,
+            },
+            unix_ms(),
+        )
+        .await
+        .unwrap();
+        fork.db.close().await.unwrap();
+
+        let fork_store2: Arc<dyn super::ObjectStore> = Arc::new(InMemory::new());
+        super::copy_space_objects(&app.object_store(), &fork_store2, "fork_space")
+            .await
+            .unwrap();
+        let fork_state2 = app.fork_with_store(fork_store2);
+        let fork2 = fork_state2.load_space("fork_space", true).await.unwrap();
+        assert_eq!(fork2.get_info().name.as_deref(), Some("before fork"));
+        fork2.db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_space_objects_removes_run_scoped_space() {
+        let app = test_app_state("delete_src");
+        let space = create_loaded_space(&app, "delete_space").await;
+        space.db.close().await.unwrap();
+
+        let deleted = super::delete_space_objects(&app.object_store(), "delete_space")
+            .await
+            .unwrap();
+        assert!(deleted > 0);
+        app.evict_space("delete_space").await;
+
+        // The prefix is empty afterwards: forking the deleted space fails.
+        let empty: Arc<dyn super::ObjectStore> = Arc::new(InMemory::new());
+        assert!(
+            super::copy_space_objects(&app.object_store(), &empty, "delete_space")
+                .await
+                .is_err()
+        );
+
+        // Deleting an already-empty prefix is a no-op, not an error.
+        assert_eq!(
+            super::delete_space_objects(&app.object_store(), "delete_space")
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

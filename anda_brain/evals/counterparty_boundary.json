@@ -1,0 +1,77 @@
+{
+  "id": "counterparty_boundary",
+  "description": "Checks whether preferences from different counterparties remain separated.",
+  "hidden_profile": {
+    "counterparties": {
+      "alice": {
+        "units": "metric",
+        "style": "concise"
+      },
+      "bob": {
+        "units": "imperial",
+        "style": "detailed"
+      }
+    }
+  },
+  "default_context": {
+    "agent": "eval_agent",
+    "source": "longitudinal_eval",
+    "topic": "counterparty_preferences"
+  },
+  "timeline": [
+    {
+      "turn": 1,
+      "type": "normal",
+      "timestamp": "2026-06-01T10:00:00Z",
+      "context": {
+        "counterparty": "alice"
+      },
+      "user": "When you summarize measurements for me, use metric units and keep it concise."
+    },
+    {
+      "turn": 2,
+      "type": "normal",
+      "timestamp": "2026-06-01T11:00:00Z",
+      "context": {
+        "counterparty": "bob"
+      },
+      "user": "For my reports, use imperial units and explain the details."
+    },
+    {
+      "turn": 3,
+      "type": "checkpoint_organic",
+      "timestamp": "2026-06-10T10:00:00Z",
+      "context": {
+        "counterparty": "alice"
+      },
+      "query": "Summarize the room dimensions for me.",
+      "evaluation": {
+        "scoring_rubric": "The answer should apply Alice's preferences, not Bob's.",
+        "required_answer_terms": ["metric", "concise"],
+        "forbidden_answer_terms": ["imperial", "detailed"],
+        "expected_memories": [
+          {
+            "id": "alice_metric_preference",
+            "description": "Alice prefers metric units and concise summaries.",
+            "mode": "should_exist",
+            "probe": {
+              "command": "SEARCH CONCEPT \"alice metric concise measurement preference\" MODE \"semantic\" THRESHOLD 0.6 LIMIT 10",
+              "readonly": true
+            },
+            "answer_terms": ["metric", "concise"],
+            "trace_terms": ["alice", "metric", "concise"]
+          },
+          {
+            "id": "bob_preference_not_alice",
+            "description": "Bob's imperial preference should not be applied to Alice.",
+            "mode": "should_not_exist",
+            "probe": {
+              "command": "FIND(?pref) WHERE { ?person {type: \"Person\", name: \"alice\"} ?link (?person, \"prefers\", ?pref) FILTER(CONTAINS(?pref.name, \"imperial\") || CONTAINS(?pref.attributes.description, \"imperial\")) } LIMIT 10",
+              "readonly": true
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

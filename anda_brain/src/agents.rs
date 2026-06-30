@@ -1,5 +1,6 @@
 mod formation;
 mod maintenance;
+pub mod prompts;
 mod recall;
 
 use anda_core::{BoxError, ContentPart, Document, Message, Principal};

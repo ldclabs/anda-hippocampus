@@ -1,0 +1,73 @@
+{
+  "id": "expiring_discount",
+  "description": "Checks whether expired time-sensitive facts stop influencing later answers.",
+  "hidden_profile": {
+    "discounts": {
+      "old_code": "SPRING20",
+      "status": "expired"
+    }
+  },
+  "default_context": {
+    "counterparty": "user_042",
+    "agent": "eval_agent",
+    "source": "longitudinal_eval",
+    "topic": "pricing"
+  },
+  "timeline": [
+    {
+      "turn": 1,
+      "type": "normal",
+      "timestamp": "2026-03-01T12:00:00Z",
+      "user": "For March proposals, we can mention discount code SPRING20."
+    },
+    {
+      "turn": 2,
+      "type": "normal",
+      "timestamp": "2026-04-15T12:00:00Z",
+      "user": "SPRING20 is expired now. Do not use that code in new pricing notes."
+    },
+    {
+      "turn": 3,
+      "type": "maintenance",
+      "timestamp": "2026-04-16T03:00:00Z",
+      "maintenance": {
+        "trigger": "on_demand",
+        "scope": "quick",
+        "timestamp": "2026-04-16T03:00:00Z"
+      }
+    },
+    {
+      "turn": 4,
+      "type": "checkpoint_synthetic",
+      "timestamp": "2026-05-01T12:00:00Z",
+      "query": "Write a pricing follow-up for a new prospect.",
+      "evaluation": {
+        "scoring_rubric": "The answer should avoid expired discount codes and default to current pricing language.",
+        "required_answer_terms": ["current pricing"],
+        "forbidden_answer_terms": ["SPRING20"],
+        "expected_memories": [
+          {
+            "id": "expired_discount",
+            "description": "SPRING20 is expired and should not be used for new pricing.",
+            "mode": "should_exist",
+            "probe": {
+              "command": "SEARCH CONCEPT \"SPRING20 expired do not use pricing\" MODE \"semantic\" THRESHOLD 0.6 LIMIT 10",
+              "readonly": true
+            },
+            "answer_terms": ["current pricing"],
+            "trace_terms": ["SPRING20", "expired"]
+          },
+          {
+            "id": "active_old_discount",
+            "description": "The expired code should not remain active for new prospects.",
+            "mode": "should_not_exist",
+            "probe": {
+              "command": "FIND(?code) WHERE { ?code {type: \"Discount\"} FILTER(CONTAINS(?code.name, \"SPRING20\") || CONTAINS(?code.attributes.description, \"SPRING20\")) FILTER(IS_NULL(?code.metadata.expired) || ?code.metadata.expired != true) } LIMIT 10",
+              "readonly": true
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
