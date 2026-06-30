@@ -1,0 +1,56 @@
+{
+  "id": "project_budget",
+  "description": "Checks whether project context and rough budget survive later task requests.",
+  "hidden_profile": {
+    "projects": {
+      "home_renovation": {
+        "budget": "$200k",
+        "location": "Orange County, CA"
+      }
+    }
+  },
+  "default_context": {
+    "counterparty": "user_042",
+    "agent": "eval_agent",
+    "source": "longitudinal_eval",
+    "topic": "home_renovation"
+  },
+  "timeline": [
+    {
+      "turn": 1,
+      "type": "normal",
+      "timestamp": "2026-02-01T10:00:00Z",
+      "user": "I'm starting a home renovation project in Orange County."
+    },
+    {
+      "turn": 2,
+      "type": "normal",
+      "timestamp": "2026-02-02T10:00:00Z",
+      "user": "The rough budget is about $200k, but I want to avoid sounding too locked in when talking to contractors."
+    },
+    {
+      "turn": 3,
+      "type": "checkpoint_synthetic",
+      "timestamp": "2026-02-20T10:00:00Z",
+      "query": "Write an email to follow up on the renovation cost with the general contractor.",
+      "evaluation": {
+        "scoring_rubric": "The answer should pull in project context without pretending the budget is exact.",
+        "required_answer_terms": ["renovation", "$200k"],
+        "forbidden_answer_terms": ["exact budget", "guaranteed"],
+        "expected_memories": [
+          {
+            "id": "renovation_budget",
+            "description": "Home renovation project has a rough budget around $200k.",
+            "mode": "should_exist",
+            "probe": {
+              "command": "SEARCH CONCEPT \"home renovation budget 200k Orange County\" MODE \"semantic\" THRESHOLD 0.6 LIMIT 10",
+              "readonly": true
+            },
+            "answer_terms": ["renovation", "$200k"],
+            "trace_terms": ["renovation", "200k", "Orange County"]
+          }
+        ]
+      }
+    }
+  ]
+}

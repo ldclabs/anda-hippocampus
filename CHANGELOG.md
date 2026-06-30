@@ -2,6 +2,22 @@
 
 All notable changes to the Anda Brain project.
 
+## [Unreleased] — 2026-07-03
+
+### Added
+- **Checkpoint sampling with variance-aware gates.** Eval profiles accept `checkpoint_samples: N` (or `--checkpoint-samples`) to run Recall N times per checkpoint, reporting mean scores plus a propagated `total_stddev`; findings only count with majority support across samples, and `--confidence-z` makes `--min-score` gate on the lower confidence bound instead of a single noisy roll.
+- **Shared-formation experiments.** `anda_brain eval --shared-formation` replays formation once per scenario, snapshots the space objects, and forks the snapshot into an isolated in-memory store per profile (`space::copy_space_objects` + `AppState::fork_with_store`), so maintenance policies are compared on identical encoded memory without formation LLM variance — and the most expensive phase runs once instead of once per profile.
+- **LLM-as-judge scoring.** Profiles with `"judge": "llm"` score checkpoint answers against the rubric's previously unused `scoring_rubric` and the scenario `hidden_profile`: paraphrases count fully, correct meta-references to superseded facts are no longer penalized as stale, and the judge emits attributed findings plus a per-checkpoint satisfaction signal. Lexical scoring remains the deterministic default.
+- **Semantic graph probes.** Memory expectations accept a natural-language `assertion` (with optional `search` text) instead of hand-written KQL; the harness runs a semantic search and lets the judge decide whether the evidence shows the asserted memory state, staying correct across valid graph-encoding variations.
+- **Noise pressure and simulated users.** Scenarios accept a deterministic `noise` config (seeded corpus injection between anchors) and `"type": "simulated"` turns whose messages are written by an eval-only user simulator from the hidden profile, transcript, and satisfaction trail; reports carry a `satisfaction_trajectory`.
+- **Trajectory metrics and real graph health.** Aggregate scores weight later checkpoints more, `evolution_quality` now measures late-vs-early checkpoint improvement instead of re-averaging other components, and `graph_health` reads real metabolism counters (unsorted backlog, orphans) through read-only KIP.
+- **Prompt optimization loop.** `anda_brain eval --optimize formation|recall|maintenance|auto` treats the three agent prompts as an evolvable genome: attributed failures drive an optimizer LLM that proposes surgical find/replace edits, candidates are re-evaluated on fresh spaces, and edits are kept only when they beat the baseline beyond the sampling noise band. Accepted prompts and the decision log are written to `--optimize-out` for human review; agents read prompts through a new `agents::prompts` override layer.
+- **Longitudinal memory eval harness.** `anda_brain::eval` can replay user timelines through Formation, optional Maintenance, and Recall checkpoints; score memory utility, forgetting quality, graph health, uncertainty, latency, and token cost; and attribute failures to Formation, Recall, Maintenance, grounding, synthesis, or overconfidence.
+- **`anda_brain eval` CLI command.** Local eval runs now support single scenarios, scenario suites, profile comparisons, JSON report output, score/finding gates for CI, and starter scenarios/profiles under `anda_brain/evals/`.
+- **Eval gate artifacts.** Gated `anda_brain eval` runs now embed the gate criteria, pass/fail state, and failure messages in the JSON report before returning a non-zero CI exit.
+- **Eval validate-only mode.** `anda_brain eval --validate-only` now checks scenario/profile inputs offline, emits an `EvalValidationReport`, and fails before model or storage initialization when inputs are unsafe.
+- **Eval fixture CI and summaries.** CI now runs the starter eval fixtures through offline validation, `anda_brain eval --summary-only` prints compact human-readable summaries, and the starter suite includes additional fact-correction, counterparty-boundary, travel-logistics, and expiring-discount scenarios.
+
 ## [0.9.2] — 2026-06-28
 
 ### Changed

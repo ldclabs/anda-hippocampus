@@ -36,6 +36,7 @@ Anda Brain is designed to be **self-hosted** (the hosted cloud service has been 
 - **Triple serialization** — Supports JSON, CBOR, and Markdown for request/response payloads (negotiated via `Content-Type` / `Accept` headers).
 - **Built-in MCP server** — MCP-capable agents can use Anda Brain through Streamable HTTP or stdio tools without writing REST glue code.
 - **Pluggable storage backends** — Local filesystem, AWS S3, or in-memory (for development/testing).
+- **Longitudinal eval harness** — Development/CI support for replaying user timelines, probing graph state, scoring checkpoints, and attributing memory failures to Formation, Recall, or Maintenance.
 
 ## Agents
 
@@ -96,6 +97,187 @@ Consolidates, prunes, and optimizes the knowledge graph during scheduled or on-d
 - Single-execution guard — only one maintenance cycle can run at a time per space.
 - Non-destructive principle — archives before deleting, decays confidence rather than removing.
 - Async execution — returns immediately with conversation ID; actual processing in background.
+
+## Longitudinal Evaluation
+
+Anda Brain includes an eval-first harness in `anda_brain::eval`. It drives the
+same deep interface used by real callers:
+
+1. Replay normal turns through Formation.
+2. Optionally trigger Maintenance by explicit turns or every N normal turns.
+3. Run checkpoint turns through Recall.
+4. Execute read-only KIP probes before each checkpoint.
+5. Score answer utility, forgetting quality, graph health, uncertainty, latency,
+   and token cost.
+6. Attribute failures to `formation_miss`, `bad_consolidation`,
+   `bad_grounding`, `bad_synthesis`, or `overconfidence`.
+
+The harness is intended for local experiments, regression tests, and CI
+benchmarks. It is not a public HTTP endpoint. See
+[`evals/style_preference.json`](evals/style_preference.json) for a minimal
+scenario shape.
+
+Beyond the basic replay loop, the harness supports:
+
+- **Sampling & variance** — `checkpoint_samples: N` in a profile (or
+  `--checkpoint-samples N`) runs Recall N times per checkpoint and reports the
+  mean score plus `total_stddev` (propagated through suite and experiment
+  aggregates). Findings only count when they appear in a majority of samples.
+  `--confidence-z Z` makes `--min-score` gate on `total - Z * stddev`, so a
+  lucky single roll cannot pass CI.
+- **LLM judge** — `"judge": "llm"` in a profile scores each answer against the
+  checkpoint's `scoring_rubric` and the scenario's `hidden_profile`.
+  Paraphrases count fully, and correct meta-references to superseded facts
+  ("unlike your old BBQ preference…") are not penalized as stale. The judge
+  also emits attributed findings and a per-checkpoint `satisfaction` signal.
+  The lexical scorer remains the default for deterministic smoke runs.
+- **Semantic probes** — an expectation may state an `assertion` in natural
+  language ("an active, non-superseded BBQ preference for user_042") instead
+  of hand-written KQL. The harness runs a semantic graph search and asks the
+  judge whether the evidence shows the statement, so probes stay correct
+  across valid encoding variations. Raw `probe` KQL remains as fallback.
+- **Noise pressure** — a scenario-level `noise` config deterministically
+  inserts chit-chat turns between authored anchors (`between_turns`, `seed`,
+  optional `corpus`), scaling a 6-turn script into a long timeline where
+  Formation must keep the needle in a haystack.
+- **Simulated users** — `"type": "simulated"` turns carry an `intent`; an
+  eval-only user simulator writes the actual message from `hidden_profile`,
+  the recent transcript, and the satisfaction trail, adapting its behavior
+  when the memory system has been failing it. Reports include a
+  `satisfaction_trajectory` — the survival-pressure signal.
+- **Trajectory metrics** — aggregate scores weight later checkpoints more
+  (an established memory failing late costs more than an early miss), and
+  `evolution_quality` compares late-half vs early-half checkpoint scores:
+  above 0.5 means the system improved over the timeline. `graph_health` reads
+  real metabolism counters (unsorted backlog, orphans) via read-only KIP
+  instead of probe execution success.
+- **Shared-formation experiments** — `--shared-formation` (with multiple
+  `--profile`) replays formation once per scenario, snapshots the space, and
+  forks the snapshot into an isolated in-memory store per profile. Every
+  maintenance policy is then measured on identical encoded memory, removing
+  formation LLM variance as a confound — and the most expensive phase runs
+  once instead of once per profile. Requires all user turns to precede the
+  first checkpoint (validated); use the default interleaved mode otherwise.
+- **Prompt optimization** — `--optimize formation|recall|maintenance|auto`
+  runs an offline evolution loop with the eval suite as fitness: attributed
+  failures are fed to an optimizer LLM that proposes surgical find/replace
+  edits to the responsible agent prompt; the candidate suite must beat the
+  baseline beyond the sampling noise band to be kept, otherwise it is
+  reverted. Accepted prompts and the full decision log are written to
+  `--optimize-out` (default `./eval_optimize`) for human review — nothing is
+  written back to `assets/`.
+
+Validate scenario/profile inputs without running models:
+
+```bash
+cargo run -p anda_brain -- \
+  eval \
+  --scenario anda_brain/evals/style_preference.json \
+  --scenario anda_brain/evals/project_budget.json \
+  --profile anda_brain/evals/default_profile.json \
+  --validate-only \
+  --summary-only
+```
+
+Run a scenario locally:
+
+```bash
+cargo run -p anda_brain -- \
+  --model-api-key "$MODEL_API_KEY" \
+  eval \
+  --space-id style_eval \
+  --scenario anda_brain/evals/style_preference.json \
+  --profile anda_brain/evals/default_profile.json \
+  --output /tmp/style_eval_report.json \
+  local --db /tmp/anda-brain-eval-db
+```
+
+Run a small suite by repeating `--scenario`. The suite writes one
+`EvalSuiteReport` with per-scenario reports plus aggregate score, usage, and
+failure attribution:
+
+```bash
+cargo run -p anda_brain -- \
+  --model-api-key "$MODEL_API_KEY" \
+  eval \
+  --space-id memory_suite \
+  --scenario anda_brain/evals/style_preference.json \
+  --scenario anda_brain/evals/project_budget.json \
+  --scenario anda_brain/evals/preference_reversal.json \
+  --profile anda_brain/evals/default_profile.json \
+  --output /tmp/anda_brain_eval_suite.json \
+  local --db /tmp/anda-brain-eval-suite-db
+```
+
+Compare maintenance policies by repeating both `--scenario` and `--profile`.
+The experiment writes one `EvalExperimentReport` with `best_suite_id` and
+ranked `comparisons`, so profiles can be compared by quality, findings, and
+token cost:
+
+```bash
+cargo run -p anda_brain -- \
+  --model-api-key "$MODEL_API_KEY" \
+  eval \
+  --space-id memory_experiment \
+  --scenario anda_brain/evals/style_preference.json \
+  --scenario anda_brain/evals/project_budget.json \
+  --scenario anda_brain/evals/preference_reversal.json \
+  --profile anda_brain/evals/no_maintenance_profile.json \
+  --profile anda_brain/evals/default_profile.json \
+  --profile anda_brain/evals/quick_profile.json \
+  --output /tmp/anda_brain_eval_experiment.json \
+  local --db /tmp/anda-brain-eval-experiment-db
+```
+
+Add `--summary-only` to any eval command to print a compact human-readable
+summary instead of JSON. Omit it for artifacts intended for CI or downstream
+analysis.
+
+Use gates in CI to fail when aggregate quality falls below a floor. The report
+is written before the command exits non-zero, and gated runs include a top-level
+`gate` object with the criteria, pass/fail state, and failure messages:
+
+```bash
+cargo run -p anda_brain -- \
+  --model-api-key "$MODEL_API_KEY" \
+  eval \
+  --space-id memory_ci \
+  --scenario anda_brain/evals/style_preference.json \
+  --scenario anda_brain/evals/project_budget.json \
+  --profile anda_brain/evals/default_profile.json \
+  --output /tmp/anda_brain_ci_eval.json \
+  --min-score 0.75 \
+  --max-findings 3 \
+  local --db /tmp/anda-brain-ci-eval-db
+```
+
+Report shapes:
+
+- `EvalValidationReport`: emitted by `--validate-only`; contains `passed`, `planned_runs`, scenario/profile plans, and validation `issues` with `error` or `warning` severity.
+- `EvalReport`: single scenario result; contains `scenario_id`, aggregate `score`, optional `total_stddev`, `attribution`, `usage`, `satisfaction_trajectory`, optional `gate`, and per-turn reports (with per-sample scores, probes, graph stats, and judge reasoning).
+- `EvalSuiteReport`: one profile across multiple scenarios; contains `suite_id`, aggregate `score`, optional `total_stddev`, `attribution`, `usage`, optional `gate`, and child `reports`.
+- `EvalExperimentReport`: multiple profiles across the same scenario set; contains `experiment_id`, aggregate `score`, optional `total_stddev`, `best_suite_id`, ranked `comparisons`, optional `shared_formation` reports, optional `gate`, and child `suites`.
+- `EvalScore`: normalized `total`, `memory_utility`, `evolution_quality`, `uncertainty_calibration`, `forgetting_quality`, `graph_health`, `latency_penalty`, and `token_cost_penalty`.
+- `AttributionSummary`: counts failures by `formation_miss`, `bad_consolidation`, `bad_grounding`, `bad_synthesis`, `overconfidence`, `graph_probe_error`, `latency_cost`, `token_cost`, and `judge_error`.
+- `OptimizeReport`: emitted by `--optimize`; contains `baseline_total`, `final_total`, per-generation edits with accept/reject decisions, and `accepted_prompts`.
+
+Included starter scenarios:
+
+- [`evals/style_preference.json`](evals/style_preference.json) — long-term writing style preference.
+- [`evals/project_budget.json`](evals/project_budget.json) — project context and rough budget recall.
+- [`evals/preference_reversal.json`](evals/preference_reversal.json) — newer preference superseding stale preference.
+- [`evals/fact_correction.json`](evals/fact_correction.json) — corrected fact superseding stale fact.
+- [`evals/counterparty_boundary.json`](evals/counterparty_boundary.json) — preferences isolated by counterparty.
+- [`evals/travel_logistics.json`](evals/travel_logistics.json) — durable travel logistics and preferences.
+- [`evals/expiring_discount.json`](evals/expiring_discount.json) — expired time-sensitive facts not reused.
+- [`evals/noisy_style_preference.json`](evals/noisy_style_preference.json) — longitudinal pressure: style preferences must survive injected noise and a simulated follow-up, measured at two checkpoints for trajectory.
+
+Included starter profiles:
+
+- [`evals/no_maintenance_profile.json`](evals/no_maintenance_profile.json) — Formation plus Recall without scheduled maintenance.
+- [`evals/default_profile.json`](evals/default_profile.json) — daydream maintenance every two normal turns.
+- [`evals/quick_profile.json`](evals/quick_profile.json) — quick maintenance every two normal turns.
+- [`evals/llm_judge_profile.json`](evals/llm_judge_profile.json) — LLM judge with three recall samples per checkpoint for mean±stddev scoring.
 
 ## API Endpoints
 

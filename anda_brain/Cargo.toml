@@ -32,6 +32,7 @@ cbor2 = { workspace = true }
 dotenv = { workspace = true }
 ic_auth_types = { workspace = true }
 ic_cose_types = { workspace = true }
+futures = { workspace = true }
 parking_lot = { workspace = true }
 tokio-util = { workspace = true }
 structured-logger = { workspace = true }

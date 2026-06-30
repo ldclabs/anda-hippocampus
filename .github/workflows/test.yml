@@ -27,6 +27,20 @@ jobs:
         run: brew install protobuf
       - name: Install Rust stable
         run: rustup update --no-self-update stable
+      - name: Validate eval fixtures
+        run: >
+          cargo run -p anda_brain -- eval
+          --scenario anda_brain/evals/style_preference.json
+          --scenario anda_brain/evals/project_budget.json
+          --scenario anda_brain/evals/preference_reversal.json
+          --scenario anda_brain/evals/fact_correction.json
+          --scenario anda_brain/evals/counterparty_boundary.json
+          --scenario anda_brain/evals/travel_logistics.json
+          --scenario anda_brain/evals/expiring_discount.json
+          --profile anda_brain/evals/no_maintenance_profile.json
+          --profile anda_brain/evals/default_profile.json
+          --profile anda_brain/evals/quick_profile.json
+          --validate-only
       - name: Run clippy
         run: cargo clippy --all-targets --all-features
       - name: Run tests

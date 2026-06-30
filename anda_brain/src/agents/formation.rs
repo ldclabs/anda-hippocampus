@@ -26,6 +26,9 @@ use std::{
 use super::{BrainHook, append_runner_history, compact_runner_if_needed, push_completed_history};
 use crate::types::FormationInput;
 
+// Kept for reference; the runtime prompt comes from `prompts::active_prompt`
+// so the eval optimizer can install candidate prompts.
+#[allow(dead_code)]
 const SELF_INSTRUCTIONS: &str = include_str!("../../assets/BrainFormation.md");
 const REVIEW_INSTRUCTIONS: &str = include_str!("../../assets/BrainFormationReview.md");
 
@@ -336,7 +339,7 @@ impl FormationAgent {
             CompletionRequest {
                 instructions: format!(
                     "{}\n\n---\n\n# `DESCRIBE PRIMER` Result:\n{}\n\n---\n\n# Your Notes:\n{}\n\n# Counterparty Profile:\n{}\n\n# Current Datetime: {}",
-                    SELF_INSTRUCTIONS,
+                    super::prompts::active_prompt(super::prompts::PromptTarget::Formation),
                     primer,
                     serde_json::to_string(&notes.items).unwrap_or_default(),
                     serde_json::to_string(&counterparty_info).unwrap_or_default(),

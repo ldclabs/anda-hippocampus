@@ -1,0 +1,65 @@
+{
+  "id": "travel_logistics",
+  "description": "Checks recall of durable travel logistics and seat preference across later planning turns.",
+  "hidden_profile": {
+    "travel": {
+      "home_airport": "SFO",
+      "seat_preference": "aisle"
+    }
+  },
+  "default_context": {
+    "counterparty": "user_042",
+    "agent": "eval_agent",
+    "source": "longitudinal_eval",
+    "topic": "travel_planning"
+  },
+  "timeline": [
+    {
+      "turn": 1,
+      "type": "normal",
+      "timestamp": "2026-07-01T08:00:00Z",
+      "user": "For work travel, my home airport is SFO."
+    },
+    {
+      "turn": 2,
+      "type": "normal",
+      "timestamp": "2026-07-02T08:00:00Z",
+      "user": "I usually prefer an aisle seat on flights."
+    },
+    {
+      "turn": 3,
+      "type": "checkpoint_synthetic",
+      "timestamp": "2026-07-15T08:00:00Z",
+      "query": "Draft a quick flight search note for my next work trip.",
+      "evaluation": {
+        "scoring_rubric": "The answer should include durable travel logistics without inventing a destination.",
+        "required_answer_terms": ["SFO", "aisle"],
+        "forbidden_answer_terms": ["LAX", "window"],
+        "expected_memories": [
+          {
+            "id": "home_airport",
+            "description": "User's home airport is SFO.",
+            "mode": "should_exist",
+            "probe": {
+              "command": "SEARCH CONCEPT \"home airport SFO work travel\" MODE \"semantic\" THRESHOLD 0.6 LIMIT 10",
+              "readonly": true
+            },
+            "answer_terms": ["SFO"],
+            "trace_terms": ["SFO", "airport"]
+          },
+          {
+            "id": "seat_preference",
+            "description": "User prefers aisle seats on flights.",
+            "mode": "should_exist",
+            "probe": {
+              "command": "SEARCH CONCEPT \"flight aisle seat preference\" MODE \"semantic\" THRESHOLD 0.6 LIMIT 10",
+              "readonly": true
+            },
+            "answer_terms": ["aisle"],
+            "trace_terms": ["aisle", "seat"]
+          }
+        ]
+      }
+    }
+  ]
+}
