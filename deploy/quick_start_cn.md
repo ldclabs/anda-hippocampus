@@ -1,15 +1,15 @@
 # Anda Brain 快速开始
 
-本文提供一条从 0 到可用的最小流程，包含：
+本文提供了从零开始构建到服务可用的极简流程，包含：
 
-- 安装 `anda-cli`（优先）
+- 安装 `anda-cli`
 - 配置环境变量
-- 启动服务（本地构建 或 Docker，本地文件存储）
+- 运行服务（本地构建或 Docker 运行，使用本地文件存储）
 - 生成 CWT
 - 创建 Space
-- 提交 Formation
-- 执行 Recall
-- 读取会话记录
+- 提交记忆写入 (Formation)
+- 执行记忆召回 (Recall)
+- 查询会话历史记录
 
 ## 0. 前置条件
 
@@ -17,7 +17,7 @@
 - 已安装：`git`、`jq`、`curl`
 - 若使用本地构建：`rust`、`cargo`、`go`
 - 若使用 Docker：`docker`
-- 可用的大模型 API Key（例如 Gemini、MiniMax、小米 Mimo）
+- 可用的大语言模型 API Key（例如 Gemini、MiniMax、小米 Mimo）
 
 ## 1. 工作目录
 ```bash
@@ -26,9 +26,9 @@ cd anda-brain
 mkdir db
 ```
 
-## 2. 安装 `anda-cli`（先完成）
+## 2. 安装 `anda-cli`
 
-二选一：从 Releases 下载，或本地构建。
+您可以从 Releases 直接下载预编译文件，或者在本地进行编译构建。
 
 ### 方案 A：从 Releases 下载可执行文件（推荐）
 
@@ -59,7 +59,7 @@ cd ../anda-brain/
 ./anda-cli --help
 ```
 
-## 3. 准备变量与密钥
+## 3. 配置环境变量与密钥
 
 ### 3.1 生成 Ed25519 密钥（用于 CWT 签名）
 
@@ -70,7 +70,7 @@ cat keys.json
 
 ### 3.2 配置通用环境变量
 
-创建运行 Anda Brain 需要的 `.env` 文件，内容示例如下：
+在工作目录下创建运行 Anda Brain 所需的 `.env` 配置文件，示例如下：
 ```bash
 LOG_LEVEL='info'
 LISTEN_ADDR='0.0.0.0:8042'
@@ -86,9 +86,9 @@ MODEL_API_BASE='https://api.minimaxi.com/anthropic/v1'
 MODEL_API_KEY='YOUR_MODEL_API_KEY'
 ```
 
-## 4. 启动 Anda Brain（本地文件存储）
+## 4. 运行 Anda Brain 服务（本地文件存储）
 
-二选一：本地构建运行，或 Docker 运行（支持远端拉取镜像）。
+您可以选择在本地编译并运行，或者通过 Docker 运行（支持拉取远程镜像）。
 
 ### 方案 A：本地构建运行
 
@@ -132,7 +132,7 @@ docker run --rm --platform $DOCKER_PLATFORM -p 8042:8042 \
 docker buildx build --platform linux/arm64 -f anda_brain/Dockerfile -t anda_brain:local --load .
 ```
 
-### 4.2 验证服务可用
+### 4.3 验证服务是否可用
 
 另开一个终端执行：
 
@@ -149,7 +149,7 @@ curl -s "$ANDA_BASE_URL/info" | jq .
 
 ## 5. 生成 CWT
 
-### 5.1 生成管理员 Token（用于创建 Space）
+### 5.1 生成管理员 CWT Token（用于创建 Space）
 
 ```bash
 export ANDA_TOKEN="$(./anda-cli cwt \
@@ -199,7 +199,7 @@ export ANDA_TOKEN="$(./anda-cli cwt \
 ./anda-cli --space-id demo info
 ```
 
-## 7. 提交 Formation
+## 7. 提交记忆写入 (Formation)
 
 ```bash
 # 这里使用了 ANDA_TOKEN 环境变量
@@ -226,7 +226,7 @@ anda-cli --space-id demo conversations get 1
 anda-cli formation --help
 ```
 
-## 8. 执行 Recall
+## 8. 执行记忆召回 (Recall)
 
 Recall 是同步处理，等待最终结果返回：
 ```bash
@@ -239,7 +239,7 @@ Recall 是同步处理，等待最终结果返回：
 anda-cli --space-id demo conversations --collection recall get 1
 ```
 
-## 9. 查看会话记录
+## 9. 查询会话历史记录
 
 ### 9.2 列出会话
 
@@ -272,7 +272,7 @@ anda-cli --space-id demo conversations --collection recall get 1
 
 
 
-## 10. 集成
+## 10. 系统集成
 
 ### 10.1 直接使用 HTTP API
 

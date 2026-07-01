@@ -4,12 +4,12 @@
 
 - Base URL: `http://{host}:{port}`
 - 认证头：`Authorization: Bearer <token>`
-- 若 `ED25519_PUBKEYS` 为空/未提供，则鉴权关闭。
-- 支持序列化：
+- 若 `ED25519_PUBKEYS` 为空或未提供，则鉴权将被关闭。
+- 支持的序列化格式：
   - 请求：`Content-Type: application/json | application/cbor | text/markdown`
   - 响应：`Accept: application/json | application/cbor | text/markdown`
-- 大多数业务接口返回 RPC 包装结构：`RpcResponse<T>`
-- MCP client 可使用内置 Streamable HTTP 端点：`/mcp/<space_id>`，也可使用本地 stdio server：`anda_brain mcp --space-id <space_id> [local|aws]`
+- 大多数业务接口都会返回 RPC 包装后的结构体：`RpcResponse<T>`
+- MCP 客户端可使用内置的支持流式传输的 HTTP MCP 端点：`/mcp/<space_id>`，也可以使用本地 stdio server：`anda_brain mcp --space-id <space_id> [local|aws]`
 
 ---
 
@@ -290,7 +290,7 @@ export interface KipResponse<T> {
 
 ## 3) MCP Server
 
-HTTP 服务启动时，Anda Brain 会暴露 Streamable HTTP MCP 端点，供支持 MCP client 的智能体直接调用：
+HTTP 服务启动时，Anda Brain 会暴露支持流式传输的 HTTP MCP 端点，供支持 MCP 客户端的智能体直接调用：
 
 ```text
 https://your-brain-host/mcp/my_space_001
@@ -319,7 +319,7 @@ MCP_AUTH_TOKEN="$SPACE_TOKEN" \
 | `anda_brain_list_conversations` | `{ collection?, cursor?, limit? }` | `{ conversations, next_cursor }` | `read` |
 | `anda_brain_get_conversation` | `{ conversation_id, collection?, delta?, messages_offset?, artifacts_offset? }` | `Conversation` 或 `ConversationDelta` | `read` |
 
-当设置了 `ED25519_PUBKEYS` 时，远程 MCP client 需要携带 `Authorization` bearer token；stdio 模式请通过 `MCP_AUTH_TOKEN` 或 `--mcp-auth-token` 配置 CWT 或 space token。`read` 工具也可无 token 访问 public space。远程 MCP 经过公司域名或反向代理暴露时，请设置 `MCP_HTTP_ALLOWED_HOSTS`。本地 stdio 开发可用 `--mcp-auto-create-space` 自动创建目标 space；远程开发可用 `MCP_HTTP_AUTO_CREATE_SPACE=true`，但远程缺失 space 创建前必须已配置 `ED25519_PUBKEYS`，并提供目标 space 的 `write` scope CWT。
+当设置了 `ED25519_PUBKEYS` 时，远程 MCP 客户端需要携带 `Authorization` bearer token；stdio 模式请通过 `MCP_AUTH_TOKEN` 或 `--mcp-auth-token` 配置 CWT 或 space token。`read` 工具也可无 token 访问 public space。远程 MCP 经过公司域名或反向代理暴露时，请设置 `MCP_HTTP_ALLOWED_HOSTS`。本地 stdio 开发可用 `--mcp-auto-create-space` 自动创建目标 space；远程开发可用 `MCP_HTTP_AUTO_CREATE_SPACE=true`，但在远程自动创建不存在的 space 前，必须配置好 `ED25519_PUBKEYS`，且客户端需提供该 space 拥有 `write` 范围的 CWT。
 
 ---
 
