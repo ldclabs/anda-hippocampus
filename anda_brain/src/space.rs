@@ -55,6 +55,9 @@ use crate::{
         MaintenanceScope, ModelConfig, RecallInput, SpaceInfo, SpaceTier, SpaceToken, TokenScope,
         UpdateSpaceInput,
     },
+    wiki::{
+        WikiCommitTool, WikiDigest, WikiDigestReport, WikiReadTool, WikiSearchTool, WikiService,
+    },
 };
 
 pub static FUNCTION_DEFINITION: LazyLock<FunctionDefinition> = LazyLock::new(|| {
@@ -454,6 +457,8 @@ pub struct Space {
     pub recall: Arc<RecallAgent>,
     pub db: Arc<AndaDB>,
     pub memory: Arc<MemoryManagement>,
+    pub wiki: Arc<WikiService>,
+    pub wiki_digest: Arc<WikiDigest>,
 }
 
 impl Space {
@@ -494,6 +499,7 @@ impl Space {
             scope: input.scope,
             name: input.name,
             expires_at: input.expires_at,
+            labels: input.labels,
             created_at: now_ms,
             updated_at: now_ms,
             ..Default::default()
@@ -508,7 +514,7 @@ impl Space {
         token: String,
         scope: TokenScope,
         now_ms: u64,
-    ) -> Result<(), BoxError> {
+    ) -> Result<SpaceToken, BoxError> {
         // Space tokens always carry the "ST" prefix. Rejecting other keys here
         // keeps non-token extensions (e.g. "byok", "tier") out of the
         // credential lookup below.
@@ -529,10 +535,7 @@ impl Space {
                 None
             });
 
-        if token.is_none() {
-            return Err("invalid space token".into());
-        }
-        Ok(())
+        token.ok_or_else(|| "invalid space token".into())
     }
 
     pub async fn revoke_space_token(&self, token: &str) -> Result<bool, BoxError> {
@@ -580,6 +583,21 @@ impl Space {
             changed = true;
             self.db.set_extension_from("public".to_string(), public);
         }
+        if let Some(wiki_digest) = input.wiki_digest {
+            changed = true;
+            self.db
+                .set_extension_from("wiki_digest".to_string(), wiki_digest);
+        }
+        if let Some(audit_reads) = input.wiki_audit_reads {
+            changed = true;
+            self.db
+                .set_extension_from("wiki_audit_reads".to_string(), audit_reads);
+            self.wiki.set_audit_reads(audit_reads);
+        }
+        if let Some(defaults) = input.wiki_acl_defaults {
+            changed = true;
+            self.wiki.set_acl_defaults(defaults).await?;
+        }
         if changed {
             self.db.flush_metadata(now_ms).await?;
         }
@@ -614,6 +632,12 @@ impl Space {
             formation_processed_id: self.formation.get_processed().unwrap_or_default(),
             maintenance_processed_id: self.maintenance.get_processed().unwrap_or_default(),
             maintenance_at: self.maintenance.get_processed_at(),
+            wiki_docs: self.wiki.docs_count(),
+            wiki_chunks: self.wiki.chunks_count(),
+            wiki_versions: self.wiki.versions_count(),
+            wiki_queries: self.wiki.queries_count(),
+            wiki_digested: self.wiki_digest.cursor(),
+            wiki_stale_docs: self.wiki.stale_report_cached().stale_docs,
             ..Default::default()
         };
 
@@ -737,6 +761,85 @@ impl Space {
             )
             .await?;
         Ok(rt)
+    }
+
+    /// WikiDigest is off by default (PRD §13): extraction writes to the
+    /// graph, so spaces opt in explicitly via `update_space { wiki_digest }`.
+    pub fn wiki_digest_enabled(&self) -> bool {
+        self.db.get_extension_as("wiki_digest").unwrap_or(false)
+    }
+
+    /// Runs the wiki digest synchronously: distills pending wiki versions
+    /// into the Cognitive Nexus with citation provenance, supersedes stale
+    /// facts, and re-verifies a citation sample.
+    pub async fn run_wiki_digest(&self, user: Principal) -> Result<WikiDigestReport, BoxError> {
+        if !self.wiki_digest_enabled() {
+            return Err(
+                "wiki digest is disabled for this space; enable it via update_space { \"wiki_digest\": true }"
+                    .into(),
+            );
+        }
+        // Digest is not a registered engine agent; it borrows the formation
+        // agent's context (same write-path trust) with its own label.
+        let ctx = self.engine.ctx_with(
+            user,
+            FormationAgent::NAME,
+            "wiki_digest",
+            Default::default(),
+        )?;
+        let rt = self.wiki_digest.run_pending(ctx, unix_ms()).await?;
+        let _ = self
+            .db
+            .set_extension_from_with("wiki_digest_usage".to_string(), |v| {
+                let mut usage: Usage = v.unwrap_or_default();
+                usage.accumulate(&rt.usage);
+                Some(usage)
+            });
+        Ok(rt)
+    }
+
+    /// Non-LLM wiki housekeeping (PRD §7.4 Full tier): audit-log retention
+    /// pruning and the stale-document report. Cheap enough to run alongside
+    /// every digest kick.
+    pub fn kick_wiki_housekeeping(self: &Arc<Self>) {
+        let space = self.clone();
+        tokio::spawn(async move {
+            let now_ms = unix_ms();
+            if let Err(err) = space
+                .wiki
+                .prune_events(crate::wiki::DEFAULT_EVENT_RETENTION, now_ms)
+                .await
+            {
+                log::warn!(target: "brain", space_id = space.id; "wiki event prune failed: {err:?}");
+            }
+            if let Err(err) = space
+                .wiki
+                .stale_report(now_ms, crate::wiki::DEFAULT_STALE_AFTER_MS)
+                .await
+            {
+                log::warn!(target: "brain", space_id = space.id; "wiki stale report failed: {err:?}");
+            }
+        });
+    }
+
+    /// Fire-and-forget digest kick used by startup and post-maintenance
+    /// hooks; a no-op when disabled or already running.
+    pub fn kick_wiki_digest(self: &Arc<Self>) {
+        if !self.wiki_digest_enabled() || self.wiki_digest.is_processing() {
+            return;
+        }
+        let space = self.clone();
+        tokio::spawn(async move {
+            match space.run_wiki_digest(SELF_USER_ID).await {
+                Ok(report) if report.digested > 0 => {
+                    log::info!(target: "brain", space_id = space.id, report:serde = report; "wiki digest completed");
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    log::warn!(target: "brain", space_id = space.id; "wiki digest failed: {err:?}");
+                }
+            }
+        });
     }
 
     pub async fn restart_formation(
@@ -953,10 +1056,13 @@ impl Space {
             resources,
             kip_function_definitions: FUNCTION_DEFINITION.clone(),
         };
+        let wiki = Arc::new(WikiService::connect(id.clone(), db.clone()).await?);
 
         // create a new models instance for each space to allow per-space customization in the future (e.g., different model providers or credentials)
         let models = Arc::new(Models::from_clone(models.as_ref()));
         let memory = Arc::new(memory);
+        let wiki_digest = Arc::new(WikiDigest::new(wiki.clone(), memory.clone()));
+        wiki.set_audit_reads(db.get_extension_as("wiki_audit_reads").unwrap_or(false));
         let memory_r = TimedMemoryReadonly::new(memory.clone());
         let memory_tool = MemoryTool::new(memory.clone());
         let note_tool = NoteTool::new();
@@ -986,10 +1092,18 @@ impl Space {
             .register_tool(Arc::new(memory_r))?
             .register_tool(Arc::new(memory_tool))?
             .register_tool(Arc::new(note_tool))?
+            .register_tool(Arc::new(WikiSearchTool::new(wiki.clone())))?
+            .register_tool(Arc::new(WikiReadTool::new(wiki.clone())))?
+            .register_tool(Arc::new(WikiCommitTool::new(wiki.clone())))?
             .register_agent(formation.clone(), None)?
             .register_agent(recall.clone(), None)?
             .register_agent(maintenance.clone(), None)?
-            .export_tools(vec![MemoryTool::NAME.to_string()])
+            .export_tools(vec![
+                MemoryTool::NAME.to_string(),
+                WikiSearchTool::NAME.to_string(),
+                WikiReadTool::NAME.to_string(),
+                WikiCommitTool::NAME.to_string(),
+            ])
             .export_agents(vec![
                 RecallAgent::NAME.to_string(),
                 FormationAgent::NAME.to_string(),
@@ -1007,6 +1121,8 @@ impl Space {
             recall,
             maintenance,
             memory,
+            wiki,
+            wiki_digest,
             engine,
             pinned,
         });
@@ -1029,6 +1145,20 @@ impl Space {
             if let Err(err) = this_clone.recall.init().await {
                 log::warn!(target: "brain", space_id = this_clone.id; "recall history init failed: {err:?}");
             }
+            // Startup repair: reclaim wiki commit-crash leftovers before the
+            // space serves queries built on them.
+            match this_clone.wiki.orphan_sweep(unix_ms()).await {
+                Ok(report) if !report.is_empty() => {
+                    log::warn!(target: "brain", space_id = this_clone.id, report:serde = report; "wiki orphan sweep repaired state");
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    log::warn!(target: "brain", space_id = this_clone.id; "wiki orphan sweep failed: {err:?}");
+                }
+            }
+            // Resume any wiki digest backlog left from before the restart.
+            this_clone.kick_wiki_digest();
+            this_clone.kick_wiki_housekeeping();
             // Resume formation if it was interrupted before. A missing marker
             // means nothing was processed yet, so resume from the beginning.
             let conversation = this_clone.formation.get_processed().unwrap_or_default();
@@ -1115,6 +1245,10 @@ impl BrainHook for Hooks {
         // beginning so conversations queued during maintenance are not stuck.
         let id = space.formation.get_processed().unwrap_or_default();
         let _ = space.restart_formation(SELF_USER_ID, id + 1).await;
+        // Post-sleep digest: fold freshly committed wiki knowledge into the
+        // graph while formation is quiet (PRD §7.3, Daydream cadence).
+        space.kick_wiki_digest();
+        space.kick_wiki_housekeeping();
     }
 
     async fn try_start_maintenance(&self, formation_id: DocumentId) -> Option<DocumentId> {
@@ -1483,8 +1617,7 @@ mod tests {
             .update(
                 UpdateSpaceInput {
                     name: Some("before fork".to_string()),
-                    description: None,
-                    public: None,
+                    ..Default::default()
                 },
                 unix_ms(),
             )
@@ -1514,8 +1647,7 @@ mod tests {
         fork.update(
             UpdateSpaceInput {
                 name: Some("after fork".to_string()),
-                description: None,
-                public: None,
+                ..Default::default()
             },
             unix_ms(),
         )
@@ -1891,6 +2023,7 @@ mod tests {
                     name: Some("Research Brain".to_string()),
                     description: Some("memory space".to_string()),
                     public: Some(true),
+                    ..Default::default()
                 },
                 1000,
             )
@@ -1933,6 +2066,7 @@ mod tests {
                     scope: TokenScope::Read,
                     name: "reader".to_string(),
                     expires_at: Some(2000),
+                    labels: None,
                 },
                 1100,
             )
@@ -1973,9 +2107,7 @@ mod tests {
         space
             .update(
                 UpdateSpaceInput {
-                    name: None,
-                    description: None,
-                    public: None,
+                    ..Default::default()
                 },
                 3000,
             )
@@ -1998,6 +2130,7 @@ mod tests {
                         scope: TokenScope::Read,
                         name: format!("reader-{idx}"),
                         expires_at: None,
+                        labels: None,
                     },
                     idx,
                 )
@@ -2011,6 +2144,7 @@ mod tests {
                     scope: TokenScope::Read,
                     name: "overflow".to_string(),
                     expires_at: None,
+                    labels: None,
                 },
                 101,
             )
@@ -2464,5 +2598,312 @@ mod tests {
         wait_until_idle(&space).await;
         assert!(full > quick);
         assert_eq!(space.maintenance_for_test().get_processed_at().full, 168);
+    }
+
+    /// M4 acceptance: an exported OKF bundle plus its manifest replays into
+    /// an empty space with every document checksum intact.
+    #[tokio::test]
+    async fn wiki_export_bundle_replays_into_empty_space() {
+        use crate::wiki::{WikiBundleEntry, WikiCommitInput, WikiImportInput};
+
+        let app = test_app_state("wiki_replay_src");
+        let source = create_loaded_space(&app, "wiki_replay_source").await;
+        for (title, body) in [
+            ("部署指南", "# 部署指南\n\n回滚使用上一版本快照。\n"),
+            ("安全政策", "# 安全政策\n\n密钥必须存放在 KMS。\n"),
+        ] {
+            let mut input = WikiCommitInput {
+                title: title.to_string(),
+                content: body.to_string(),
+                ..Default::default()
+            };
+            input.namespace = Some("kb".to_string());
+            source
+                .wiki
+                .commit("op".to_string(), input, unix_ms())
+                .await
+                .unwrap();
+        }
+        let export = source
+            .wiki
+            .export_bundle("op".to_string(), Some("kb".to_string()), unix_ms())
+            .await
+            .unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(
+            &export
+                .entries
+                .iter()
+                .find(|e| e.path == "manifest.json")
+                .unwrap()
+                .content,
+        )
+        .unwrap();
+
+        // Replay into a brand-new space.
+        let replay_app = test_app_state("wiki_replay_dst");
+        let target = create_loaded_space(&replay_app, "wiki_replay_target").await;
+        let entries: Vec<WikiBundleEntry> = export
+            .entries
+            .iter()
+            .filter(|e| e.path.ends_with(".md"))
+            .cloned()
+            .collect();
+        let imported = target
+            .wiki
+            .import_bundle(
+                "op".to_string(),
+                WikiImportInput {
+                    entries,
+                    namespace: Some("kb".to_string()),
+                },
+                unix_ms(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(imported.created, export.docs);
+
+        // Every replayed document matches the manifest checksum: the bundle
+        // is a faithful backup.
+        for doc in manifest["docs"].as_array().unwrap() {
+            let path = doc["path"].as_str().unwrap();
+            let checksum = doc["checksum"].as_str().unwrap();
+            let restored = imported
+                .docs
+                .iter()
+                .find(|d| d.path == path)
+                .unwrap_or_else(|| panic!("missing {path}"));
+            let info = target.wiki.get_doc(restored.doc_id).await.unwrap();
+            assert_eq!(info.current_checksum, checksum, "checksum drift for {path}");
+        }
+
+        // SpaceInfo exposes the M4 wiki metrics.
+        let info = target.get_info();
+        assert_eq!(info.wiki_docs, export.docs);
+        assert!(info.wiki_versions >= export.docs);
+    }
+
+    /// Replays scripted completion responses in order; used to drive the
+    /// wiki digest extraction deterministically.
+    #[derive(Debug)]
+    struct ScriptedCompleter(std::sync::Mutex<std::collections::VecDeque<String>>);
+
+    impl CompletionFeaturesDyn for ScriptedCompleter {
+        fn model_name(&self) -> String {
+            "scripted-test-model".to_string()
+        }
+
+        fn completion(&self, _req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+            let next = self
+                .0
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| r#"{"facts": []}"#.to_string());
+            Box::pin(async move {
+                Ok(AgentOutput {
+                    content: next,
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn wiki_digest_extracts_supersedes_and_verifies() {
+        use crate::wiki::WikiCommitInput;
+        use anda_cognitive_nexus::ConceptPK;
+        use anda_kip::parse_kql;
+
+        let extraction_v1 = serde_json::json!({
+            "concepts": [
+                {"type": "Organization", "name": "Acme", "attributes": {"description": "发布政策的组织"}}
+            ],
+            "facts": [
+                {
+                    "subject": {"type": "Organization", "name": "Acme"},
+                    "predicate": "publishes",
+                    "object": {"type": "Policy", "name": "安全政策"},
+                    "confidence": 0.95,
+                    "anchor": "安全政策-0"
+                },
+                {
+                    "subject": {"type": "Policy", "name": "安全政策"},
+                    "predicate": "requires",
+                    "object": {"type": "Procedure", "name": "密钥轮换"},
+                    "confidence": 0.9,
+                    "anchor": "no-such-anchor"
+                }
+            ]
+        })
+        .to_string();
+        let extraction_v2 = serde_json::json!({
+            "facts": [
+                {
+                    "subject": {"type": "Organization", "name": "Acme"},
+                    "predicate": "publishes",
+                    "object": {"type": "Policy", "name": "安全政策"},
+                    "confidence": 0.95,
+                    "anchor": "安全政策-0"
+                },
+                {
+                    "subject": {"type": "Policy", "name": "安全政策"},
+                    "predicate": "requires",
+                    "object": {"type": "Procedure", "name": "双因素认证"},
+                    "confidence": 0.9,
+                    "anchor": "安全政策-0"
+                }
+            ]
+        })
+        .to_string();
+
+        let models = Models::default();
+        models.set_model(Model::with_completer(Arc::new(ScriptedCompleter(
+            std::sync::Mutex::new([extraction_v1, extraction_v2].into_iter().collect()),
+        ))));
+        let app = test_app_state_with_models("wiki_digest_app", Arc::new(models));
+        let space = create_loaded_space(&app, "wiki_digest_space").await;
+
+        // RecallAgent exposes the wiki evidence tools to its LLM loop.
+        {
+            use anda_core::Agent;
+            let deps = space.recall.tool_dependencies();
+            assert!(deps.contains(&"wiki_search".to_string()));
+            assert!(deps.contains(&"wiki_read".to_string()));
+        }
+
+        // Digest is opt-in: disabled spaces refuse to run.
+        let err = space.run_wiki_digest(SELF_USER_ID).await.unwrap_err();
+        assert!(err.to_string().contains("disabled"));
+        space
+            .update(
+                crate::types::UpdateSpaceInput {
+                    wiki_digest: Some(true),
+                    ..Default::default()
+                },
+                unix_ms(),
+            )
+            .await
+            .unwrap();
+        assert!(space.wiki_digest_enabled());
+
+        let v1 = space
+            .wiki
+            .commit(
+                "tester".to_string(),
+                WikiCommitInput {
+                    title: "安全政策".to_string(),
+                    content: "# 安全政策\n\n所有系统必须启用密钥轮换。\n".to_string(),
+                    ..Default::default()
+                },
+                unix_ms(),
+            )
+            .await
+            .unwrap();
+
+        let report = space.run_wiki_digest(SELF_USER_ID).await.unwrap();
+        assert_eq!(report.digested, 1);
+        assert_eq!(report.facts, 2);
+        assert_eq!(report.superseded, 0);
+        assert!(report.citations_checked >= 2);
+        assert_eq!(report.citations_invalid, 0);
+
+        // The graph now holds the concepts and a proposition whose metadata
+        // carries the wiki citation and extractor fingerprint.
+        assert!(
+            space
+                .memory
+                .nexus
+                .has_concept(&ConceptPK::Object {
+                    r#type: "Organization".to_string(),
+                    name: "Acme".to_string(),
+                })
+                .await
+        );
+        let (meta, _) = space
+            .memory
+            .nexus
+            .execute_kql(
+                parse_kql(
+                    "FIND(?link.metadata) WHERE { ?link ({type: \"Organization\", name: \"Acme\"}, \"publishes\", {type: \"Policy\", name: \"安全政策\"}) }",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let meta_text = meta.to_string();
+        assert!(meta_text.contains("wiki://"), "metadata: {meta_text}");
+        assert!(
+            meta_text.contains("wiki_digest@v1"),
+            "metadata: {meta_text}"
+        );
+        assert!(
+            meta_text.contains(&format!("@{}", v1.version.id)),
+            "citation should pin version {}: {meta_text}",
+            v1.version.id
+        );
+
+        // Digest ledger event recorded with both facts.
+        let events = space
+            .wiki
+            .list_events(Some("DigestExtracted".to_string()), None, None, Some(10))
+            .await
+            .unwrap();
+        assert_eq!(events.events.len(), 1);
+
+        // No pending versions: the next run is a no-op (cursor advanced).
+        let report = space.run_wiki_digest(SELF_USER_ID).await.unwrap();
+        assert_eq!(report.digested, 0);
+
+        // Revision drops the 密钥轮换 requirement; digesting it must mark the
+        // stale proposition superseded while the surviving fact stays live.
+        let v2 = space
+            .wiki
+            .commit(
+                "tester".to_string(),
+                WikiCommitInput {
+                    doc_id: Some(v1.doc.id),
+                    parent_version: Some(v1.version.id),
+                    title: "安全政策".to_string(),
+                    content: "# 安全政策\n\n所有系统必须启用双因素认证。\n".to_string(),
+                    ..Default::default()
+                },
+                unix_ms(),
+            )
+            .await
+            .unwrap();
+        let report = space.run_wiki_digest(SELF_USER_ID).await.unwrap();
+        assert_eq!(report.digested, 1);
+        assert_eq!(report.superseded, 1);
+
+        let (stale, _) = space
+            .memory
+            .nexus
+            .execute_kql(
+                parse_kql(
+                    "FIND(?link.metadata) WHERE { ?link ({type: \"Policy\", name: \"安全政策\"}, \"requires\", {type: \"Procedure\", name: \"密钥轮换\"}) }",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let stale_text = stale.to_string();
+        assert!(stale_text.contains("superseded"), "stale: {stale_text}");
+        assert!(
+            stale_text.contains(&format!("@{}", v2.version.id)),
+            "superseded_by should pin version {}: {stale_text}",
+            v2.version.id
+        );
+        let (live, _) = space
+            .memory
+            .nexus
+            .execute_kql(
+                parse_kql(
+                    "FIND(?link.metadata) WHERE { ?link ({type: \"Organization\", name: \"Acme\"}, \"publishes\", {type: \"Policy\", name: \"安全政策\"}) }",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(!live.to_string().contains("superseded"));
     }
 }

@@ -83,6 +83,7 @@ export interface AddSpaceTokenInput {
   scope: TokenScope;
   name: string;
   expires_at?: number; // Unix timestamp in milliseconds
+  labels?: string[]; // wiki ACL 标签；缺省 = 不受限
 }
 
 export interface RevokeSpaceTokenInput {
@@ -93,6 +94,9 @@ export interface UpdateSpaceInput {
   name?: string;
   description?: string;
   public?: boolean;
+  wiki_digest?: boolean; // 开启 WikiDigest 图谱蒸馏（默认关闭）
+  wiki_audit_reads?: boolean; // 外部 wiki 读操作写审计事件（默认关闭）
+  wiki_acl_defaults?: Record<string, string>; // namespace -> 默认 ACL 标签
 }
 
 export interface FormationRestartInput {
@@ -108,6 +112,196 @@ export interface CreateOrUpdateSpaceInput {
 export interface GetOrInitUserInput {
   user: string;
   name?: string;
+}
+
+// ── Wiki：版本化参考文档与可校验引用 ──────────────────────────────
+
+export type WikiDocStatus = 'active' | 'archived';
+export type WikiSearchMode = 'chunks' | 'docs';
+
+export interface WikiCommitInput {
+  doc_id?: number; // 缺省 = 创建新文档
+  parent_version?: number; // 更新必填（CAS）；过期返回 409
+  namespace?: string; // 默认 "default"
+  slug?: string; // 展示用；缺省从标题派生
+  title: string;
+  content: string; // 全量 Markdown（非 diff）；规范化后 ≤ 1 MiB
+  tags?: string[]; // 缺省 = 更新时保持原值
+  acl_label?: string; // 缺省 = 保持/继承 namespace 默认；"" 清除
+  source_uri?: string; // 缺省 = 保持原值
+  message?: string; // 提交说明
+  metadata?: Record<string, unknown>; // 缺省 = 保持原值
+}
+
+export interface WikiDocInfo {
+  id: number;
+  namespace: string;
+  slug: string;
+  title: string;
+  status: WikiDocStatus;
+  current_version: number;
+  current_checksum: string; // "sha3-256:..."
+  tags: string[];
+  acl_label?: string;
+  source_uri?: string;
+  metadata?: Record<string, unknown>;
+  created_by: string;
+  updated_by: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface WikiVersionInfo {
+  id: number;
+  doc_id: number;
+  parent_version?: number;
+  checksum: string;
+  size: number;
+  author: string;
+  message?: string;
+  created_at: number;
+}
+
+export interface WikiCommitOutput {
+  doc: WikiDocInfo;
+  version: WikiVersionInfo;
+  chunks: number;
+  created: boolean;
+  idempotent: boolean; // true = 内容未变，零写入
+}
+
+export interface WikiSearchInput {
+  query: string; // BM25 关键词：术语、产品名、错误码优于整句
+  namespaces?: string[];
+  doc_ids?: number[];
+  tags?: string[];
+  top_k?: number; // 1-50，默认 8
+  mode?: WikiSearchMode; // 'docs' = 每篇文档只返回最佳命中
+  expand?: number; // 0-2 邻域扩展；引用范围相应扩大
+}
+
+export interface WikiCitation {
+  uri: string; // wiki://{space}/{doc_id}@{version_id}#{start}-{end}
+  doc_id: number;
+  version_id: number;
+  chunk_id: number;
+  heading_path: string[];
+  anchor: string; // 稳定章节锚点，可用于按节读取
+  byte_range: [number, number];
+  checksum: string; // 可经 /wiki/verify 校验
+  quote: string;
+}
+
+export interface WikiHit {
+  text: string;
+  doc_title: string;
+  heading_path: string[];
+  score?: number;
+  citation: WikiCitation;
+}
+
+export interface WikiSearchOutput {
+  hits: WikiHit[];
+  total_docs_matched: number;
+}
+
+export type WikiSelector =
+  | { type: 'toc' }
+  | { type: 'section'; anchor: string }
+  | { type: 'range'; start: number; end: number }
+  | { type: 'full' };
+
+export interface WikiReadInput {
+  doc_id: number;
+  version?: number; // 读取历史版本（time-travel）
+  selector?: WikiSelector; // 默认 { type: 'full' }
+}
+
+export interface WikiTocEntry {
+  anchor: string;
+  heading_path: string[];
+  byte_start: number;
+  byte_end: number;
+}
+
+export interface WikiReadOutput {
+  doc_id: number;
+  version_id: number;
+  is_current: boolean;
+  title: string;
+  status: WikiDocStatus;
+  checksum: string;
+  size: number;
+  toc?: WikiTocEntry[]; // selector 为 'toc' 时返回
+  content?: string; // section/range/full 时返回
+  byte_range?: [number, number];
+  truncated: boolean; // 全文读取有上限（256 KiB）
+}
+
+export interface WikiVerifyInput {
+  uri?: string; // wiki:// 引用 URI；或使用下方显式字段
+  doc_id?: number;
+  version_id?: number;
+  byte_range?: [number, number];
+  checksum?: string; // 提供时与重算校验和比对
+}
+
+export type WikiVerifyStatus = 'valid' | 'superseded' | 'invalid' | 'not_found';
+
+export interface WikiVerifyOutput {
+  status: WikiVerifyStatus; // 'superseded' = 内容完好但已有新版本
+  current_version?: number;
+  checksum?: string; // 从不可变内容重算
+  quote?: string;
+}
+
+export interface WikiBundleEntry {
+  path: string; // bundle 相对路径，如 "guides/setup.md"
+  content: string;
+}
+
+export interface WikiImportInput {
+  entries: WikiBundleEntry[]; // OKF v0.1 bundle 文件（Markdown + YAML frontmatter）
+  namespace?: string; // 默认 "default"；bundle 以 namespace 为单位往返
+}
+
+export type WikiImportStatus = 'created' | 'updated' | 'unchanged';
+
+export interface WikiImportOutput {
+  created: number;
+  updated: number;
+  unchanged: number; // checksum 幂等：重复导入零版本膨胀
+  docs: { path: string; doc_id: number; version_id: number; status: WikiImportStatus }[];
+  skipped?: { path: string; reason: string }[];
+}
+
+export interface WikiExportOutput {
+  namespace: string;
+  entries: WikiBundleEntry[]; // concept .md 文件 + index.md + manifest.json
+  docs: number;
+}
+
+export interface WikiEventInfo {
+  id: number;
+  // DocCreated | VersionCommitted | DocArchived | DocRestored | OrphanSwept
+  // | CitationVerifyFailed | ImportCompleted | ExportCompleted
+  // | DigestExtracted | WikiQueried | WikiRead | StaleReport | EventsPruned
+  kind: string;
+  doc_id?: number;
+  version_id?: number;
+  actor: string;
+  detail?: Record<string, unknown>;
+  created_at: number;
+}
+
+export interface WikiDigestReport {
+  digested: number; // 本轮蒸馏进图谱的版本数
+  facts: number; // 写入的命题数（metadata 携带 wiki:// 引用）
+  superseded: number; // 被标记 superseded 的旧命题数
+  skipped: number;
+  citations_checked: number; // 蒸馏后引用抽检
+  citations_invalid: number;
+  usage: Usage;
 }
 
 export interface McpServerConfig {
@@ -159,6 +353,7 @@ export interface SpaceToken {
   created_at: number; // Unix timestamp in milliseconds
   updated_at: number; // Unix timestamp in milliseconds
   expires_at?: number; // Unix timestamp in milliseconds
+  labels?: string[]; // wiki ACL 标签：仅可见无标签内容 + 所列标签
 }
 
 export interface StorageStats {
@@ -182,6 +377,12 @@ export interface SpaceInfo {
   formation_processed_id: number;
   maintenance_processed_id: number;
   maintenance_at: MaintenanceAt;
+  wiki_docs: number;
+  wiki_chunks: number;
+  wiki_versions: number;
+  wiki_queries: number;
+  wiki_digested: number; // 蒸馏高水位（version id）
+  wiki_stale_docs: number; // 最近一次 housekeeping 陈旧扫描结果
 }
 
 export interface FormationStatus {
@@ -427,7 +628,97 @@ MCP_AUTH_TOKEN="$SPACE_TOKEN" \
 
 ---
 
-## 4.3 空间管理接口（`/v1/{space_id}/management`）
+## 4.3 Wiki 接口（`/v1/{space_id}/wiki`）
+
+Wiki 是空间的版本化参考记忆（政策、手册、SOP、API 文档）。写入是 Git 式不可变提交（CAS 并发控制）；检索返回可校验的 `wiki://` 引用。ACL：文档可携带 `acl_label`；带 `labels` 的 space token 仅可见无标签内容 + 所授标签——过滤在检索查询内部执行。公开空间的匿名读者仅可见无标签内容；越权一律表现为 404。
+
+Wiki 专属错误语义：`409` 提交冲突（`error.data.current_version` 为应 rebase 的版本）、`413` 内容超 1 MiB、`404` 不存在或 ACL 拒绝。
+
+### POST `/v1/{space_id}/wiki/docs`
+
+- 作用：提交文档（创建；或携带 `doc_id` + `parent_version` 做 CAS 更新）；同内容提交为零写入
+- 鉴权：SpaceToken/CWT `write`
+- 请求体：`WikiCommitInput`（也接受原始 Markdown 字符串，标题取首个标题行）
+- 响应：`RpcResponse<WikiCommitOutput>`
+
+### GET `/v1/{space_id}/wiki/docs?namespace=<ns>&status=<status>&tag=<tag>&cursor=<cursor>&limit=<n>`
+
+- 作用：分页列出文档
+- 鉴权：SpaceToken/CWT `read`（公开空间免鉴权；ACL 标签生效）
+- 响应：`RpcResponse<WikiDocInfo[]>`（下一页游标经 `next_cursor` 返回）
+
+### GET `/v1/{space_id}/wiki/docs/{doc_id}`
+
+- 作用：文档元信息 + 目录（TOC）
+- 鉴权：SpaceToken/CWT `read`（公开空间免鉴权；ACL 标签生效）
+- 响应：`RpcResponse<{ doc: WikiDocInfo; toc: WikiTocEntry[] }>`
+
+### GET `/v1/{space_id}/wiki/docs/{doc_id}/content?version=<id>&anchor=<anchor>&start=<n>&end=<n>`
+
+- 作用：渐进读取——`anchor` 读单节、`start`+`end` 读字节区间、均不传读受限全文；`version` 读历史版本
+- 鉴权：SpaceToken/CWT `read`（公开空间免鉴权；ACL 标签生效）
+- 响应：`RpcResponse<WikiReadOutput>`
+
+### GET `/v1/{space_id}/wiki/docs/{doc_id}/versions?cursor=<cursor>&limit=<n>`
+
+- 作用：版本历史（不可变提交链）
+- 鉴权：SpaceToken/CWT `read`（公开空间免鉴权；ACL 标签生效）
+- 响应：`RpcResponse<WikiVersionInfo[]>`（下一页游标经 `next_cursor` 返回）
+
+### POST `/v1/{space_id}/wiki/docs/{doc_id}/archive`
+
+- 作用：归档文档（退出检索，仍可按 id 读取，可恢复）
+- 鉴权：SpaceToken/CWT `write`
+- 响应：`RpcResponse<WikiDocInfo>`
+
+### POST `/v1/{space_id}/wiki/docs/{doc_id}/restore`
+
+- 作用：恢复归档文档进入检索
+- 鉴权：SpaceToken/CWT `write`
+- 响应：`RpcResponse<WikiDocInfo>`
+
+### POST `/v1/{space_id}/wiki/search`
+
+- 作用：BM25 关键词检索，返回片段与可校验引用
+- 鉴权：SpaceToken/CWT `read`（公开空间免鉴权；ACL 标签生效）
+- 请求体：`WikiSearchInput`（也接受原始查询字符串）
+- 响应：`RpcResponse<WikiSearchOutput>`
+
+### POST `/v1/{space_id}/wiki/verify`
+
+- 作用：对照不可变存储校验引用
+- 鉴权：SpaceToken/CWT `read`（公开空间免鉴权；ACL 标签生效）
+- 请求体：`WikiVerifyInput`（也接受原始 `wiki://` URI 字符串）
+- 响应：`RpcResponse<WikiVerifyOutput>`
+
+### GET `/v1/{space_id}/wiki/events?kind=<kind>&doc_id=<id>&cursor=<cursor>&limit=<n>`
+
+- 作用：查询 append-only 审计日志（写入、导入、蒸馏；开启 `wiki_audit_reads` 后含读操作）
+- 鉴权：SpaceToken/CWT `read`；受 ACL 标签限制的 token 返回 `403`
+- 响应：`RpcResponse<WikiEventInfo[]>`（下一页游标经 `next_cursor` 返回）
+
+### POST `/v1/{space_id}/wiki/import`
+
+- 作用：导入 OKF v0.1 bundle；checksum 幂等（重复导入零版本膨胀）；未知 frontmatter 字段逐字往返
+- 鉴权：SpaceToken/CWT `*`（全量 scope）
+- 请求体：`WikiImportInput`
+- 响应：`RpcResponse<WikiImportOutput>`
+
+### GET `/v1/{space_id}/wiki/export?namespace=<ns>`
+
+- 作用：按 namespace 导出 OKF bundle（concept `.md` + `index.md` + 含校验和的 `manifest.json`）；可在空库完整重放
+- 鉴权：SpaceToken/CWT `*`（全量 scope）
+- 响应：`RpcResponse<WikiExportOutput>`
+
+### POST `/v1/{space_id}/wiki/digest`
+
+- 作用：把待处理 wiki 版本蒸馏进 Cognitive Nexus（命题 metadata 携带 `wiki://` 引用）；新版本不再断言的旧命题被标记 superseded（需先 `update_space {"wiki_digest": true}` 开启）
+- 鉴权：SpaceToken/CWT `write`
+- 响应：`RpcResponse<WikiDigestReport>`
+
+---
+
+## 4.4 空间管理接口（`/v1/{space_id}/management`）
 
 ### GET `/v1/{space_id}/management/space_tokens`
 
@@ -478,7 +769,7 @@ MCP_AUTH_TOKEN="$SPACE_TOKEN" \
 
 ---
 
-## 4.4 管理员接口（`/admin`）
+## 4.5 管理员接口（`/admin`）
 
 ### POST `/admin/create_space`
 

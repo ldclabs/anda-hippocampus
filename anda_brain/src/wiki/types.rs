@@ -1,0 +1,608 @@
+//! Wire types and error semantics for the wiki subsystem.
+
+use anda_db::{error::DBError, schema::Json};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+use super::model::WikiDocRecord;
+
+/// Default namespace for documents committed without one.
+pub const DEFAULT_NAMESPACE: &str = "default";
+
+/// Wiki errors carry enough structure for HTTP status mapping (409/413/404)
+/// and for agents to self-correct (a conflict names the current version).
+#[derive(Debug, Clone, Serialize)]
+pub enum WikiError {
+    /// CAS failure: the document moved past `parent_version`. Re-read,
+    /// merge, and retry with the returned `current_version`.
+    Conflict {
+        current_version: u64,
+        updated_by: String,
+        updated_at: u64,
+    },
+    /// Content exceeds the per-document byte limit.
+    TooLarge {
+        size: usize,
+        max: usize,
+    },
+    NotFound(String),
+    /// Invalid input or state (e.g. committing to an archived document).
+    Invalid(String),
+    Db(String),
+}
+
+impl std::fmt::Display for WikiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Conflict {
+                current_version,
+                updated_by,
+                updated_at,
+            } => write!(
+                f,
+                "commit conflict: document is at version {current_version} (updated by {updated_by} at {updated_at}); re-read, merge, and retry with parent_version={current_version}"
+            ),
+            Self::TooLarge { size, max } => write!(
+                f,
+                "content too large: {size} bytes exceeds the {max} byte limit; split the document"
+            ),
+            Self::NotFound(msg) => write!(f, "not found: {msg}"),
+            Self::Invalid(msg) => write!(f, "invalid: {msg}"),
+            Self::Db(msg) => write!(f, "db error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for WikiError {}
+
+impl From<DBError> for WikiError {
+    fn from(err: DBError) -> Self {
+        match err {
+            DBError::NotFound { name, path, .. } => Self::NotFound(format!("{path}/{name}")),
+            err => Self::Db(format!("{err:?}")),
+        }
+    }
+}
+
+/// One write primitive: commit. `doc_id: None` creates; `Some` updates and
+/// then requires `parent_version` for CAS.
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+pub struct WikiCommitInput {
+    #[serde(default)]
+    pub doc_id: Option<u64>,
+    #[serde(default)]
+    pub parent_version: Option<u64>,
+    #[serde(default)]
+    pub namespace: Option<String>,
+    #[serde(default)]
+    pub slug: Option<String>,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub content: String,
+    /// `None` keeps the stored tags on update; `Some` replaces them.
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    /// ACL label. `None` keeps the stored label (or inherits the namespace
+    /// default on create); `Some("")` clears it.
+    #[serde(default)]
+    pub acl_label: Option<String>,
+    /// `None` keeps the stored value on update.
+    #[serde(default)]
+    pub source_uri: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+    /// `None` keeps the stored metadata on update; `Some` replaces it.
+    #[serde(default)]
+    pub metadata: Option<BTreeMap<String, Json>>,
+}
+
+impl WikiCommitInput {
+    /// Builds a create-commit from bare Markdown, deriving the title from
+    /// the first heading.
+    pub fn from_markdown(content: String) -> Self {
+        let title = markdown_title(&content).unwrap_or_else(|| "Untitled".to_string());
+        Self {
+            title,
+            content,
+            ..Default::default()
+        }
+    }
+
+    pub fn normalize(&mut self) {
+        self.title = self.title.trim().to_string();
+        if self.title.is_empty()
+            && let Some(title) = markdown_title(&self.content)
+        {
+            self.title = title;
+        }
+        normalize_opt(&mut self.namespace);
+        normalize_opt(&mut self.slug);
+        normalize_opt(&mut self.message);
+        normalize_opt(&mut self.source_uri);
+        if let Some(tags) = &self.tags {
+            self.tags = Some(normalize_tags(tags));
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct WikiCommitOutput {
+    pub doc: WikiDocInfo,
+    pub version: WikiVersionInfo,
+    pub chunks: usize,
+    pub created: bool,
+    /// True when the commit was a no-op because nothing changed.
+    pub idempotent: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct WikiDocInfo {
+    pub id: u64,
+    pub namespace: String,
+    pub slug: String,
+    pub title: String,
+    pub status: String,
+    pub current_version: u64,
+    pub current_checksum: String,
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub acl_label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, Json>,
+    pub created_by: String,
+    pub updated_by: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+impl From<WikiDocRecord> for WikiDocInfo {
+    fn from(doc: WikiDocRecord) -> Self {
+        Self {
+            id: doc._id,
+            namespace: doc.namespace,
+            slug: doc.slug,
+            title: doc.title,
+            status: doc.status,
+            current_version: doc.current_version,
+            current_checksum: doc.current_checksum,
+            tags: doc.tags,
+            acl_label: doc.acl_label,
+            source_uri: doc.source_uri,
+            metadata: doc.metadata,
+            created_by: doc.created_by,
+            updated_by: doc.updated_by,
+            created_at: doc.created_at,
+            updated_at: doc.updated_at,
+        }
+    }
+}
+
+/// Version metadata without content (content is read via `read`).
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct WikiVersionInfo {
+    pub id: u64,
+    pub doc_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_version: Option<u64>,
+    pub checksum: String,
+    pub size: u64,
+    pub author: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub created_at: u64,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WikiSearchMode {
+    #[default]
+    Chunks,
+    Docs,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+pub struct WikiSearchInput {
+    pub query: String,
+    #[serde(default)]
+    pub namespaces: Vec<String>,
+    #[serde(default)]
+    pub doc_ids: Vec<u64>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub top_k: Option<usize>,
+    #[serde(default)]
+    pub mode: WikiSearchMode,
+    /// Neighbor expansion: widen each hit by up to N adjacent chunks on both
+    /// sides (0–2, default 0). Overlapping expansions within one document
+    /// merge into a single hit; the citation range widens accordingly and
+    /// stays verifiable.
+    #[serde(default)]
+    pub expand: Option<u8>,
+}
+
+impl WikiSearchInput {
+    pub fn from_query(query: String) -> Self {
+        Self {
+            query,
+            ..Default::default()
+        }
+    }
+
+    pub fn normalize(&mut self) {
+        self.query = self.query.trim().to_string();
+        self.namespaces = normalize_tags(&self.namespaces);
+        self.tags = normalize_tags(&self.tags);
+        self.doc_ids.sort_unstable();
+        self.doc_ids.dedup();
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct WikiCitation {
+    /// `wiki://{space}/{doc_id}@{version_id}#{start}-{end}`
+    pub uri: String,
+    pub doc_id: u64,
+    pub version_id: u64,
+    pub chunk_id: u64,
+    pub heading_path: Vec<String>,
+    pub anchor: String,
+    pub byte_range: (u64, u64),
+    pub checksum: String,
+    pub quote: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct WikiHit {
+    pub text: String,
+    pub doc_title: String,
+    pub heading_path: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f32>,
+    pub citation: WikiCitation,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+pub struct WikiSearchOutput {
+    pub hits: Vec<WikiHit>,
+    pub total_docs_matched: usize,
+}
+
+/// Progressive disclosure selector: browse the TOC, read one section, slice
+/// a byte range, or read the whole document (bounded).
+#[derive(Debug, Default, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WikiSelector {
+    Toc,
+    Section {
+        anchor: String,
+    },
+    Range {
+        start: u64,
+        end: u64,
+    },
+    #[default]
+    Full,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+pub struct WikiReadInput {
+    pub doc_id: u64,
+    #[serde(default)]
+    pub version: Option<u64>,
+    #[serde(default)]
+    pub selector: WikiSelector,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct WikiTocEntry {
+    pub anchor: String,
+    pub heading_path: Vec<String>,
+    pub byte_start: u64,
+    pub byte_end: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct WikiReadOutput {
+    pub doc_id: u64,
+    pub version_id: u64,
+    pub is_current: bool,
+    pub title: String,
+    pub status: String,
+    pub checksum: String,
+    pub size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub toc: Option<Vec<WikiTocEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// Byte range of `content` within the version, when content is present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub byte_range: Option<(u64, u64)>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+pub struct WikiVerifyInput {
+    /// `wiki://{space}/{doc_id}@{version_id}#{start}-{end}`; explicit fields
+    /// below are used when absent.
+    #[serde(default)]
+    pub uri: Option<String>,
+    #[serde(default)]
+    pub doc_id: Option<u64>,
+    #[serde(default)]
+    pub version_id: Option<u64>,
+    #[serde(default)]
+    pub byte_range: Option<(u64, u64)>,
+    /// When provided, compared against the recomputed chunk checksum.
+    #[serde(default)]
+    pub checksum: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WikiVerifyStatus {
+    /// Checksum matches and the cited version is current.
+    Valid,
+    /// Checksum matches but a newer version exists.
+    Superseded,
+    /// The citation does not match stored content: storage corruption signal.
+    Invalid,
+    NotFound,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct WikiVerifyOutput {
+    pub status: WikiVerifyStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_version: Option<u64>,
+    /// Recomputed checksum for the cited range, when resolvable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quote: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+pub struct WikiListDocsInput {
+    #[serde(default)]
+    pub namespace: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub tag: Option<String>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+pub struct WikiDocListOutput {
+    pub docs: Vec<WikiDocInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+pub struct WikiVersionListOutput {
+    pub versions: Vec<WikiVersionInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct WikiEventInfo {
+    pub id: u64,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<u64>,
+    pub actor: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub detail: BTreeMap<String, Json>,
+    pub created_at: u64,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+pub struct WikiEventListOutput {
+    pub events: Vec<WikiEventInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// One file of an OKF bundle: a bundle-relative path and its full content.
+#[derive(Debug, Default, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct WikiBundleEntry {
+    pub path: String,
+    pub content: String,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+pub struct WikiImportInput {
+    pub entries: Vec<WikiBundleEntry>,
+    /// Target namespace; defaults to "default". Bundles round-trip per
+    /// namespace: export paths carry no namespace prefix.
+    #[serde(default)]
+    pub namespace: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WikiImportStatus {
+    Created,
+    Updated,
+    Unchanged,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct WikiImportedDoc {
+    pub path: String,
+    pub doc_id: u64,
+    pub version_id: u64,
+    pub status: WikiImportStatus,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct WikiImportSkip {
+    pub path: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+pub struct WikiImportOutput {
+    pub created: usize,
+    pub updated: usize,
+    pub unchanged: usize,
+    pub docs: Vec<WikiImportedDoc>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<WikiImportSkip>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+pub struct WikiExportOutput {
+    pub namespace: String,
+    /// Concept `.md` files plus generated `index.md` and `manifest.json`.
+    pub entries: Vec<WikiBundleEntry>,
+    pub docs: usize,
+}
+
+/// Caller identity for scoped (HTTP/MCP) wiki reads. `labels: None` means
+/// unrestricted (CWT holders and legacy space tokens); `Some(list)` grants
+/// unlabeled content plus the listed labels. The filter runs inside the
+/// same AndaDB query as retrieval, so over-broad results are structurally
+/// impossible.
+#[derive(Debug, Clone, Default)]
+pub struct WikiAccess {
+    pub actor: String,
+    pub labels: Option<Vec<String>>,
+}
+
+impl WikiAccess {
+    pub fn unrestricted(actor: impl Into<String>) -> Self {
+        Self {
+            actor: actor.into(),
+            labels: None,
+        }
+    }
+
+    pub fn allows(&self, label: &str) -> bool {
+        match &self.labels {
+            None => true,
+            Some(labels) => label.is_empty() || labels.iter().any(|l| l == label),
+        }
+    }
+}
+
+/// Last housekeeping stale scan, persisted for `SpaceInfo`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct WikiStaleReport {
+    pub stale_docs: u64,
+    pub checked_docs: u64,
+    pub checked_at: u64,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+pub struct WikiSweepReport {
+    pub docs_removed: usize,
+    pub versions_removed: usize,
+    pub chunks_removed: usize,
+    pub chunks_repaired: usize,
+}
+
+impl WikiSweepReport {
+    pub fn is_empty(&self) -> bool {
+        self.docs_removed == 0
+            && self.versions_removed == 0
+            && self.chunks_removed == 0
+            && self.chunks_repaired == 0
+    }
+}
+
+/// Builds the canonical citation URI.
+pub fn citation_uri(space_id: &str, doc_id: u64, version_id: u64, start: u64, end: u64) -> String {
+    format!("wiki://{space_id}/{doc_id}@{version_id}#{start}-{end}")
+}
+
+/// Parses a `wiki://{space}/{doc_id}@{version_id}#{start}-{end}` URI into
+/// `(space, doc_id, version_id, start, end)`.
+pub fn parse_citation_uri(uri: &str) -> Option<(String, u64, u64, u64, u64)> {
+    let rest = uri.strip_prefix("wiki://")?;
+    let (space, rest) = rest.split_once('/')?;
+    let (doc, rest) = rest.split_once('@')?;
+    let (version, range) = rest.split_once('#')?;
+    let (start, end) = range.split_once('-')?;
+    Some((
+        space.to_string(),
+        doc.parse().ok()?,
+        version.parse().ok()?,
+        start.parse().ok()?,
+        end.parse().ok()?,
+    ))
+}
+
+pub(crate) fn markdown_title(content: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        let trimmed = line.trim_start();
+        let level = trimmed.chars().take_while(|ch| *ch == '#').count();
+        if !(1..=6).contains(&level) {
+            return None;
+        }
+        let title = trimmed.get(level..)?.trim().trim_end_matches('#').trim();
+        if title.is_empty() {
+            None
+        } else {
+            Some(title.to_string())
+        }
+    })
+}
+
+fn normalize_opt(value: &mut Option<String>) {
+    if let Some(inner) = value {
+        let trimmed = inner.trim();
+        if trimmed.is_empty() {
+            *value = None;
+        } else if trimmed != inner {
+            *inner = trimmed.to_string();
+        }
+    }
+}
+
+fn normalize_tags(tags: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = tags
+        .iter()
+        .map(|tag| tag.trim())
+        .filter(|tag| !tag.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    out.dedup();
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn citation_uri_round_trips() {
+        let uri = citation_uri("my_space", 7, 42, 100, 260);
+        assert_eq!(uri, "wiki://my_space/7@42#100-260");
+        let (space, doc, ver, start, end) = parse_citation_uri(&uri).unwrap();
+        assert_eq!(space, "my_space");
+        assert_eq!((doc, ver, start, end), (7, 42, 100, 260));
+        assert!(parse_citation_uri("wiki://bad").is_none());
+        assert!(parse_citation_uri("http://x/1@2#3-4").is_none());
+    }
+
+    #[test]
+    fn markdown_title_finds_first_heading() {
+        assert_eq!(
+            markdown_title("intro\n\n## 部署指南 ##\nbody").as_deref(),
+            Some("部署指南")
+        );
+        assert_eq!(markdown_title("no headings"), None);
+    }
+}

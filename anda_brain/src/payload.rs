@@ -309,6 +309,7 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for HeaderVals {
 pub struct AppError {
     pub status: StatusCode,
     pub message: String,
+    pub data: Option<Value>,
 }
 
 impl AppError {
@@ -316,6 +317,7 @@ impl AppError {
         Self {
             status: StatusCode::UNAUTHORIZED,
             message: "authentication failed".into(),
+            data: None,
         }
     }
 
@@ -323,13 +325,24 @@ impl AppError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: format!("{e:?}"),
+            data: None,
+        }
+    }
+
+    pub fn with_status(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+            data: None,
         }
     }
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        RpcError::new(self.message).into_response(Some(self.status))
+        let mut err = RpcError::new(self.message);
+        err.data = self.data;
+        err.into_response(Some(self.status))
     }
 }
 

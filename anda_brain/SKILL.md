@@ -379,6 +379,101 @@ Authorization: Bearer <token>
 
 ---
 
+### Wiki — Versioned Reference Documents with Citations
+
+The wiki is the space's reference memory: policies, manuals, SOPs, API docs and FAQs stored as immutable Markdown commits (git-like), retrieved by BM25 keyword search, and quoted through verifiable `wiki://` citations. Search is deterministic and LLM-free; compose answers yourself and cite the URIs.
+
+**Commit (create or update):**
+
+```
+POST /v1/{space_id}/wiki/docs
+Authorization: Bearer <token with write scope>
+```
+
+```json
+{
+  "title": "Deployment Guide",
+  "content": "# Deployment Guide\n\n## Rollback\n\nUse the previous snapshot...",
+  "namespace": "engineering",
+  "tags": ["sop"],
+  "message": "initial import"
+}
+```
+
+- Create: omit `doc_id`. Update: pass `doc_id` **and** `parent_version` (the `current_version` you read). A stale `parent_version` returns `409` with the current version in `error.data` — re-read, merge, retry.
+- Committing identical content is a no-op (`"idempotent": true`); safe to retry and re-import.
+- Content is whole-document Markdown (not a diff), at most 1 MiB after normalization (`413` beyond).
+
+**Search with citations:**
+
+```
+POST /v1/{space_id}/wiki/search
+```
+
+```json
+{ "query": "rollback checksum", "namespaces": ["engineering"], "top_k": 8, "mode": "chunks", "expand": 1 }
+```
+
+Each hit carries the matching text and a citation: `{ "uri": "wiki://{space}/{doc_id}@{version_id}#{start}-{end}", "checksum": "sha3-256:...", "anchor": "...", "quote": "..." }`. `mode: "docs"` returns one best hit per document. `expand` (0-2, default 0) widens each hit with adjacent passages; overlapping expansions merge and the citation range widens while staying verifiable. BM25 favors exact terms (product names, error codes); reformulate keywords rather than sending full sentences.
+
+**Read progressively:**
+
+```
+GET /v1/{space_id}/wiki/docs/{doc_id}                      → metadata + table of contents
+GET /v1/{space_id}/wiki/docs/{doc_id}/content?anchor=...   → one section
+GET /v1/{space_id}/wiki/docs/{doc_id}/content?start=&end=  → byte range
+GET /v1/{space_id}/wiki/docs/{doc_id}/content              → full text (bounded)
+GET /v1/{space_id}/wiki/docs/{doc_id}/content?version=...  → historical version
+```
+
+Prefer TOC → section over full reads for long documents.
+
+**Manage and audit:**
+
+```
+GET  /v1/{space_id}/wiki/docs?namespace=&tag=&status=&cursor=&limit=
+GET  /v1/{space_id}/wiki/docs/{doc_id}/versions
+POST /v1/{space_id}/wiki/docs/{doc_id}/archive     (hidden from search, still readable)
+POST /v1/{space_id}/wiki/docs/{doc_id}/restore
+POST /v1/{space_id}/wiki/verify                    {"uri": "wiki://...", "checksum": "sha3-256:..."}
+GET  /v1/{space_id}/wiki/events?kind=&doc_id=
+```
+
+`verify` answers `valid`, `superseded` (a newer version exists — it names it), or `invalid`. Versions are immutable, so citations never rot.
+
+**Access control (ACL labels):**
+
+Documents may carry an `acl_label` (set via commit, or inherited from a per-namespace default configured with `update_space {"wiki_acl_defaults": {"hr": "hr-internal"}}`). Space tokens may carry `labels`: a token with labels sees only unlabeled documents plus its granted labels — enforced as a filter clause inside the same database query as retrieval, so over-broad results are structurally impossible. Tokens without labels and CWT holders are unrestricted; anonymous readers of public spaces see unlabeled content only. Denials surface as 404 (existence does not leak); the audit log requires an unrestricted token. Note: OKF bundles do not carry ACL labels (the exchange format cannot express enterprise ACLs) — imported documents inherit namespace defaults.
+
+```
+POST /v1/{space_id}/management/add_space_token
+{"scope": "read", "name": "analyst", "labels": ["engineering"]}
+```
+
+**Read auditing and housekeeping:**
+
+`update_space {"wiki_audit_reads": true}` events every external search/read (`WikiQueried` / `WikiRead`, with the real actor); agent reads stay covered by recall conversation logs. Housekeeping runs automatically after maintenance cycles and on startup: the audit log is pruned to its retention cap (the prune itself is evented), and a stale-document report is refreshed. `GET /v1/{space_id}/info` exposes `wiki_docs / wiki_chunks / wiki_versions / wiki_queries / wiki_digested / wiki_stale_docs`.
+
+**Graph bridge (WikiDigest, opt-in):**
+
+```
+PATCH /v1/{space_id}/management/update_space   {"wiki_digest": true}
+POST  /v1/{space_id}/wiki/digest
+```
+
+When enabled, committed wiki versions are distilled into the Cognitive Nexus: an LLM proposes subject–predicate–object facts per section, and the runtime writes them as KIP propositions whose metadata always carries `source: "wiki"`, a `wiki://` citation with checksum, and the extractor fingerprint — provenance is attached by construction, not by prompt discipline. Re-committing a document supersedes facts the new version no longer asserts (`metadata.status: "superseded"`, `metadata.superseded_by` → the new version). Recall answers can therefore explain *why* a graph fact is believed and quote the exact source passage. The digest also runs automatically after maintenance cycles and on space startup, and each run re-verifies a sample of recorded citations. Disabled by default because it writes to the graph.
+
+**OKF interchange (requires full-scope token):**
+
+```
+POST /v1/{space_id}/wiki/import    {"entries": [{"path": "guides/setup.md", "content": "---\ntype: Guide\n---\n\n# ..."}], "namespace": "kb"}
+GET  /v1/{space_id}/wiki/export?namespace=kb
+```
+
+Bundles follow the OKF v0.1 convention (Markdown + YAML frontmatter; concept paths become hierarchical slugs). Unknown frontmatter keys, ordering and comments survive round-trips verbatim; re-importing an unchanged bundle is a no-op (checksum-idempotent). Export adds `x_anda_doc_id` / `x_anda_version_id` / `x_anda_checksum` provenance keys plus a root `index.md` and `manifest.json`, so a wiki snapshot can be reviewed with git diff and replayed into an empty space. Reserved files (`index.md`, `log.md`, non-Markdown) are skipped on import.
+
+---
+
 ## Integration Pattern
 
 A typical integration workflow for a business agent (replace `your-brain-host` with your deployment address, e.g. `localhost:8042`):

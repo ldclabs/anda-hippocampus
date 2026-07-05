@@ -5,15 +5,21 @@ use axum::{
     extract::{Path, Query, State},
     response::{IntoResponse, Response},
 };
+use http::StatusCode;
 use ic_auth_types::ByteArrayB64;
 use rand::Rng;
+use serde::Deserialize;
 use serde_json::json;
 
 use crate::{
     agents::SELF_USER_ID,
-    payload::{Accept, AppError, ContentType, HeaderVals, RpcResponse, StringOr},
-    space::AppState,
+    payload::{Accept, AppError, ContentType, HeaderVals, PayloadFormat, RpcResponse, StringOr},
+    space::{AppState, Space},
     types::*,
+    wiki::{
+        WikiAccess, WikiCommitInput, WikiError, WikiImportInput, WikiListDocsInput, WikiReadInput,
+        WikiSearchInput, WikiSelector, WikiVerifyInput,
+    },
 };
 
 const SKILL_MARKDOWN: &str = include_str!("../SKILL.md");
@@ -191,6 +197,605 @@ pub async fn post_recall(
     // 使用固定的 caller 进行 ingestions 和 queries
     let rt = space
         .query(SELF_USER_ID, input)
+        .await
+        .map_err(AppError::bad_request)?;
+    Ok(ct.response(RpcResponse::success(rt)))
+}
+
+// ─── Wiki ─────────────────────────────────────────────────────────────────────
+
+fn wiki_error(err: WikiError) -> AppError {
+    match &err {
+        WikiError::Conflict {
+            current_version,
+            updated_by,
+            updated_at,
+        } => AppError {
+            status: StatusCode::CONFLICT,
+            message: err.to_string(),
+            data: Some(json!({
+                "current_version": current_version,
+                "updated_by": updated_by,
+                "updated_at": updated_at,
+            })),
+        },
+        WikiError::TooLarge { .. } => {
+            AppError::with_status(StatusCode::PAYLOAD_TOO_LARGE, err.to_string())
+        }
+        WikiError::NotFound(_) => AppError::with_status(StatusCode::NOT_FOUND, err.to_string()),
+        WikiError::Invalid(_) => AppError::with_status(StatusCode::BAD_REQUEST, err.to_string()),
+        WikiError::Db(_) => {
+            AppError::with_status(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+        }
+    }
+}
+
+/// Resolves the audit actor: the authenticated CWT user, else a stable
+/// space-token identity, else the local dev identity.
+fn wiki_actor(t: &Option<CWToken>, st: Option<&SpaceToken>) -> String {
+    if let Some(t) = t {
+        return t.user.to_string();
+    }
+    match st {
+        Some(st) if !st.name.trim().is_empty() => format!("st:{}", st.name.trim()),
+        Some(_) => "st:unnamed".to_string(),
+        None => SELF_USER_ID.to_string(),
+    }
+}
+
+/// Verifies read access and returns the space token (for its ACL labels).
+/// CWT holders and public-space anonymous readers carry no space token.
+fn wiki_read_token(
+    space: &Space,
+    t: &Option<CWToken>,
+    token: String,
+    now_ms: u64,
+) -> Result<Option<SpaceToken>, AppError> {
+    if t.is_some() || space.is_public() {
+        return Ok(None);
+    }
+    space
+        .verify_space_token(token, TokenScope::Read, now_ms)
+        .map(Some)
+        .map_err(|_| AppError::unauthorized())
+}
+
+/// Read scope resolution (PRD §8.2): CWT holders and label-less space
+/// tokens are unrestricted; labeled tokens see unlabeled content plus their
+/// labels; anonymous public-space readers see unlabeled content only.
+fn wiki_read_access(t: &Option<CWToken>, st: Option<&SpaceToken>) -> WikiAccess {
+    let labels = if t.is_some() {
+        None
+    } else if let Some(st) = st {
+        st.labels.clone()
+    } else {
+        Some(Vec::new())
+    };
+    WikiAccess {
+        actor: wiki_actor(t, st),
+        labels,
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct WikiPageQuery {
+    pub cursor: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct WikiDocsQuery {
+    pub namespace: Option<String>,
+    pub status: Option<String>,
+    pub tag: Option<String>,
+    pub cursor: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct WikiContentQuery {
+    pub version: Option<u64>,
+    pub anchor: Option<String>,
+    pub start: Option<u64>,
+    pub end: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct WikiEventsQuery {
+    pub kind: Option<String>,
+    pub doc_id: Option<u64>,
+    pub cursor: Option<String>,
+    pub limit: Option<usize>,
+}
+
+/// POST /v1/{space_id}/wiki/docs — commit (create or CAS update)
+pub async fn post_wiki_commit(
+    State(app): State<AppState>,
+    Path(space_id): Path<String>,
+    Accept(ct, _): Accept,
+    HeaderVals(token, sharding): HeaderVals,
+    body: Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    ensure_sharding(&app, sharding)?;
+
+    let input: StringOr<WikiCommitInput> = ct.parse_body(&body).map_err(AppError::bad_request)?;
+    let input = match input {
+        StringOr::String(content) => WikiCommitInput::from_markdown(content),
+        StringOr::Value(input) => input,
+    };
+
+    let now_ms = unix_ms();
+    let t = app
+        .check_auth_if(&token, &space_id, TokenScope::Write, now_ms)
+        .map_err(|_| AppError::unauthorized())?;
+    let space = app
+        .load_space(&space_id, false)
+        .await
+        .map_err(AppError::bad_request)?;
+    let st = match &t {
+        Some(_) => None,
+        None => Some(
+            space
+                .verify_space_token(token, TokenScope::Write, now_ms)
+                .map_err(|_| AppError::unauthorized())?,
+        ),
+    };
+
+    let actor = wiki_actor(&t, st.as_ref());
+    let rt = space
+        .wiki
+        .commit(actor, input, now_ms)
+        .await
+        .map_err(wiki_error)?;
+    Ok(ct.response(RpcResponse::success(rt)))
+}
+
+/// GET /v1/{space_id}/wiki/docs
+pub async fn list_wiki_docs(
+    State(app): State<AppState>,
+    Path(space_id): Path<String>,
+    Query(q): Query<WikiDocsQuery>,
+    Accept(ct, _): Accept,
+    HeaderVals(token, sharding): HeaderVals,
+) -> Result<impl IntoResponse, AppError> {
+    ensure_sharding(&app, sharding)?;
+
+    let now_ms = unix_ms();
+    let t = app
+        .check_auth_if(&token, &space_id, TokenScope::Read, now_ms)
+        .map_err(|_| AppError::unauthorized())?;
+    let space = app
+        .load_space(&space_id, false)
+        .await
+        .map_err(AppError::bad_request)?;
+    let st = wiki_read_token(&space, &t, token, now_ms)?;
+    let access = wiki_read_access(&t, st.as_ref());
+
+    let rt = space
+        .wiki
+        .list_docs_scoped(
+            &access,
+            WikiListDocsInput {
+                namespace: q.namespace,
+                status: q.status,
+                tag: q.tag,
+                cursor: q.cursor,
+                limit: q.limit,
+            },
+        )
+        .await
+        .map_err(wiki_error)?;
+    Ok(ct.response(RpcResponse {
+        result: Some(rt.docs),
+        error: None,
+        next_cursor: rt.next_cursor,
+    }))
+}
+
+/// GET /v1/{space_id}/wiki/docs/{doc_id} — metadata + TOC
+pub async fn get_wiki_doc(
+    State(app): State<AppState>,
+    Path((space_id, doc_id)): Path<(String, u64)>,
+    Accept(ct, _): Accept,
+    HeaderVals(token, sharding): HeaderVals,
+) -> Result<impl IntoResponse, AppError> {
+    ensure_sharding(&app, sharding)?;
+
+    let now_ms = unix_ms();
+    let t = app
+        .check_auth_if(&token, &space_id, TokenScope::Read, now_ms)
+        .map_err(|_| AppError::unauthorized())?;
+    let space = app
+        .load_space(&space_id, false)
+        .await
+        .map_err(AppError::bad_request)?;
+    let st = wiki_read_token(&space, &t, token, now_ms)?;
+    let access = wiki_read_access(&t, st.as_ref());
+
+    let doc = space
+        .wiki
+        .get_doc_scoped(&access, doc_id)
+        .await
+        .map_err(wiki_error)?;
+    let toc = space
+        .wiki
+        .read_scoped(
+            &access,
+            WikiReadInput {
+                doc_id,
+                version: None,
+                selector: WikiSelector::Toc,
+            },
+            now_ms,
+        )
+        .await
+        .map_err(wiki_error)?;
+    Ok(ct.response(RpcResponse::success(json!({
+        "doc": doc,
+        "toc": toc.toc,
+    }))))
+}
+
+/// GET /v1/{space_id}/wiki/docs/{doc_id}/content
+///
+/// `?anchor=` reads one section, `?start=&end=` a byte range, neither reads
+/// the bounded full text; `?version=` time-travels.
+pub async fn get_wiki_content(
+    State(app): State<AppState>,
+    Path((space_id, doc_id)): Path<(String, u64)>,
+    Query(q): Query<WikiContentQuery>,
+    Accept(ct, _): Accept,
+    HeaderVals(token, sharding): HeaderVals,
+) -> Result<impl IntoResponse, AppError> {
+    ensure_sharding(&app, sharding)?;
+
+    let now_ms = unix_ms();
+    let t = app
+        .check_auth_if(&token, &space_id, TokenScope::Read, now_ms)
+        .map_err(|_| AppError::unauthorized())?;
+    let space = app
+        .load_space(&space_id, false)
+        .await
+        .map_err(AppError::bad_request)?;
+    let st = wiki_read_token(&space, &t, token, now_ms)?;
+    let access = wiki_read_access(&t, st.as_ref());
+
+    let selector = if let Some(anchor) = q.anchor {
+        WikiSelector::Section { anchor }
+    } else if let (Some(start), Some(end)) = (q.start, q.end) {
+        WikiSelector::Range { start, end }
+    } else {
+        WikiSelector::Full
+    };
+    let rt = space
+        .wiki
+        .read_scoped(
+            &access,
+            WikiReadInput {
+                doc_id,
+                version: q.version,
+                selector,
+            },
+            now_ms,
+        )
+        .await
+        .map_err(wiki_error)?;
+    Ok(ct.response(RpcResponse::success(rt)))
+}
+
+/// GET /v1/{space_id}/wiki/docs/{doc_id}/versions
+pub async fn list_wiki_versions(
+    State(app): State<AppState>,
+    Path((space_id, doc_id)): Path<(String, u64)>,
+    Query(pg): Query<WikiPageQuery>,
+    Accept(ct, _): Accept,
+    HeaderVals(token, sharding): HeaderVals,
+) -> Result<impl IntoResponse, AppError> {
+    ensure_sharding(&app, sharding)?;
+
+    let now_ms = unix_ms();
+    let t = app
+        .check_auth_if(&token, &space_id, TokenScope::Read, now_ms)
+        .map_err(|_| AppError::unauthorized())?;
+    let space = app
+        .load_space(&space_id, false)
+        .await
+        .map_err(AppError::bad_request)?;
+    let st = wiki_read_token(&space, &t, token, now_ms)?;
+    let access = wiki_read_access(&t, st.as_ref());
+
+    let rt = space
+        .wiki
+        .list_versions_scoped(&access, doc_id, pg.cursor, pg.limit)
+        .await
+        .map_err(wiki_error)?;
+    Ok(ct.response(RpcResponse {
+        result: Some(rt.versions),
+        error: None,
+        next_cursor: rt.next_cursor,
+    }))
+}
+
+/// POST /v1/{space_id}/wiki/docs/{doc_id}/archive
+pub async fn post_wiki_archive(
+    State(app): State<AppState>,
+    Path((space_id, doc_id)): Path<(String, u64)>,
+    Accept(ct, _): Accept,
+    HeaderVals(token, sharding): HeaderVals,
+) -> Result<impl IntoResponse, AppError> {
+    wiki_set_archived(app, space_id, doc_id, ct, token, sharding, true).await
+}
+
+/// POST /v1/{space_id}/wiki/docs/{doc_id}/restore
+pub async fn post_wiki_restore(
+    State(app): State<AppState>,
+    Path((space_id, doc_id)): Path<(String, u64)>,
+    Accept(ct, _): Accept,
+    HeaderVals(token, sharding): HeaderVals,
+) -> Result<impl IntoResponse, AppError> {
+    wiki_set_archived(app, space_id, doc_id, ct, token, sharding, false).await
+}
+
+async fn wiki_set_archived(
+    app: AppState,
+    space_id: String,
+    doc_id: u64,
+    ct: PayloadFormat,
+    token: String,
+    sharding: u32,
+    archive: bool,
+) -> Result<Response, AppError> {
+    ensure_sharding(&app, sharding)?;
+
+    let now_ms = unix_ms();
+    let t = app
+        .check_auth_if(&token, &space_id, TokenScope::Write, now_ms)
+        .map_err(|_| AppError::unauthorized())?;
+    let space = app
+        .load_space(&space_id, false)
+        .await
+        .map_err(AppError::bad_request)?;
+    let st = match &t {
+        Some(_) => None,
+        None => Some(
+            space
+                .verify_space_token(token, TokenScope::Write, now_ms)
+                .map_err(|_| AppError::unauthorized())?,
+        ),
+    };
+
+    let actor = wiki_actor(&t, st.as_ref());
+    let rt = if archive {
+        space.wiki.archive(actor, doc_id, now_ms).await
+    } else {
+        space.wiki.restore(actor, doc_id, now_ms).await
+    }
+    .map_err(wiki_error)?;
+    Ok(ct.response(RpcResponse::success(rt)).into_response())
+}
+
+/// POST /v1/{space_id}/wiki/search
+pub async fn post_wiki_search(
+    State(app): State<AppState>,
+    Path(space_id): Path<String>,
+    Accept(ct, _): Accept,
+    HeaderVals(token, sharding): HeaderVals,
+    body: Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    ensure_sharding(&app, sharding)?;
+
+    let input: StringOr<WikiSearchInput> = ct.parse_body(&body).map_err(AppError::bad_request)?;
+    let input = match input {
+        StringOr::String(query) => WikiSearchInput::from_query(query),
+        StringOr::Value(input) => input,
+    };
+
+    let now_ms = unix_ms();
+    let t = app
+        .check_auth_if(&token, &space_id, TokenScope::Read, now_ms)
+        .map_err(|_| AppError::unauthorized())?;
+    let space = app
+        .load_space(&space_id, false)
+        .await
+        .map_err(AppError::bad_request)?;
+    let st = wiki_read_token(&space, &t, token, now_ms)?;
+    let access = wiki_read_access(&t, st.as_ref());
+
+    let rt = space
+        .wiki
+        .search_scoped(&access, input, now_ms)
+        .await
+        .map_err(wiki_error)?;
+    Ok(ct.response(RpcResponse::success(rt)))
+}
+
+/// POST /v1/{space_id}/wiki/verify — citation verification
+pub async fn post_wiki_verify(
+    State(app): State<AppState>,
+    Path(space_id): Path<String>,
+    Accept(ct, _): Accept,
+    HeaderVals(token, sharding): HeaderVals,
+    body: Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    ensure_sharding(&app, sharding)?;
+
+    let input: StringOr<WikiVerifyInput> = ct.parse_body(&body).map_err(AppError::bad_request)?;
+    let input = match input {
+        StringOr::String(uri) => WikiVerifyInput {
+            uri: Some(uri),
+            ..Default::default()
+        },
+        StringOr::Value(input) => input,
+    };
+
+    let now_ms = unix_ms();
+    let t = app
+        .check_auth_if(&token, &space_id, TokenScope::Read, now_ms)
+        .map_err(|_| AppError::unauthorized())?;
+    let space = app
+        .load_space(&space_id, false)
+        .await
+        .map_err(AppError::bad_request)?;
+    let st = wiki_read_token(&space, &t, token, now_ms)?;
+    let access = wiki_read_access(&t, st.as_ref());
+    let rt = space
+        .wiki
+        .verify_scoped(&access, input, now_ms)
+        .await
+        .map_err(wiki_error)?;
+    Ok(ct.response(RpcResponse::success(rt)))
+}
+
+/// GET /v1/{space_id}/wiki/events
+pub async fn list_wiki_events(
+    State(app): State<AppState>,
+    Path(space_id): Path<String>,
+    Query(q): Query<WikiEventsQuery>,
+    Accept(ct, _): Accept,
+    HeaderVals(token, sharding): HeaderVals,
+) -> Result<impl IntoResponse, AppError> {
+    ensure_sharding(&app, sharding)?;
+
+    let now_ms = unix_ms();
+    let t = app
+        .check_auth_if(&token, &space_id, TokenScope::Read, now_ms)
+        .map_err(|_| AppError::unauthorized())?;
+    let space = app
+        .load_space(&space_id, false)
+        .await
+        .map_err(AppError::bad_request)?;
+    let st = wiki_read_token(&space, &t, token, now_ms)?;
+    let access = wiki_read_access(&t, st.as_ref());
+    if access.labels.is_some() {
+        // The audit log spans all labels; restricted tokens cannot read it.
+        return Err(AppError::with_status(
+            StatusCode::FORBIDDEN,
+            "audit events require an unrestricted token",
+        ));
+    }
+
+    let rt = space
+        .wiki
+        .list_events(q.kind, q.doc_id, q.cursor, q.limit)
+        .await
+        .map_err(wiki_error)?;
+    Ok(ct.response(RpcResponse {
+        result: Some(rt.events),
+        error: None,
+        next_cursor: rt.next_cursor,
+    }))
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct WikiExportQuery {
+    pub namespace: Option<String>,
+}
+
+/// POST /v1/{space_id}/wiki/import — OKF bundle import (requires All scope)
+pub async fn post_wiki_import(
+    State(app): State<AppState>,
+    Path(space_id): Path<String>,
+    Accept(ct, _): Accept,
+    HeaderVals(token, sharding): HeaderVals,
+    body: Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    ensure_sharding(&app, sharding)?;
+
+    let input: StringOr<WikiImportInput> = ct.parse_body(&body).map_err(AppError::bad_request)?;
+    let StringOr::Value(input) = input else {
+        return Err(AppError::bad_request(
+            "wiki import expects a structured bundle body",
+        ));
+    };
+
+    let now_ms = unix_ms();
+    let t = app
+        .check_auth_if(&token, &space_id, TokenScope::All, now_ms)
+        .map_err(|_| AppError::unauthorized())?;
+    let space = app
+        .load_space(&space_id, false)
+        .await
+        .map_err(AppError::bad_request)?;
+    let st = match &t {
+        Some(_) => None,
+        None => Some(
+            space
+                .verify_space_token(token, TokenScope::All, now_ms)
+                .map_err(|_| AppError::unauthorized())?,
+        ),
+    };
+
+    let actor = wiki_actor(&t, st.as_ref());
+    let rt = space
+        .wiki
+        .import_bundle(actor, input, now_ms)
+        .await
+        .map_err(wiki_error)?;
+    Ok(ct.response(RpcResponse::success(rt)))
+}
+
+/// GET /v1/{space_id}/wiki/export?namespace= — OKF bundle export (requires All scope)
+pub async fn get_wiki_export(
+    State(app): State<AppState>,
+    Path(space_id): Path<String>,
+    Query(q): Query<WikiExportQuery>,
+    Accept(ct, _): Accept,
+    HeaderVals(token, sharding): HeaderVals,
+) -> Result<impl IntoResponse, AppError> {
+    ensure_sharding(&app, sharding)?;
+
+    let now_ms = unix_ms();
+    let t = app
+        .check_auth_if(&token, &space_id, TokenScope::All, now_ms)
+        .map_err(|_| AppError::unauthorized())?;
+    let space = app
+        .load_space(&space_id, false)
+        .await
+        .map_err(AppError::bad_request)?;
+    let st = match &t {
+        Some(_) => None,
+        None => Some(
+            space
+                .verify_space_token(token, TokenScope::All, now_ms)
+                .map_err(|_| AppError::unauthorized())?,
+        ),
+    };
+
+    let actor = wiki_actor(&t, st.as_ref());
+    let rt = space
+        .wiki
+        .export_bundle(actor, q.namespace, now_ms)
+        .await
+        .map_err(wiki_error)?;
+    Ok(ct.response(RpcResponse::success(rt)))
+}
+
+/// POST /v1/{space_id}/wiki/digest — distill pending wiki versions into the
+/// Cognitive Nexus (requires the space to have wiki_digest enabled)
+pub async fn post_wiki_digest(
+    State(app): State<AppState>,
+    Path(space_id): Path<String>,
+    Accept(ct, _): Accept,
+    HeaderVals(token, sharding): HeaderVals,
+) -> Result<impl IntoResponse, AppError> {
+    ensure_sharding(&app, sharding)?;
+
+    let now_ms = unix_ms();
+    let t = app
+        .check_auth_if(&token, &space_id, TokenScope::Write, now_ms)
+        .map_err(|_| AppError::unauthorized())?;
+    let space = app
+        .load_space(&space_id, false)
+        .await
+        .map_err(AppError::bad_request)?;
+    if t.is_none() {
+        space
+            .verify_space_token(token, TokenScope::Write, now_ms)
+            .map_err(|_| AppError::unauthorized())?;
+    }
+
+    let rt = space
+        .run_wiki_digest(SELF_USER_ID)
         .await
         .map_err(AppError::bad_request)?;
     Ok(ct.response(RpcResponse::success(rt)))
@@ -728,11 +1333,13 @@ pub async fn update_space_tier(
 #[cfg(test)]
 mod tests {
     use super::{
-        add_space_token, apple_touch_icon, create_space, execute_kip_readonly, favicon, get_byok,
-        get_conversation, get_conversation_delta, get_formation_status, get_info, get_information,
-        get_or_init_user, get_skill, list_conversations, list_space_tokens, post_formation,
-        post_maintenance, post_recall, restart_formation, revoke_space_token, update_byok,
-        update_space, update_space_tier,
+        WikiContentQuery, WikiEventsQuery, WikiExportQuery, add_space_token, apple_touch_icon,
+        create_space, execute_kip_readonly, favicon, get_byok, get_conversation,
+        get_conversation_delta, get_formation_status, get_info, get_information, get_or_init_user,
+        get_skill, get_wiki_content, get_wiki_doc, get_wiki_export, list_conversations,
+        list_space_tokens, list_wiki_events, post_formation, post_maintenance, post_recall,
+        post_wiki_commit, post_wiki_import, post_wiki_search, post_wiki_verify, restart_formation,
+        revoke_space_token, update_byok, update_space, update_space_tier,
     };
     use crate::{
         agents::SELF_USER_ID,
@@ -1028,6 +1635,7 @@ mod tests {
             name: Some("Handler Brain".to_string()),
             description: Some("handler coverage".to_string()),
             public: Some(true),
+            ..Default::default()
         };
         let updated = ok_json(
             update_space(
@@ -1104,6 +1712,7 @@ mod tests {
             scope: TokenScope::Read,
             name: "reader".to_string(),
             expires_at: None,
+            labels: None,
         };
         let added = ok_json(
             add_space_token(
@@ -1226,6 +1835,7 @@ mod tests {
                     scope: TokenScope::Write,
                     name: "writer".to_string(),
                     expires_at: None,
+                    labels: None,
                 },
                 unix_ms(),
             )
@@ -1308,11 +1918,11 @@ mod tests {
             scope: TokenScope::Read,
             name: "reader".to_string(),
             expires_at: None,
+            labels: None,
         };
         let update_input = UpdateSpaceInput {
             name: Some("ignored".to_string()),
-            description: None,
-            public: None,
+            ..Default::default()
         };
 
         let info = err_json(
@@ -1697,9 +2307,8 @@ mod tests {
         space
             .update(
                 UpdateSpaceInput {
-                    name: None,
-                    description: None,
                     public: Some(true),
+                    ..Default::default()
                 },
                 unix_ms(),
             )
@@ -1880,6 +2489,7 @@ mod tests {
                     scope: TokenScope::Read,
                     name: "reader".to_string(),
                     expires_at: None,
+                    labels: None,
                 },
                 unix_ms(),
             )
@@ -1892,6 +2502,7 @@ mod tests {
                     scope: TokenScope::Write,
                     name: "writer".to_string(),
                     expires_at: None,
+                    labels: None,
                 },
                 unix_ms(),
             )
@@ -2082,5 +2693,313 @@ mod tests {
         )
         .await;
         assert!(maintenance["result"]["conversation"].is_number());
+    }
+
+    #[tokio::test]
+    async fn wiki_handlers_commit_search_read_and_conflict_mapping() {
+        let app = test_app_state("handler_wiki", 0);
+        let space_id = "handler_wiki_space".to_string();
+        create_loaded_space(&app, &space_id).await;
+
+        // Commit via JSON body.
+        let commit = ok_json(
+            post_wiki_commit(
+                State(app.clone()),
+                Path(space_id.clone()),
+                accept_json(),
+                headers(&app),
+                json_bytes(&crate::wiki::WikiCommitInput {
+                    title: "回滚手册".to_string(),
+                    content: "# 回滚手册\n\n生产事故时按引用校验和回滚到上一版本。\n".to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        let doc_id = commit["result"]["doc"]["id"].as_u64().unwrap();
+        let version_id = commit["result"]["version"]["id"].as_u64().unwrap();
+        assert!(commit["result"]["created"].as_bool().unwrap());
+
+        // Search returns hits with citations.
+        let search = ok_json(
+            post_wiki_search(
+                State(app.clone()),
+                Path(space_id.clone()),
+                accept_json(),
+                headers(&app),
+                json_bytes(&crate::wiki::WikiSearchInput::from_query(
+                    "回滚".to_string(),
+                )),
+            )
+            .await,
+        )
+        .await;
+        let uri = search["result"]["hits"][0]["citation"]["uri"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(uri.starts_with(&format!("wiki://{space_id}/{doc_id}@{version_id}#")));
+
+        // Doc detail with TOC, and full content read.
+        let detail = ok_json(
+            get_wiki_doc(
+                State(app.clone()),
+                Path((space_id.clone(), doc_id)),
+                accept_json(),
+                headers(&app),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            detail["result"]["toc"]
+                .as_array()
+                .is_some_and(|t| !t.is_empty())
+        );
+        let content = ok_json(
+            get_wiki_content(
+                State(app.clone()),
+                Path((space_id.clone(), doc_id)),
+                Query(WikiContentQuery::default()),
+                accept_json(),
+                headers(&app),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            content["result"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("回滚")
+        );
+
+        // Verify the citation URI over HTTP.
+        let verify = ok_json(
+            post_wiki_verify(
+                State(app.clone()),
+                Path(space_id.clone()),
+                accept_json(),
+                headers(&app),
+                json_bytes(&crate::wiki::WikiVerifyInput {
+                    uri: Some(
+                        uri.replace(&format!("wiki://{space_id}"), "wiki://handler_wiki_space"),
+                    ),
+                    ..Default::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(verify["result"]["status"].as_str(), Some("valid"));
+
+        // Stale CAS maps to 409 with structured current_version data.
+        let conflict = err_json(
+            post_wiki_commit(
+                State(app.clone()),
+                Path(space_id.clone()),
+                accept_json(),
+                headers(&app),
+                json_bytes(&crate::wiki::WikiCommitInput {
+                    doc_id: Some(doc_id),
+                    parent_version: Some(version_id + 999),
+                    title: "回滚手册".to_string(),
+                    content: "# 回滚手册\n\n不同内容。\n".to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await,
+            StatusCode::CONFLICT,
+        )
+        .await;
+        assert_eq!(
+            conflict["error"]["data"]["current_version"].as_u64(),
+            Some(version_id)
+        );
+
+        // Unknown doc maps to 404.
+        let _ = err_json(
+            get_wiki_doc(
+                State(app.clone()),
+                Path((space_id.clone(), 999_999)),
+                accept_json(),
+                headers(&app),
+            )
+            .await,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+    }
+
+    /// M4 acceptance over HTTP: a space token restricted to other labels
+    /// cannot retrieve a labeled probe document; a token granted the label
+    /// can. The filter runs inside the retrieval query itself.
+    #[tokio::test]
+    async fn wiki_restricted_token_cannot_see_labeled_probe() {
+        let app = test_app_state_with_auth_enabled("handler_wiki_acl", 0);
+        let space_id = "handler_wiki_acl_space".to_string();
+        let space = create_loaded_space(&app, &space_id).await;
+
+        // Seed one open and one labeled probe document directly.
+        space
+            .wiki
+            .commit(
+                "admin".to_string(),
+                crate::wiki::WikiCommitInput {
+                    title: "公开文档".to_string(),
+                    content: "# 公开文档\n\n公开探针：晨雾灯塔。\n".to_string(),
+                    ..Default::default()
+                },
+                unix_ms(),
+            )
+            .await
+            .unwrap();
+        space
+            .wiki
+            .commit(
+                "admin".to_string(),
+                crate::wiki::WikiCommitInput {
+                    title: "机密文档".to_string(),
+                    content: "# 机密文档\n\n机密探针：夜航坐标。\n".to_string(),
+                    acl_label: Some("secret".to_string()),
+                    ..Default::default()
+                },
+                unix_ms(),
+            )
+            .await
+            .unwrap();
+
+        // Two space tokens: one restricted to an unrelated label, one
+        // granted "secret".
+        space
+            .add_space_token(
+                "STouter".to_string(),
+                AddSpaceTokenInput {
+                    scope: TokenScope::Read,
+                    name: "outsider".to_string(),
+                    expires_at: None,
+                    labels: Some(vec!["public-team".to_string()]),
+                },
+                unix_ms(),
+            )
+            .await
+            .unwrap();
+        space
+            .add_space_token(
+                "STinner".to_string(),
+                AddSpaceTokenInput {
+                    scope: TokenScope::Read,
+                    name: "insider".to_string(),
+                    expires_at: None,
+                    labels: Some(vec!["secret".to_string()]),
+                },
+                unix_ms(),
+            )
+            .await
+            .unwrap();
+
+        let search = |token: &str, query: &str| {
+            let app = app.clone();
+            let space_id = space_id.clone();
+            let token = token.to_string();
+            let query = query.to_string();
+            async move {
+                ok_json(
+                    post_wiki_search(
+                        State(app),
+                        Path(space_id),
+                        accept_json(),
+                        HeaderVals(token, 0),
+                        json_bytes(&crate::wiki::WikiSearchInput::from_query(query)),
+                    )
+                    .await,
+                )
+                .await
+            }
+        };
+
+        // Restricted token: the labeled probe is invisible at the database
+        // level, unlabeled content still searchable.
+        let miss = search("STouter", "夜航坐标").await;
+        assert_eq!(miss["result"]["hits"].as_array().unwrap().len(), 0);
+        assert_eq!(miss["result"]["total_docs_matched"].as_u64(), Some(0));
+        let open_hit = search("STouter", "晨雾灯塔").await;
+        assert_eq!(open_hit["result"]["hits"].as_array().unwrap().len(), 1);
+
+        // Granted token sees the probe.
+        let hit = search("STinner", "夜航坐标").await;
+        assert_eq!(hit["result"]["hits"].as_array().unwrap().len(), 1);
+
+        // Restricted tokens cannot read the audit log.
+        let _ = err_json(
+            list_wiki_events(
+                State(app.clone()),
+                Path(space_id.clone()),
+                Query(WikiEventsQuery::default()),
+                accept_json(),
+                HeaderVals("STouter".to_string(), 0),
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn wiki_import_export_round_trip_over_http() {
+        let app = test_app_state("handler_wiki_okf", 0);
+        let space_id = "handler_wiki_okf_space".to_string();
+        create_loaded_space(&app, &space_id).await;
+
+        let import = ok_json(
+            post_wiki_import(
+                State(app.clone()),
+                Path(space_id.clone()),
+                accept_json(),
+                headers(&app),
+                json_bytes(&crate::wiki::WikiImportInput {
+                    entries: vec![crate::wiki::WikiBundleEntry {
+                        path: "guides/setup.md".to_string(),
+                        content: "---\ntype: Guide\ncustom_key: 保留\n---\n\n# 安装指南\n\n执行安装脚本。\n"
+                            .to_string(),
+                    }],
+                    namespace: Some("kb".to_string()),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(import["result"]["created"].as_u64(), Some(1));
+
+        let export = ok_json(
+            get_wiki_export(
+                State(app.clone()),
+                Path(space_id.clone()),
+                Query(WikiExportQuery {
+                    namespace: Some("kb".to_string()),
+                }),
+                accept_json(),
+                headers(&app),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(export["result"]["docs"].as_u64(), Some(1));
+        let entries = export["result"]["entries"].as_array().unwrap();
+        let paths: Vec<&str> = entries
+            .iter()
+            .map(|e| e["path"].as_str().unwrap())
+            .collect();
+        assert!(paths.contains(&"guides/setup.md"));
+        assert!(paths.contains(&"index.md"));
+        assert!(paths.contains(&"manifest.json"));
+        let doc_entry = entries
+            .iter()
+            .find(|e| e["path"] == "guides/setup.md")
+            .unwrap();
+        let content = doc_entry["content"].as_str().unwrap();
+        assert!(content.contains("custom_key: 保留"));
+        assert!(content.contains("x_anda_doc_id:"));
     }
 }

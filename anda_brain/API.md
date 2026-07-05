@@ -83,6 +83,7 @@ export interface AddSpaceTokenInput {
   scope: TokenScope;
   name: string;
   expires_at?: number; // Unix timestamp in milliseconds
+  labels?: string[]; // wiki ACL labels; omitted = unrestricted
 }
 
 export interface RevokeSpaceTokenInput {
@@ -93,6 +94,9 @@ export interface UpdateSpaceInput {
   name?: string;
   description?: string;
   public?: boolean;
+  wiki_digest?: boolean; // enable WikiDigest graph extraction (default false)
+  wiki_audit_reads?: boolean; // event external wiki reads (default false)
+  wiki_acl_defaults?: Record<string, string>; // namespace -> default ACL label
 }
 
 export interface FormationRestartInput {
@@ -108,6 +112,196 @@ export interface CreateOrUpdateSpaceInput {
 export interface GetOrInitUserInput {
   user: string;
   name?: string;
+}
+
+// ── Wiki: versioned reference documents with verifiable citations ──────────
+
+export type WikiDocStatus = 'active' | 'archived';
+export type WikiSearchMode = 'chunks' | 'docs';
+
+export interface WikiCommitInput {
+  doc_id?: number; // omit to create a new document
+  parent_version?: number; // required on update (CAS); stale value -> 409
+  namespace?: string; // default "default"
+  slug?: string; // display slug; derived from title when omitted
+  title: string;
+  content: string; // full Markdown document (not a diff); <= 1 MiB normalized
+  tags?: string[]; // omit to keep stored tags on update
+  acl_label?: string; // omit to keep/inherit namespace default; "" clears
+  source_uri?: string; // omit to keep
+  message?: string; // commit message
+  metadata?: Record<string, unknown>; // omit to keep
+}
+
+export interface WikiDocInfo {
+  id: number;
+  namespace: string;
+  slug: string;
+  title: string;
+  status: WikiDocStatus;
+  current_version: number;
+  current_checksum: string; // "sha3-256:..."
+  tags: string[];
+  acl_label?: string;
+  source_uri?: string;
+  metadata?: Record<string, unknown>;
+  created_by: string;
+  updated_by: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface WikiVersionInfo {
+  id: number;
+  doc_id: number;
+  parent_version?: number;
+  checksum: string;
+  size: number;
+  author: string;
+  message?: string;
+  created_at: number;
+}
+
+export interface WikiCommitOutput {
+  doc: WikiDocInfo;
+  version: WikiVersionInfo;
+  chunks: number;
+  created: boolean;
+  idempotent: boolean; // true when nothing changed (no new version written)
+}
+
+export interface WikiSearchInput {
+  query: string; // BM25 keywords: exact terms, product names, error codes
+  namespaces?: string[];
+  doc_ids?: number[];
+  tags?: string[];
+  top_k?: number; // 1-50, default 8
+  mode?: WikiSearchMode; // 'docs' = one best hit per document
+  expand?: number; // 0-2 neighbor expansion; citations widen accordingly
+}
+
+export interface WikiCitation {
+  uri: string; // wiki://{space}/{doc_id}@{version_id}#{start}-{end}
+  doc_id: number;
+  version_id: number;
+  chunk_id: number;
+  heading_path: string[];
+  anchor: string; // stable section anchor for wiki_read
+  byte_range: [number, number];
+  checksum: string; // verifiable via /wiki/verify
+  quote: string;
+}
+
+export interface WikiHit {
+  text: string;
+  doc_title: string;
+  heading_path: string[];
+  score?: number;
+  citation: WikiCitation;
+}
+
+export interface WikiSearchOutput {
+  hits: WikiHit[];
+  total_docs_matched: number;
+}
+
+export type WikiSelector =
+  | { type: 'toc' }
+  | { type: 'section'; anchor: string }
+  | { type: 'range'; start: number; end: number }
+  | { type: 'full' };
+
+export interface WikiReadInput {
+  doc_id: number;
+  version?: number; // time-travel read of a historical version
+  selector?: WikiSelector; // default { type: 'full' }
+}
+
+export interface WikiTocEntry {
+  anchor: string;
+  heading_path: string[];
+  byte_start: number;
+  byte_end: number;
+}
+
+export interface WikiReadOutput {
+  doc_id: number;
+  version_id: number;
+  is_current: boolean;
+  title: string;
+  status: WikiDocStatus;
+  checksum: string;
+  size: number;
+  toc?: WikiTocEntry[]; // for the 'toc' selector
+  content?: string; // for section/range/full selectors
+  byte_range?: [number, number];
+  truncated: boolean; // full reads are bounded (256 KiB)
+}
+
+export interface WikiVerifyInput {
+  uri?: string; // wiki:// citation URI, or pass the explicit fields below
+  doc_id?: number;
+  version_id?: number;
+  byte_range?: [number, number];
+  checksum?: string; // compared against the recomputed checksum when present
+}
+
+export type WikiVerifyStatus = 'valid' | 'superseded' | 'invalid' | 'not_found';
+
+export interface WikiVerifyOutput {
+  status: WikiVerifyStatus; // 'superseded' = intact but a newer version exists
+  current_version?: number;
+  checksum?: string; // recomputed from immutable content
+  quote?: string;
+}
+
+export interface WikiBundleEntry {
+  path: string; // bundle-relative path, e.g. "guides/setup.md"
+  content: string;
+}
+
+export interface WikiImportInput {
+  entries: WikiBundleEntry[]; // OKF v0.1 bundle files (Markdown + YAML frontmatter)
+  namespace?: string; // default "default"; bundles round-trip per namespace
+}
+
+export type WikiImportStatus = 'created' | 'updated' | 'unchanged';
+
+export interface WikiImportOutput {
+  created: number;
+  updated: number;
+  unchanged: number; // checksum-idempotent: re-imports never grow versions
+  docs: { path: string; doc_id: number; version_id: number; status: WikiImportStatus }[];
+  skipped?: { path: string; reason: string }[];
+}
+
+export interface WikiExportOutput {
+  namespace: string;
+  entries: WikiBundleEntry[]; // concept .md files + index.md + manifest.json
+  docs: number;
+}
+
+export interface WikiEventInfo {
+  id: number;
+  // DocCreated | VersionCommitted | DocArchived | DocRestored | OrphanSwept
+  // | CitationVerifyFailed | ImportCompleted | ExportCompleted
+  // | DigestExtracted | WikiQueried | WikiRead | StaleReport | EventsPruned
+  kind: string;
+  doc_id?: number;
+  version_id?: number;
+  actor: string;
+  detail?: Record<string, unknown>;
+  created_at: number;
+}
+
+export interface WikiDigestReport {
+  digested: number; // versions distilled into the Cognitive Nexus
+  facts: number; // propositions written (with wiki:// citation metadata)
+  superseded: number; // stale propositions marked superseded
+  skipped: number;
+  citations_checked: number; // post-run citation sample
+  citations_invalid: number;
+  usage: Usage;
 }
 
 export interface McpServerConfig {
@@ -159,6 +353,7 @@ export interface SpaceToken {
   created_at: number; // Unix timestamp in milliseconds
   updated_at: number; // Unix timestamp in milliseconds
   expires_at?: number; // Unix timestamp in milliseconds
+  labels?: string[]; // wiki ACL labels: token sees unlabeled content plus these
 }
 
 export interface StorageStats {
@@ -182,6 +377,12 @@ export interface SpaceInfo {
   formation_processed_id: number;
   maintenance_processed_id: number;
   maintenance_at: MaintenanceAt;
+  wiki_docs: number;
+  wiki_chunks: number;
+  wiki_versions: number;
+  wiki_queries: number;
+  wiki_digested: number; // digest high-water mark (version id)
+  wiki_stale_docs: number; // from the last housekeeping stale scan
 }
 
 export interface FormationStatus {
@@ -427,7 +628,97 @@ When `ED25519_PUBKEYS` is set, configure the remote MCP client with an `Authoriz
 
 ---
 
-## 4.3 Space Management Endpoints (`/v1/{space_id}/management`)
+## 4.3 Wiki Endpoints (`/v1/{space_id}/wiki`)
+
+The wiki is the space's versioned reference memory (policies, manuals, SOPs, API docs). Writes are git-like immutable commits with CAS concurrency control; searches return verifiable `wiki://` citations. ACL: documents may carry an `acl_label`; space tokens with `labels` see unlabeled content plus their granted labels — enforced inside the retrieval query itself. Anonymous readers of public spaces see unlabeled content only; denials surface as 404.
+
+Wiki-specific error semantics: `409` commit conflict (`error.data.current_version` carries the version to rebase on), `413` content over 1 MiB, `404` not found / ACL-denied.
+
+### POST `/v1/{space_id}/wiki/docs`
+
+- Purpose: Commit a document (create, or CAS update with `doc_id` + `parent_version`); identical content is a no-op
+- Auth: SpaceToken/CWT `write`
+- Request body: `WikiCommitInput` (raw Markdown string is also accepted; the title derives from the first heading)
+- Response: `RpcResponse<WikiCommitOutput>`
+
+### GET `/v1/{space_id}/wiki/docs?namespace=<ns>&status=<status>&tag=<tag>&cursor=<cursor>&limit=<n>`
+
+- Purpose: List documents with pagination
+- Auth: SpaceToken/CWT `read` (public spaces are unauthenticated; ACL labels apply)
+- Response: `RpcResponse<WikiDocInfo[]>` (next page cursor via `next_cursor`)
+
+### GET `/v1/{space_id}/wiki/docs/{doc_id}`
+
+- Purpose: Document metadata plus table of contents
+- Auth: SpaceToken/CWT `read` (public spaces are unauthenticated; ACL labels apply)
+- Response: `RpcResponse<{ doc: WikiDocInfo; toc: WikiTocEntry[] }>`
+
+### GET `/v1/{space_id}/wiki/docs/{doc_id}/content?version=<id>&anchor=<anchor>&start=<n>&end=<n>`
+
+- Purpose: Progressive reading — `anchor` reads one section, `start`+`end` a byte range, neither reads the bounded full text; `version` time-travels
+- Auth: SpaceToken/CWT `read` (public spaces are unauthenticated; ACL labels apply)
+- Response: `RpcResponse<WikiReadOutput>`
+
+### GET `/v1/{space_id}/wiki/docs/{doc_id}/versions?cursor=<cursor>&limit=<n>`
+
+- Purpose: Version history (immutable commit chain)
+- Auth: SpaceToken/CWT `read` (public spaces are unauthenticated; ACL labels apply)
+- Response: `RpcResponse<WikiVersionInfo[]>` (next page cursor via `next_cursor`)
+
+### POST `/v1/{space_id}/wiki/docs/{doc_id}/archive`
+
+- Purpose: Archive a document (hidden from search, still readable by id, restorable)
+- Auth: SpaceToken/CWT `write`
+- Response: `RpcResponse<WikiDocInfo>`
+
+### POST `/v1/{space_id}/wiki/docs/{doc_id}/restore`
+
+- Purpose: Restore an archived document into search
+- Auth: SpaceToken/CWT `write`
+- Response: `RpcResponse<WikiDocInfo>`
+
+### POST `/v1/{space_id}/wiki/search`
+
+- Purpose: BM25 keyword retrieval over document passages, returning snippets with verifiable citations
+- Auth: SpaceToken/CWT `read` (public spaces are unauthenticated; ACL labels apply)
+- Request body: `WikiSearchInput` (raw query string is also accepted)
+- Response: `RpcResponse<WikiSearchOutput>`
+
+### POST `/v1/{space_id}/wiki/verify`
+
+- Purpose: Verify a citation against immutable stored content
+- Auth: SpaceToken/CWT `read` (public spaces are unauthenticated; ACL labels apply)
+- Request body: `WikiVerifyInput` (raw `wiki://` URI string is also accepted)
+- Response: `RpcResponse<WikiVerifyOutput>`
+
+### GET `/v1/{space_id}/wiki/events?kind=<kind>&doc_id=<id>&cursor=<cursor>&limit=<n>`
+
+- Purpose: Query the append-only audit log (writes, imports, digests; reads too when `wiki_audit_reads` is enabled)
+- Auth: SpaceToken/CWT `read`; tokens restricted by ACL labels are rejected with `403`
+- Response: `RpcResponse<WikiEventInfo[]>` (next page cursor via `next_cursor`)
+
+### POST `/v1/{space_id}/wiki/import`
+
+- Purpose: Import an OKF v0.1 bundle; checksum-idempotent (re-imports never grow version chains); unknown frontmatter keys survive round-trips verbatim
+- Auth: SpaceToken/CWT `*` (full scope)
+- Request body: `WikiImportInput`
+- Response: `RpcResponse<WikiImportOutput>`
+
+### GET `/v1/{space_id}/wiki/export?namespace=<ns>`
+
+- Purpose: Export one namespace as an OKF bundle (concept `.md` files + `index.md` + `manifest.json` with checksums); replayable into an empty space
+- Auth: SpaceToken/CWT `*` (full scope)
+- Response: `RpcResponse<WikiExportOutput>`
+
+### POST `/v1/{space_id}/wiki/digest`
+
+- Purpose: Distill pending wiki versions into the Cognitive Nexus as propositions with `wiki://` citation metadata; supersedes facts the newest version no longer asserts (requires `update_space {"wiki_digest": true}`)
+- Auth: SpaceToken/CWT `write`
+- Response: `RpcResponse<WikiDigestReport>`
+
+---
+
+## 4.4 Space Management Endpoints (`/v1/{space_id}/management`)
 
 ### GET `/v1/{space_id}/management/space_tokens`
 
@@ -475,7 +766,7 @@ When `ED25519_PUBKEYS` is set, configure the remote MCP client with an `Authoriz
 
 ---
 
-## 4.4 Admin Endpoints (`/admin`)
+## 4.5 Admin Endpoints (`/admin`)
 
 ### POST `/admin/create_space`
 

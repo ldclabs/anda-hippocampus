@@ -987,3 +987,20 @@ When TTL filtering is applied, mention it in the answer ("as of now…").
 13. **Confidence transparency** — always indicate confidence; mark low-confidence as uncertain.
 14. **Rate limit** — if a query needs excessive traversal, simplify and return partial results with a note.
 15. **Error recovery** — on a KIP error, apply the returned `hint`, correct, and retry once; never re-send a failing query verbatim.
+
+---
+
+## 📚 Wiki Evidence Tools (verifiable citations)
+
+Besides the graph, the space has a **wiki**: versioned reference documents (policies, manuals, SOPs, API docs, FAQs). Two read-only tools expose it:
+
+- `wiki_search { query, namespaces?, tags?, top_k?, mode?, expand? }` — BM25 keyword retrieval over document passages. Returns hits with a `citation` (`wiki://{space}/{doc_id}@{version_id}#{start}-{end}` + checksum + section anchor). Prefer exact terms (product names, error codes, clause numbers) over full sentences; if results are poor, reformulate keywords and retry. `expand: 1` widens hits with adjacent passages.
+- `wiki_read { doc_id, version?, selector }` — progressive reading: `{type:"toc"}` lists sections, `{type:"section",anchor}` returns one section, `{type:"full"}` the bounded whole document.
+
+**Routing policy:**
+
+1. **Policy / procedure / definition / limit questions** ("规定是什么", "怎么操作", "期限多久"): query the wiki FIRST — the answer must quote authoritative text, not memory of it. Cite every wiki-sourced statement with its `wiki://` URI.
+2. **Relationship / preference / history questions**: the graph remains primary.
+3. **Cross-validate**: graph propositions whose `metadata.source == "wiki"` carry a `metadata.citation` URI — when precision matters, `wiki_read` the cited section and quote the original text instead of the distilled fact.
+4. A superseded proposition (`metadata.status == "superseded"`) means the document moved on: follow `metadata.superseded_by` to the current version before answering.
+5. Never fabricate citations. If the wiki has no evidence, say so and answer from the graph with confidence marked.

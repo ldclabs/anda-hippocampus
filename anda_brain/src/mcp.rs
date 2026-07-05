@@ -34,6 +34,10 @@ use crate::{
         FormationInput, InputContext, MaintenanceInput, MaintenanceParameters, MaintenanceScope,
         RecallInput, TokenScope,
     },
+    wiki::{
+        WikiAccess, WikiCommitInput, WikiError, WikiReadInput, WikiSearchInput, WikiSearchMode,
+        WikiSelector, WikiVerifyInput,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -433,6 +437,19 @@ impl AndaBrainMcpServer {
         scope: TokenScope,
         access: &McpAccess,
     ) -> Result<Arc<Space>, ErrorData> {
+        Ok(self
+            .load_authorized_space_with_token(scope, access)
+            .await?
+            .0)
+    }
+
+    /// Like [`Self::load_authorized_space`] but also returns the verified
+    /// space token so wiki tools can honor its ACL labels (PRD §8.2).
+    async fn load_authorized_space_with_token(
+        &self,
+        scope: TokenScope,
+        access: &McpAccess,
+    ) -> Result<(Arc<Space>, Option<crate::types::SpaceToken>), ErrorData> {
         if let Some(sharding) = access.sharding
             && sharding != self.app.sharding
         {
@@ -472,13 +489,15 @@ impl AndaBrainMcpServer {
             }
             Err(err) => return Err(err),
         };
+        let mut space_token = None;
         if cwt.is_none() && !(scope == TokenScope::Read && space.is_public()) {
-            space
-                .verify_space_token(access.auth_token.clone(), scope, now_ms)
-                .map_err(|_| unauthorized(scope))?;
+            space_token = Some(
+                space
+                    .verify_space_token(access.auth_token.clone(), scope, now_ms)
+                    .map_err(|_| unauthorized(scope))?,
+            );
         }
-
-        Ok(space)
+        Ok((space, space_token))
     }
 
     pub async fn ensure_space_available(&self) -> Result<(), ErrorData> {
@@ -621,6 +640,245 @@ impl AndaBrainMcpServer {
             structured_result(conversation)
         }
     }
+
+    async fn wiki_commit_for(
+        &self,
+        access: &McpAccess,
+        input: WikiCommitToolInput,
+    ) -> Result<CallToolResult, ErrorData> {
+        let space = self
+            .load_authorized_space(TokenScope::Write, access)
+            .await?;
+        let output = space
+            .wiki
+            .commit(SELF_USER_ID.to_string(), input.into(), unix_ms())
+            .await
+            .map_err(wiki_tool_error)?;
+        structured_result(output)
+    }
+
+    async fn wiki_search_for(
+        &self,
+        access: &McpAccess,
+        input: WikiSearchToolInput,
+    ) -> Result<CallToolResult, ErrorData> {
+        let (space, st) = self
+            .load_authorized_space_with_token(TokenScope::Read, access)
+            .await?;
+        let scope = mcp_wiki_access(st.as_ref());
+        let output = space
+            .wiki
+            .search_scoped(&scope, input.into(), unix_ms())
+            .await
+            .map_err(wiki_tool_error)?;
+        structured_result(output)
+    }
+
+    async fn wiki_read_for(
+        &self,
+        access: &McpAccess,
+        input: WikiReadToolInput,
+    ) -> Result<CallToolResult, ErrorData> {
+        let (space, st) = self
+            .load_authorized_space_with_token(TokenScope::Read, access)
+            .await?;
+        let scope = mcp_wiki_access(st.as_ref());
+        let output = space
+            .wiki
+            .read_scoped(&scope, input.try_into()?, unix_ms())
+            .await
+            .map_err(wiki_tool_error)?;
+        structured_result(output)
+    }
+
+    async fn wiki_verify_for(
+        &self,
+        access: &McpAccess,
+        input: WikiVerifyToolInput,
+    ) -> Result<CallToolResult, ErrorData> {
+        let (space, st) = self
+            .load_authorized_space_with_token(TokenScope::Read, access)
+            .await?;
+        let scope = mcp_wiki_access(st.as_ref());
+        let output = space
+            .wiki
+            .verify_scoped(
+                &scope,
+                WikiVerifyInput {
+                    uri: Some(input.uri),
+                    checksum: input.checksum,
+                    ..Default::default()
+                },
+                unix_ms(),
+            )
+            .await
+            .map_err(wiki_tool_error)?;
+        structured_result(output)
+    }
+}
+
+/// MCP wiki read scope: labeled space tokens are restricted; CWT holders
+/// and label-less tokens are unrestricted.
+fn mcp_wiki_access(st: Option<&crate::types::SpaceToken>) -> WikiAccess {
+    WikiAccess {
+        actor: st
+            .map(|st| format!("st:{}", st.name.trim()))
+            .unwrap_or_else(|| SELF_USER_ID.to_string()),
+        labels: st.and_then(|st| st.labels.clone()),
+    }
+}
+
+fn wiki_tool_error(err: WikiError) -> ErrorData {
+    match err {
+        WikiError::Db(_) => internal_error(err),
+        err => ErrorData::invalid_request(err.to_string(), None),
+    }
+}
+
+/// Flat MCP input for `anda_brain_wiki_commit`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct WikiCommitToolInput {
+    /// Existing document id to update; omit to create a new document.
+    pub doc_id: Option<u64>,
+    /// Required for updates: the current_version this edit is based on. On a
+    /// conflict error, re-read the document and retry with the reported
+    /// current version.
+    pub parent_version: Option<u64>,
+    /// Logical partition such as "policy" or "engineering"; defaults to "default".
+    pub namespace: Option<String>,
+    /// Display slug; derived from the title when omitted.
+    pub slug: Option<String>,
+    pub title: String,
+    /// Full Markdown content (the whole document, not a diff).
+    pub content: String,
+    pub tags: Option<Vec<String>>,
+    /// External origin URI when importing.
+    pub source_uri: Option<String>,
+    /// Commit message: why this change.
+    pub message: Option<String>,
+    /// ACL label; omit to keep/inherit, empty string to clear.
+    pub acl_label: Option<String>,
+}
+
+impl From<WikiCommitToolInput> for WikiCommitInput {
+    fn from(input: WikiCommitToolInput) -> Self {
+        Self {
+            doc_id: input.doc_id,
+            parent_version: input.parent_version,
+            namespace: input.namespace,
+            slug: input.slug,
+            title: input.title,
+            content: input.content,
+            tags: input.tags,
+            acl_label: input.acl_label,
+            source_uri: input.source_uri,
+            message: input.message,
+            metadata: None,
+        }
+    }
+}
+
+/// Flat MCP input for `anda_brain_wiki_search`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct WikiSearchToolInput {
+    /// Keyword query; BM25 matching favors exact terms, product names and error codes.
+    pub query: String,
+    /// Restrict to these namespaces.
+    pub namespaces: Option<Vec<String>>,
+    /// Restrict to these document ids.
+    pub doc_ids: Option<Vec<u64>>,
+    /// Restrict to documents carrying any of these tags.
+    pub tags: Option<Vec<String>>,
+    /// Max hits (1-50, default 8).
+    pub top_k: Option<usize>,
+    /// "chunks" (default) for best passages, "docs" for one hit per document.
+    pub mode: Option<String>,
+    /// Neighbor expansion 0-2 (default 0): widen hits with adjacent passages.
+    pub expand: Option<u8>,
+}
+
+impl From<WikiSearchToolInput> for WikiSearchInput {
+    fn from(input: WikiSearchToolInput) -> Self {
+        Self {
+            query: input.query,
+            namespaces: input.namespaces.unwrap_or_default(),
+            doc_ids: input.doc_ids.unwrap_or_default(),
+            tags: input.tags.unwrap_or_default(),
+            top_k: input.top_k,
+            mode: match input.mode.as_deref() {
+                Some("docs") => WikiSearchMode::Docs,
+                _ => WikiSearchMode::Chunks,
+            },
+            expand: input.expand,
+        }
+    }
+}
+
+/// Flat MCP input for `anda_brain_wiki_read`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct WikiReadToolInput {
+    pub doc_id: u64,
+    /// Version id for time-travel reads; omit for the current version.
+    pub version: Option<u64>,
+    /// "toc" | "section" | "range" | "full". Defaults to "section" when an
+    /// anchor is given, "range" when start/end are given, else "toc".
+    pub selector: Option<String>,
+    /// Section anchor from a TOC entry or a search citation.
+    pub anchor: Option<String>,
+    pub start: Option<u64>,
+    pub end: Option<u64>,
+}
+
+impl TryFrom<WikiReadToolInput> for WikiReadInput {
+    type Error = ErrorData;
+
+    fn try_from(input: WikiReadToolInput) -> Result<Self, ErrorData> {
+        let selector = match input.selector.as_deref() {
+            Some("toc") => WikiSelector::Toc,
+            Some("full") => WikiSelector::Full,
+            Some("section") => WikiSelector::Section {
+                anchor: input.anchor.clone().ok_or_else(|| {
+                    ErrorData::invalid_request("selector 'section' requires anchor", None)
+                })?,
+            },
+            Some("range") => match (input.start, input.end) {
+                (Some(start), Some(end)) => WikiSelector::Range { start, end },
+                _ => {
+                    return Err(ErrorData::invalid_request(
+                        "selector 'range' requires start and end",
+                        None,
+                    ));
+                }
+            },
+            Some(other) => {
+                return Err(ErrorData::invalid_request(
+                    format!("unknown selector: {other}"),
+                    None,
+                ));
+            }
+            None => match (&input.anchor, input.start, input.end) {
+                (Some(anchor), _, _) => WikiSelector::Section {
+                    anchor: anchor.clone(),
+                },
+                (None, Some(start), Some(end)) => WikiSelector::Range { start, end },
+                _ => WikiSelector::Toc,
+            },
+        };
+        Ok(Self {
+            doc_id: input.doc_id,
+            version: input.version,
+            selector,
+        })
+    }
+}
+
+/// Flat MCP input for `anda_brain_wiki_verify`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct WikiVerifyToolInput {
+    /// Citation URI: wiki://{space}/{doc_id}@{version_id}#{start}-{end}
+    pub uri: String,
+    /// Optional cited checksum to compare against stored content.
+    pub checksum: Option<String>,
 }
 
 #[tool_router]
@@ -807,6 +1065,93 @@ impl AndaBrainMcpServer {
     ) -> Result<CallToolResult, ErrorData> {
         let access = self.access_from_context(&context)?;
         self.get_conversation_for(&access, input).await
+    }
+
+    /// Search the space wiki (versioned reference documents) with keyword BM25
+    /// and get snippets with verifiable wiki:// citations. Cite the URIs when
+    /// using the evidence; retry with reformulated keywords if results are poor.
+    #[tool(
+        name = "anda_brain_wiki_search",
+        annotations(
+            title = "Search Wiki",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn wiki_search(
+        &self,
+        Parameters(input): Parameters<WikiSearchToolInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let access = self.access_from_context(&context)?;
+        self.wiki_search_for(&access, input).await
+    }
+
+    /// Read a wiki document progressively: TOC first, then one section by
+    /// anchor, a byte range, or the bounded full text. Supports reading
+    /// historical versions.
+    #[tool(
+        name = "anda_brain_wiki_read",
+        annotations(
+            title = "Read Wiki Document",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn wiki_read(
+        &self,
+        Parameters(input): Parameters<WikiReadToolInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let access = self.access_from_context(&context)?;
+        self.wiki_read_for(&access, input).await
+    }
+
+    /// Commit a wiki document as an immutable new version (git-like).
+    /// Create: omit doc_id. Update: pass doc_id and parent_version; on a
+    /// conflict, re-read, merge, and retry. Identical content is a no-op.
+    #[tool(
+        name = "anda_brain_wiki_commit",
+        annotations(
+            title = "Commit Wiki Document",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn wiki_commit(
+        &self,
+        Parameters(input): Parameters<WikiCommitToolInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let access = self.access_from_context(&context)?;
+        self.wiki_commit_for(&access, input).await
+    }
+
+    /// Verify a wiki citation URI against the immutable stored content:
+    /// valid, superseded by a newer version, or invalid.
+    #[tool(
+        name = "anda_brain_wiki_verify",
+        annotations(
+            title = "Verify Wiki Citation",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn wiki_verify(
+        &self,
+        Parameters(input): Parameters<WikiVerifyToolInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let access = self.access_from_context(&context)?;
+        self.wiki_verify_for(&access, input).await
     }
 }
 

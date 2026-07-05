@@ -53,6 +53,7 @@ parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
 sha3 = "0.12"
+unicode-normalization = "0.1"
 ic_cose_types = "0.10"
 ic_auth_types = "0.9"
 ic-ed25519 = "0.6"

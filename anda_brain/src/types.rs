@@ -3,7 +3,7 @@ use anda_db::storage::StorageStats;
 use anda_engine::model::ModelConfig as EngineModelConfig;
 use ic_cose_types::cose::cwt::{ClaimsSet, get_scope};
 use serde::{Deserialize, Deserializer, Serialize, de};
-use std::str::FromStr;
+use std::{collections::BTreeMap, str::FromStr};
 
 #[derive(Deserialize)]
 pub struct Pagination {
@@ -39,6 +39,20 @@ pub struct SpaceInfo {
     pub formation_processed_id: u64,
     pub maintenance_processed_id: u64,
     pub maintenance_at: MaintenanceAt,
+    #[serde(default)]
+    pub wiki_docs: usize,
+    #[serde(default)]
+    pub wiki_chunks: usize,
+    #[serde(default)]
+    pub wiki_versions: usize,
+    #[serde(default)]
+    pub wiki_queries: u64,
+    /// Digest high-water mark (largest digested wiki version id).
+    #[serde(default)]
+    pub wiki_digested: u64,
+    /// From the last housekeeping stale scan.
+    #[serde(default)]
+    pub wiki_stale_docs: u64,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
@@ -243,6 +257,10 @@ pub struct SpaceToken {
 
     #[serde(default, alias = "ea")]
     pub expires_at: Option<u64>,
+
+    /// Wiki ACL labels this token may read (None = unrestricted).
+    #[serde(default, alias = "lb")]
+    pub labels: Option<Vec<String>>,
 }
 
 impl SpaceToken {
@@ -254,6 +272,7 @@ impl SpaceToken {
             created_at: self.created_at,
             updated_at: self.updated_at,
             expires_at: self.expires_at,
+            labels: &self.labels,
         }
     }
 }
@@ -272,6 +291,12 @@ pub struct SpaceTokenRef<'a> {
     pub updated_at: u64,
     #[serde(rename = "ea", alias = "expires_at")]
     pub expires_at: Option<u64>,
+    #[serde(
+        rename = "lb",
+        alias = "labels",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub labels: &'a Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
@@ -310,6 +335,10 @@ pub struct AddSpaceTokenInput {
     #[serde(default)]
     pub name: String,
     pub expires_at: Option<u64>,
+    /// Wiki ACL labels this token may read. `None` = unrestricted; `Some`
+    /// grants unlabeled content plus the listed labels (PRD §8.2).
+    #[serde(default)]
+    pub labels: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -317,11 +346,26 @@ pub struct RevokeSpaceTokenInput {
     pub token: String,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct UpdateSpaceInput {
+    #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
     pub public: Option<bool>,
+    /// Enables/disables the WikiDigest background extraction for this space
+    /// (PRD §7.3; disabled by default).
+    #[serde(default)]
+    pub wiki_digest: Option<bool>,
+    /// Enables/disables read auditing for external wiki reads (PRD §3.4;
+    /// disabled by default — agent reads are covered by recall logs).
+    #[serde(default)]
+    pub wiki_audit_reads: Option<bool>,
+    /// Namespace → default ACL label map applied to newly created wiki
+    /// documents (replaces the whole map when present).
+    #[serde(default)]
+    pub wiki_acl_defaults: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Default, Serialize, Clone, PartialEq, Eq)]
@@ -807,6 +851,7 @@ mod tests {
             created_at: 10,
             updated_at: 20,
             expires_at: Some(30),
+            labels: None,
         };
         let value = serde_json::to_value(token.to_ref()).unwrap();
 
