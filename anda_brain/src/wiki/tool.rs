@@ -79,9 +79,13 @@ impl Tool<BaseCtx> for WikiSearchTool {
                         "type": ["string", "null"],
                         "enum": ["chunks", "docs", null],
                         "description": "chunks (default): best matching passages. docs: one best passage per document, for 'which document covers X'."
+                    },
+                    "expand": {
+                        "type": ["integer", "null"],
+                        "description": "Neighbor expansion 0-2 (default 0): widen each hit with adjacent passages for more context; citations widen accordingly."
                     }
                 },
-                "required": ["query", "namespaces", "doc_ids", "tags", "top_k", "mode"],
+                "required": ["query", "namespaces", "doc_ids", "tags", "top_k", "mode", "expand"],
                 "additionalProperties": false
             }),
             strict: Some(true),

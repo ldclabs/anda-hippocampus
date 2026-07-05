@@ -17,8 +17,8 @@ use crate::{
     space::AppState,
     types::*,
     wiki::{
-        WikiCommitInput, WikiError, WikiListDocsInput, WikiReadInput, WikiSearchInput,
-        WikiSelector, WikiVerifyInput,
+        WikiCommitInput, WikiError, WikiImportInput, WikiListDocsInput, WikiReadInput,
+        WikiSearchInput, WikiSelector, WikiVerifyInput,
     },
 };
 
@@ -649,6 +649,90 @@ pub async fn list_wiki_events(
     }))
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct WikiExportQuery {
+    pub namespace: Option<String>,
+}
+
+/// POST /v1/{space_id}/wiki/import — OKF bundle import (requires All scope)
+pub async fn post_wiki_import(
+    State(app): State<AppState>,
+    Path(space_id): Path<String>,
+    Accept(ct, _): Accept,
+    HeaderVals(token, sharding): HeaderVals,
+    body: Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    ensure_sharding(&app, sharding)?;
+
+    let input: StringOr<WikiImportInput> = ct.parse_body(&body).map_err(AppError::bad_request)?;
+    let StringOr::Value(input) = input else {
+        return Err(AppError::bad_request(
+            "wiki import expects a structured bundle body",
+        ));
+    };
+
+    let now_ms = unix_ms();
+    let t = app
+        .check_auth_if(&token, &space_id, TokenScope::All, now_ms)
+        .map_err(|_| AppError::unauthorized())?;
+    let space = app
+        .load_space(&space_id, false)
+        .await
+        .map_err(AppError::bad_request)?;
+    let st = match &t {
+        Some(_) => None,
+        None => Some(
+            space
+                .verify_space_token(token, TokenScope::All, now_ms)
+                .map_err(|_| AppError::unauthorized())?,
+        ),
+    };
+
+    let actor = wiki_actor(&t, st.as_ref());
+    let rt = space
+        .wiki
+        .import_bundle(actor, input, now_ms)
+        .await
+        .map_err(wiki_error)?;
+    Ok(ct.response(RpcResponse::success(rt)))
+}
+
+/// GET /v1/{space_id}/wiki/export?namespace= — OKF bundle export (requires All scope)
+pub async fn get_wiki_export(
+    State(app): State<AppState>,
+    Path(space_id): Path<String>,
+    Query(q): Query<WikiExportQuery>,
+    Accept(ct, _): Accept,
+    HeaderVals(token, sharding): HeaderVals,
+) -> Result<impl IntoResponse, AppError> {
+    ensure_sharding(&app, sharding)?;
+
+    let now_ms = unix_ms();
+    let t = app
+        .check_auth_if(&token, &space_id, TokenScope::All, now_ms)
+        .map_err(|_| AppError::unauthorized())?;
+    let space = app
+        .load_space(&space_id, false)
+        .await
+        .map_err(AppError::bad_request)?;
+    let st = match &t {
+        Some(_) => None,
+        None => Some(
+            space
+                .verify_space_token(token, TokenScope::All, now_ms)
+                .map_err(|_| AppError::unauthorized())?,
+        ),
+    };
+
+    let actor = wiki_actor(&t, st.as_ref());
+    let rt = space
+        .wiki
+        .export_bundle(actor, q.namespace, now_ms)
+        .await
+        .map_err(wiki_error)?;
+    Ok(ct.response(RpcResponse::success(rt)))
+}
+
 /// POST /v1/{space_id}/maintenance
 pub async fn post_maintenance(
     State(app): State<AppState>,
@@ -1181,12 +1265,13 @@ pub async fn update_space_tier(
 #[cfg(test)]
 mod tests {
     use super::{
-        WikiContentQuery, add_space_token, apple_touch_icon, create_space, execute_kip_readonly,
-        favicon, get_byok, get_conversation, get_conversation_delta, get_formation_status,
-        get_info, get_information, get_or_init_user, get_skill, get_wiki_content, get_wiki_doc,
-        list_conversations, list_space_tokens, post_formation, post_maintenance, post_recall,
-        post_wiki_commit, post_wiki_search, post_wiki_verify, restart_formation,
-        revoke_space_token, update_byok, update_space, update_space_tier,
+        WikiContentQuery, WikiExportQuery, add_space_token, apple_touch_icon, create_space,
+        execute_kip_readonly, favicon, get_byok, get_conversation, get_conversation_delta,
+        get_formation_status, get_info, get_information, get_or_init_user, get_skill,
+        get_wiki_content, get_wiki_doc, get_wiki_export, list_conversations, list_space_tokens,
+        post_formation, post_maintenance, post_recall, post_wiki_commit, post_wiki_import,
+        post_wiki_search, post_wiki_verify, restart_formation, revoke_space_token, update_byok,
+        update_space, update_space_tier,
     };
     use crate::{
         agents::SELF_USER_ID,
@@ -2673,5 +2758,62 @@ mod tests {
             StatusCode::NOT_FOUND,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn wiki_import_export_round_trip_over_http() {
+        let app = test_app_state("handler_wiki_okf", 0);
+        let space_id = "handler_wiki_okf_space".to_string();
+        create_loaded_space(&app, &space_id).await;
+
+        let import = ok_json(
+            post_wiki_import(
+                State(app.clone()),
+                Path(space_id.clone()),
+                accept_json(),
+                headers(&app),
+                json_bytes(&crate::wiki::WikiImportInput {
+                    entries: vec![crate::wiki::WikiBundleEntry {
+                        path: "guides/setup.md".to_string(),
+                        content: "---\ntype: Guide\ncustom_key: 保留\n---\n\n# 安装指南\n\n执行安装脚本。\n"
+                            .to_string(),
+                    }],
+                    namespace: Some("kb".to_string()),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(import["result"]["created"].as_u64(), Some(1));
+
+        let export = ok_json(
+            get_wiki_export(
+                State(app.clone()),
+                Path(space_id.clone()),
+                Query(WikiExportQuery {
+                    namespace: Some("kb".to_string()),
+                }),
+                accept_json(),
+                headers(&app),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(export["result"]["docs"].as_u64(), Some(1));
+        let entries = export["result"]["entries"].as_array().unwrap();
+        let paths: Vec<&str> = entries
+            .iter()
+            .map(|e| e["path"].as_str().unwrap())
+            .collect();
+        assert!(paths.contains(&"guides/setup.md"));
+        assert!(paths.contains(&"index.md"));
+        assert!(paths.contains(&"manifest.json"));
+        let doc_entry = entries
+            .iter()
+            .find(|e| e["path"] == "guides/setup.md")
+            .unwrap();
+        let content = doc_entry["content"].as_str().unwrap();
+        assert!(content.contains("custom_key: 保留"));
+        assert!(content.contains("x_anda_doc_id:"));
     }
 }

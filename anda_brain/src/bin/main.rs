@@ -460,6 +460,11 @@ fn build_router(
         )
         .route("/v1/{space_id}/wiki/events", routing::get(list_wiki_events))
         .route(
+            "/v1/{space_id}/wiki/import",
+            routing::post(post_wiki_import),
+        )
+        .route("/v1/{space_id}/wiki/export", routing::get(get_wiki_export))
+        .route(
             "/v1/{space_id}/execute_kip_readonly",
             routing::post(execute_kip_readonly),
         )

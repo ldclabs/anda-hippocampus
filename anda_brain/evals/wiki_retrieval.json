@@ -1,0 +1,62 @@
+{
+  "docs": [
+    {
+      "path": "deploy-guide.md",
+      "content": "---\ntype: SOP\ntitle: 部署指南\ntags: [deploy, sop]\n---\n\n# 部署指南\n\n本指南覆盖生产环境的发布流程、灰度发布与回滚操作。\n\n## 发布流程\n\n发布前需要通过 CI 全部检查，并在发布窗口内执行。使用 kubectl apply 应用新版本清单，观察就绪探针状态。\n\n```bash\nkubectl apply -f release.yaml\nkubectl rollout status deploy/anda-brain\n```\n\n## 灰度发布\n\n灰度发布按 5%、25%、100% 三个阶段推进流量。每个阶段观察错误率与延迟指标至少十分钟。蓝绿部署适用于需要快速整体切换的场景：先在绿色环境部署新版本，验证后一次性切换负载均衡。\n\n## 回滚\n\n出现故障时使用上一版本快照回滚：kubectl rollout undo 恢复上一个部署版本，随后验证引用校验和与数据一致性。回滚完成后在事故频道同步状态。\n"
+    },
+    {
+      "path": "security-policy.md",
+      "content": "---\ntype: Policy\ntitle: 安全政策\ntags: [security, policy]\n---\n\n# 安全政策\n\n本政策规定访问控制、密钥管理与数据保护的强制要求。\n\n## 访问控制\n\n所有内部系统必须启用双因素认证。权限遵循最小权限原则，按季度进行权限复核，离职当天回收全部访问凭证。\n\n## 密钥管理\n\n生产密钥统一存放在 KMS 中，禁止写入代码仓库。密钥轮换周期为九十天，轮换后旧密钥保留七天用于回滚验证。\n\n## 数据保护\n\n静态数据使用 AES-256 加密，传输全程 TLS 1.3。数据加密标准的例外必须经安全委员会书面批准。\n"
+    },
+    {
+      "path": "api-reference.md",
+      "content": "---\ntype: API Reference\ntitle: API 参考\ntags: [api]\n---\n\n# API 参考\n\n本文档描述记忆与知识库的核心接口。\n\n## recall 接口\n\nPOST /v1/{space}/recall 以自然语言查询图谱记忆。请求体包含 query 与可选的 context。\n\n## wiki_search 接口\n\nPOST /v1/{space}/wiki/search 检索知识库文档。参数 top_k 控制返回条数（默认 8，上限 50），namespaces 限定命名空间，mode 取 chunks 或 docs。\n\n## wiki 提交与并发控制\n\n更新文档必须携带 parent_version 做 CAS 校验。若文档已被他人更新，服务返回 409 冲突，响应的 error.data 中携带 current_version，调用方应重新读取、合并后重试。\n"
+    },
+    {
+      "path": "faq.md",
+      "content": "---\ntype: FAQ\ntitle: 常见问题\ntags: [faq]\n---\n\n# 常见问题\n\n## 忘记密码怎么办\n\n在登录页点击忘记密码，系统会向注册邮箱发送重置链接，链接三十分钟内有效。连续失败五次会临时锁定账户。\n\n## 如何修改发票抬头\n\n进入账单设置页，编辑发票抬头与税号后保存。修改仅对之后开具的发票生效，已开发票需要联系支持申请换开。\n\n## 退款政策\n\n多付或误付的款项可在三十天内申请退款，退款原路返回，预计五到七个工作日到账。\n"
+    },
+    {
+      "path": "incident-sop.md",
+      "content": "---\ntype: SOP\ntitle: 故障处理流程\ntags: [incident, sop]\n---\n\n# 故障处理流程\n\n## 分级与响应\n\nP0 故障指核心服务不可用，需在五分钟内响应。系统出现故障时第一时间联系值班工程师，值班表见排班系统。\n\n## 升级路径\n\nP0 故障十五分钟未缓解应升级到值班经理，三十分钟未缓解升级到工程负责人。所有升级都在事故频道内记录时间线。\n\n## 熔断与降级\n\n下游依赖超时率超过阈值时触发熔断，自动切换到降级响应，保护核心链路。\n\n## 复盘报告\n\n故障解除后四十八小时内提交复盘报告，使用复盘报告模板，包含时间线、根因分析与改进项。\n"
+    },
+    {
+      "path": "billing-terms.md",
+      "content": "---\ntype: Terms\ntitle: 计费条款\ntags: [billing]\n---\n\n# 计费条款\n\n## 计费模式\n\n服务采用按量计费与套餐订阅两种模式。按量计费按实际调用次数与存储用量结算，套餐按月预付。\n\n## 免费额度\n\n每个空间每月享有十万次调用与一 GiB 存储的免费额度，超出部分按标准价目表计费。\n\n## 超额费用\n\n超额费用按自然月累计，账单在次月三日生成。超额费用计算公式：超出用量乘以对应档位单价，阶梯价格随用量递减。\n"
+    },
+    {
+      "path": "error-codes.md",
+      "content": "---\ntype: Reference\ntitle: 错误码手册\ntags: [errors]\n---\n\n# 错误码手册\n\n## E1042 存储配额不足\n\n空间存储用量达到配额上限。清理归档文档或升级套餐后重试。\n\n## E2001 令牌过期\n\n访问令牌已过期，请刷新令牌后重试。长期任务应在过期前主动续期。\n\n## E3300 分片不匹配\n\n请求携带的分片参数与服务端配置不一致，请检查 space_id 的分片段与部署拓扑。\n"
+    },
+    {
+      "path": "onboarding.md",
+      "content": "---\ntype: Guide\ntitle: 新员工入职\ntags: [hr]\n---\n\n# 新员工入职\n\n## 账号开通\n\n入职当天由 IT 完成邮箱与内部系统账号开通，初始口令首次登录时强制更换。\n\n## 权限申请\n\n业务系统权限通过权限申请流程提交，由直属负责人与系统属主双重审批，审批通过后一小时内生效。\n\n## 设备领取\n\n办公设备在行政前台登记领取，离职时归还并核对资产编号。\n"
+    }
+  ],
+  "cases": [
+    { "query": "如何回滚到上一个版本", "expect_slug": "deploy-guide", "expect_text": "回滚" },
+    { "query": "蓝绿部署 切换", "expect_slug": "deploy-guide", "expect_text": "蓝绿" },
+    { "query": "kubectl 发布命令", "expect_slug": "deploy-guide" },
+    { "query": "灰度发布 流量 阶段", "expect_slug": "deploy-guide" },
+    { "query": "密钥轮换周期", "expect_slug": "security-policy", "expect_text": "九十天" },
+    { "query": "双因素认证 要求", "expect_slug": "security-policy" },
+    { "query": "数据加密 标准", "expect_slug": "security-policy" },
+    { "query": "E1042", "expect_slug": "error-codes", "expect_text": "存储配额" },
+    { "query": "令牌过期 错误码", "expect_slug": "error-codes" },
+    { "query": "分片不匹配", "expect_slug": "error-codes" },
+    { "query": "parent_version 409 冲突", "expect_slug": "api-reference" },
+    { "query": "wiki_search top_k 参数", "expect_slug": "api-reference" },
+    { "query": "忘记密码 重置", "expect_slug": "faq" },
+    { "query": "发票抬头 修改", "expect_slug": "faq" },
+    { "query": "P0 故障 升级", "expect_slug": "incident-sop" },
+    { "query": "复盘报告 模板", "expect_slug": "incident-sop" },
+    { "query": "熔断 降级", "expect_slug": "incident-sop" },
+    { "query": "免费额度", "expect_slug": "billing-terms" },
+    { "query": "超额费用 计算", "expect_slug": "billing-terms" },
+    { "query": "新员工 账号开通", "expect_slug": "onboarding" },
+    { "query": "权限申请 审批", "expect_slug": "onboarding" },
+    { "query": "系统挂了第一时间找谁", "expect_slug": "incident-sop", "hard": true },
+    { "query": "多付的钱能退吗", "expect_slug": "faq", "hard": true },
+    { "query": "服务器宕机了咋整", "expect_slug": "incident-sop", "hard": true }
+  ]
+}

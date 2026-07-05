@@ -755,6 +755,8 @@ pub struct WikiSearchToolInput {
     pub top_k: Option<usize>,
     /// "chunks" (default) for best passages, "docs" for one hit per document.
     pub mode: Option<String>,
+    /// Neighbor expansion 0-2 (default 0): widen hits with adjacent passages.
+    pub expand: Option<u8>,
 }
 
 impl From<WikiSearchToolInput> for WikiSearchInput {
@@ -769,6 +771,7 @@ impl From<WikiSearchToolInput> for WikiSearchInput {
                 Some("docs") => WikiSearchMode::Docs,
                 _ => WikiSearchMode::Chunks,
             },
+            expand: input.expand,
         }
     }
 }

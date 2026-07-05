@@ -209,6 +209,12 @@ pub struct WikiSearchInput {
     pub top_k: Option<usize>,
     #[serde(default)]
     pub mode: WikiSearchMode,
+    /// Neighbor expansion: widen each hit by up to N adjacent chunks on both
+    /// sides (0–2, default 0). Overlapping expansions within one document
+    /// merge into a single hit; the citation range widens accordingly and
+    /// stays verifiable.
+    #[serde(default)]
+    pub expand: Option<u8>,
 }
 
 impl WikiSearchInput {
@@ -399,6 +405,62 @@ pub struct WikiEventListOutput {
     pub events: Vec<WikiEventInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+}
+
+/// One file of an OKF bundle: a bundle-relative path and its full content.
+#[derive(Debug, Default, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct WikiBundleEntry {
+    pub path: String,
+    pub content: String,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+pub struct WikiImportInput {
+    pub entries: Vec<WikiBundleEntry>,
+    /// Target namespace; defaults to "default". Bundles round-trip per
+    /// namespace: export paths carry no namespace prefix.
+    #[serde(default)]
+    pub namespace: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WikiImportStatus {
+    Created,
+    Updated,
+    Unchanged,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct WikiImportedDoc {
+    pub path: String,
+    pub doc_id: u64,
+    pub version_id: u64,
+    pub status: WikiImportStatus,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct WikiImportSkip {
+    pub path: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+pub struct WikiImportOutput {
+    pub created: usize,
+    pub updated: usize,
+    pub unchanged: usize,
+    pub docs: Vec<WikiImportedDoc>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<WikiImportSkip>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+pub struct WikiExportOutput {
+    pub namespace: String,
+    /// Concept `.md` files plus generated `index.md` and `manifest.json`.
+    pub entries: Vec<WikiBundleEntry>,
+    pub docs: usize,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]

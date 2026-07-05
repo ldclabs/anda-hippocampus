@@ -411,10 +411,10 @@ POST /v1/{space_id}/wiki/search
 ```
 
 ```json
-{ "query": "rollback checksum", "namespaces": ["engineering"], "top_k": 8, "mode": "chunks" }
+{ "query": "rollback checksum", "namespaces": ["engineering"], "top_k": 8, "mode": "chunks", "expand": 1 }
 ```
 
-Each hit carries the matching text and a citation: `{ "uri": "wiki://{space}/{doc_id}@{version_id}#{start}-{end}", "checksum": "sha3-256:...", "anchor": "...", "quote": "..." }`. `mode: "docs"` returns one best hit per document. BM25 favors exact terms (product names, error codes); reformulate keywords rather than sending full sentences.
+Each hit carries the matching text and a citation: `{ "uri": "wiki://{space}/{doc_id}@{version_id}#{start}-{end}", "checksum": "sha3-256:...", "anchor": "...", "quote": "..." }`. `mode: "docs"` returns one best hit per document. `expand` (0-2, default 0) widens each hit with adjacent passages; overlapping expansions merge and the citation range widens while staying verifiable. BM25 favors exact terms (product names, error codes); reformulate keywords rather than sending full sentences.
 
 **Read progressively:**
 
@@ -440,6 +440,15 @@ GET  /v1/{space_id}/wiki/events?kind=&doc_id=
 ```
 
 `verify` answers `valid`, `superseded` (a newer version exists — it names it), or `invalid`. Versions are immutable, so citations never rot.
+
+**OKF interchange (requires full-scope token):**
+
+```
+POST /v1/{space_id}/wiki/import    {"entries": [{"path": "guides/setup.md", "content": "---\ntype: Guide\n---\n\n# ..."}], "namespace": "kb"}
+GET  /v1/{space_id}/wiki/export?namespace=kb
+```
+
+Bundles follow the OKF v0.1 convention (Markdown + YAML frontmatter; concept paths become hierarchical slugs). Unknown frontmatter keys, ordering and comments survive round-trips verbatim; re-importing an unchanged bundle is a no-op (checksum-idempotent). Export adds `x_anda_doc_id` / `x_anda_version_id` / `x_anda_checksum` provenance keys plus a root `index.md` and `manifest.json`, so a wiki snapshot can be reviewed with git diff and replayed into an empty space. Reserved files (`index.md`, `log.md`, non-Markdown) are skipped on import.
 
 ---
 

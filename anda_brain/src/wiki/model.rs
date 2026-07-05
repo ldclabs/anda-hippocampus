@@ -17,6 +17,8 @@ pub const EVENT_DOC_ARCHIVED: &str = "DocArchived";
 pub const EVENT_DOC_RESTORED: &str = "DocRestored";
 pub const EVENT_ORPHAN_SWEPT: &str = "OrphanSwept";
 pub const EVENT_CITATION_VERIFY_FAILED: &str = "CitationVerifyFailed";
+pub const EVENT_IMPORT_COMPLETED: &str = "ImportCompleted";
+pub const EVENT_EXPORT_COMPLETED: &str = "ExportCompleted";
 
 /// Document registry row. `current_version == 0` marks a document that is
 /// still initializing (created but never activated): invisible to reads and

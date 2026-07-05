@@ -96,6 +96,24 @@ pub fn slugify(input: &str) -> String {
     }
 }
 
+/// Path-preserving slug: each `/`-separated segment is slugified, keeping
+/// the hierarchy convention OKF concept ids use (`guides/setup`). Titles
+/// never contain `/` after [`slugify`], so plain slugs pass through
+/// unchanged.
+pub fn slugify_path(input: &str) -> String {
+    let segments: Vec<String> = input
+        .split('/')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(slugify)
+        .collect();
+    if segments.is_empty() {
+        "untitled".to_string()
+    } else {
+        segments.join("/")
+    }
+}
+
 /// `"sha3-256:<hex>"` over the given parts.
 pub fn checksum_for<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> String {
     let mut hasher = Sha3_256::new();
@@ -530,6 +548,15 @@ mod tests {
         assert_eq!(slugify("安全政策 2026"), "安全政策-2026");
         assert_eq!(slugify("  !!!  "), "untitled");
         assert_ne!(slugify("产品手册"), slugify("安全政策"));
+    }
+
+    #[test]
+    fn slugify_path_keeps_hierarchy_and_flattens_segments() {
+        assert_eq!(slugify_path("guides/Setup Steps"), "guides/setup-steps");
+        assert_eq!(slugify_path("指南/部署 手册"), "指南/部署-手册");
+        assert_eq!(slugify_path("recall-api-v1"), "recall-api-v1");
+        assert_eq!(slugify_path("a//b"), "a/b");
+        assert_eq!(slugify_path("///"), "untitled");
     }
 
     #[test]
