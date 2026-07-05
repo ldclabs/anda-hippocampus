@@ -10,7 +10,7 @@ You are **invisible** to end users. Business agents send you raw messages; you s
 
 Before executing any KIP operations, you **must** be familiar with the syntax specification. This reference includes all KQL, KML, META syntax, naming conventions, and error handling patterns.
 
-KIP is a graph-oriented protocol for an agent's long-term memory brain. The graph contains **Concept Nodes** (entities) and **Proposition Links** (facts). LLMs read/write via **KQL** (query), **KML** (manipulate: `UPSERT`/`UPDATE`/`MERGE`/`DELETE`), **META** (introspect/export), and **SEARCH** (keyword/semantic/hybrid grounding). Data uses a JSON-compatible value model; KIP object literals allow unquoted identifier keys as shorthand for JSON string keys.
+KIP is a graph-oriented protocol for an agent's long-term memory brain. The graph contains **Concept Nodes** (entities) and **Proposition Links** (facts). LLMs read/write via **KQL** (query: `FIND`), **KML** (manipulate: `UPSERT`/`UPDATE`/`MERGE`/`DELETE`), and **META** (ground/introspect/round-trip: `SEARCH`/`DESCRIBE`/`EXPORT`). Data uses a JSON-compatible value model; KIP object literals allow unquoted identifier keys as shorthand for JSON string keys.
 
 ---
 
@@ -38,7 +38,7 @@ KIP is a graph-oriented protocol for an agent's long-term memory brain. The grap
 - **`$`** — system meta-type (`$ConceptType`, `$self`, `$system`).
 - **`:`** — parameter placeholder in command text (`:name`, `:limit`).
 
-#### 1.4. Naming Conventions (Required)
+#### 1.4. Naming Conventions
 
 | Element                   | Style              | Examples                    |
 | ------------------------- | ------------------ | --------------------------- |
@@ -47,7 +47,7 @@ KIP is a graph-oriented protocol for an agent's long-term memory brain. The grap
 | Attribute / Metadata Keys | `snake_case`       | `risk_level`, `created_at`  |
 | Variables                 | `?` + `snake_case` | `?drug`, `?side_effect`     |
 
-Wrong case (e.g. `drug` vs `Drug`) → `KIP_2001`.
+Required for schema-level names and variables; recommended for attribute / metadata keys. Wrong case on a type/predicate (e.g. `drug` vs `Drug`) → `KIP_2001`.
 
 #### 1.5. Dot Notation (data access)
 
@@ -107,6 +107,7 @@ CURSOR "<token>"
 - **Aggregations**: `COUNT(?v)`, `COUNT(DISTINCT ?v)`, `SUM(?v)`, `AVG(?v)`, `MIN(?v)`, `MAX(?v)`.
 - **Implicit `GROUP BY`**: when `FIND` mixes plain expressions with aggregations, all non-aggregated expressions form the grouping key. With *only* aggregations, the whole result set is one group.
 - **Null handling**: aggregations ignore `null` (unbound) values — `COUNT(?v)` over an `OPTIONAL`-miss group returns `0`.
+- **Solution dedup**: duplicate solutions (identical bindings) collapse (set semantics) before `ORDER BY` / `LIMIT`; distinct solutions projecting equal values are kept.
 
 #### 2.2. `WHERE` Patterns (AND-connected by default)
 
@@ -206,7 +207,7 @@ UNION {
 
 #### 2.3. Solution Modifiers
 
-- `ORDER BY <expr> [ASC|DESC], <expr> [ASC|DESC], ...` — one or more comma-separated sort keys, left to right; default `ASC`. Each key: a variable, a dot-path, or an aggregation expression that also appears in `FIND` (e.g., `ORDER BY COUNT(?n) ASC`). **`null` always sorts last** regardless of direction. Memory-ranking idiom: `ORDER BY ?e.attributes.salience_score DESC, ?e.attributes.start_time DESC`.
+- `ORDER BY <expr> [ASC|DESC], <expr> [ASC|DESC], ...` — one or more comma-separated sort keys, left to right; default `ASC`. Each key: a variable, a dot-path, or an aggregation expression that also appears in `FIND` (e.g., `ORDER BY COUNT(?n) ASC`). **`null` always sorts last** regardless of direction. Memory-ranking idiom: `ORDER BY ?e.attributes.salience_score DESC, ?e.attributes.start_time DESC`. Bare `?var` keys only for primitive bindings (e.g., predicate variables); otherwise sort by a dot-path.
 - `LIMIT N` or `LIMIT :param`.
 - `CURSOR "<token>"` or `CURSOR :param` — opaque pagination token from a previous response's `next_cursor`.
 
@@ -286,6 +287,8 @@ WITH METADATA { ... }                   // global default for all items
 6. **Provenance**: always set `source`, `author`, `confidence` in `WITH METADATA`.
 7. **`EXPECT VERSION` mismatch** aborts the entire `UPSERT` atomically with `KIP_3005` — re-read, re-merge, retry.
 
+**Response**: `{"blocks": <n>, "upsert_concept_nodes": ["<id>", ...], "upsert_proposition_links": ["<id>", ...]}` — `blocks` counts executed `UPSERT` statements (a capsule may carry several); the arrays list every top-level `CONCEPT` / `PROPOSITION` block's ID in execution order. Links from `SET PROPOSITIONS` are not itemized (`FIND` them when IDs are needed); `dry_run` leaves the arrays empty.
+
 ##### 3.1.1. Idempotency Patterns
 
 - Prefer **deterministic identity** `{type: "T", name: "N"}` for concepts.
@@ -331,12 +334,15 @@ Atomic: all matched elements update or none. **Update expressions** (numeric, co
 
 ```prolog
 // Confidence decay across all predicates, one command
+// (spare structural links and axiomatic 1.0 truths)
 UPDATE ?link
 SET METADATA { confidence: CLAMP(MUL(?link.metadata.confidence, :factor), 0.0, 1.0), decay_applied_at: :now }
 WHERE {
   ?link (?s, ?p, ?o)
+  FILTER(?p != "belongs_to_domain")
   FILTER(IS_NULL(?link.metadata.superseded) || ?link.metadata.superseded != true)
-  FILTER(?link.metadata.created_at < :threshold && ?link.metadata.confidence > 0.3)
+  FILTER(?link.metadata.created_at < :threshold)
+  FILTER(?link.metadata.confidence > 0.3 && ?link.metadata.confidence < 1.0)
 } LIMIT 500
 
 // Reinforce without read-modify-write
@@ -345,7 +351,7 @@ SET ATTRIBUTES { evidence_count: ADD(COALESCE(?pref.attributes.evidence_count, 0
 WHERE { ?pref {type: "Preference", name: :pref_name} }
 ```
 
-Response: `{"updated": <count>}`.
+Response: `{"updated": <n>, "matched": <m>}` — matched by `WHERE` (after `LIMIT`), actually mutated.
 
 #### 3.3. `MERGE` (atomic entity consolidation)
 
@@ -354,7 +360,7 @@ MERGE CONCEPT ?source INTO ?target
 WHERE { ?source {type: "<T>", name: "<dup>"} ?target {type: "<T>", name: "<canonical>"} }
 ```
 
-Each variable must match **exactly one** node, same `type` (0 → `KIP_3002`; >1 → `KIP_3003`; type mismatch → `KIP_2002`). Atomically: repoints all of source's links to target (link `id`s preserved; (s,p,o) collisions keep target's link, fill its missing keys, drop the duplicate), fills target's missing attributes (target wins; `aliases` unioned + source `name` appended to target's `aliases`), deletes source, records `_merged_from`. Re-running after success → `KIP_3002` = "already merged". Protected nodes → `KIP_3004`.
+Each variable must match **exactly one** node, same `type` (0 → `KIP_3002`; >1 → `KIP_3003`; type mismatch → `KIP_2002`). Atomically: repoints all of source's links to target (link `id`s preserved; (s,p,o) collisions keep target's link, fill its missing keys, drop the duplicate), fills target's missing attributes (target wins; `aliases` unioned + source `name` appended to target's `aliases`), deletes source, records `_merged_from` (the source's own `_merged_from` entries carry over). Re-running after success → `KIP_3002` = "already merged" (engines SHOULD hint this when the target's `_merged_from` lists the source). Protected nodes → `KIP_3004`.
 
 #### 3.4. `DELETE` (smallest unit first)
 
@@ -381,11 +387,11 @@ DELETE CONCEPT ?drug DETACH
 WHERE { ?drug {type: "Drug", name: "OutdatedDrug"} }
 ```
 
-`DELETE ATTRIBUTES` / `DELETE METADATA` targets may be concept or proposition variables. Always verify with `FIND` before `DELETE CONCEPT`; `DETACH` cascades through higher-order propositions. `KIP_3004` protects meta-types, the `Domain` type and `belongs_to_domain` definitions, core domains, `$self`/`$system` identity tuples, and their `core_directives`; ordinary `$self` attributes may evolve.
+`DELETE ATTRIBUTES` / `DELETE METADATA` targets may be concept or proposition variables. Always verify with `FIND` before `DELETE CONCEPT`; `DETACH` cascades through higher-order propositions. `KIP_3004` protects meta-types, the `Domain` type and `belongs_to_domain` definitions, core domains, `$self`/`$system` identity tuples, and their `core_directives`; ordinary `$self` attributes may evolve. Response: `ATTRIBUTES`/`METADATA` → `{"updated_concepts": <n>, "updated_propositions": <m>}` (key removal mutates, deletes nothing); `PROPOSITIONS` → `{"deleted_propositions": <n>}`; `CONCEPT` → `{"deleted_concepts": <n>, "deleted_propositions": <m>}` (cascade audit).
 
 ---
 
-### 4. META & SEARCH
+### 4. META — Grounding, Introspection & Export
 
 #### 4.1. `DESCRIBE` (introspection)
 
@@ -414,10 +420,10 @@ SEARCH PROPOSITION "<term>"|:term [WITH TYPE "<predicate>"|:type] [MODE ...] [TH
 #### 4.3. `EXPORT` (capsule round-trip; read-only)
 
 ```prolog
-EXPORT ?target WHERE { ... } [LIMIT N]
+EXPORT ?target WHERE { ... } [LIMIT N] [CURSOR "<t>"]
 ```
 
-Serializes matched concepts/propositions into an idempotent `UPSERT` capsule for backup, migration, and agent-to-agent knowledge exchange. Endpoints outside the export set become `{type, name}` refs (must exist on import); reserved `_` metadata is never exported; export needed `$ConceptType`/`$PropositionType` definitions separately if the destination may lack them. Response: `{"capsule": "<KIP script>", "concepts": n, "propositions": m}`.
+Serializes matched concepts/propositions into an idempotent `UPSERT` capsule for backup, migration, and agent-to-agent knowledge exchange. Endpoints outside the export set become `{type, name}` refs (must exist on import); outside proposition endpoints become nested structural `(s, "p", o)` clauses (link IDs are not portable; must exist on import); reserved `_` metadata is never exported; export needed `$ConceptType`/`$PropositionType` definitions separately if the destination may lack them. Response: `{"capsule": "<KIP script>", "concepts": n, "propositions": m}`, plus `next_cursor` when more remain — re-issue with `CURSOR` to continue; each page is an independently valid capsule.
 
 ---
 
@@ -430,7 +436,7 @@ Serializes matched concepts/propositions into an idempotent `UPSERT` capsule for
 
 #### 5.2. Parameters
 
-- `command` (String) **OR** `commands` (Array) — mutually exclusive.
+- `command` (String) **OR** `commands` (Array) — exactly one MUST be provided.
 - `commands` element: a string (uses shared `parameters`) or `{command, parameters}` (independent).
 - `parameters` (Object): `:name` → JSON value substitution. Placeholders must occupy a complete KIP value position (`name: :name`, `LIMIT :limit`, `SEARCH CONCEPT :term`); never embed inside a string literal (`"Hello :name"` is **invalid** — substitution uses JSON serialization).
 - `dry_run` (Boolean): validate only.
@@ -470,6 +476,7 @@ Serializes matched concepts/propositions into an idempotent `UPSERT` capsule for
 
 - Single response: `{ "result": ... }` or `{ "error": { "code", "message", "hint"? } }`, with optional `next_cursor`.
 - Batch response: `{ "result": [<single_response>, ...] }`; KML stop-on-error may make the array shorter than submitted commands.
+- Result shapes: `FIND` → **columnar** — one index-aligned column per expression (single expression unwrapped: `FIND(?n)` → array of node objects; bare `?var` → full objects; non-grouped aggregation → scalar; grouped → aligned columns, e.g. `[["DomainA","DomainB"],[15,3]]`); `SEARCH` → array of hits (descending `_score`); `DESCRIBE PRIMER` → `{identity, domain_map, total_domains}`, `TYPES` lists → name arrays (+ `next_cursor`), single type → definition node; `UPSERT` → `{"blocks", "upsert_concept_nodes", "upsert_proposition_links"}`; `UPDATE` → `{"updated", "matched"}`; `DELETE` → `{"deleted_*"}` / `{"updated_*"}` counters; `EXPORT` → `{"capsule", "concepts", "propositions"}`.
 
 ```json
 // Single success
@@ -492,23 +499,24 @@ Serializes matched concepts/propositions into an idempotent `UPSERT` capsule for
 
 #### 6.1. Bootstrap Entities (must exist)
 
-| Entity                                                  | Purpose                                |
-| ------------------------------------------------------- | -------------------------------------- |
-| `{type: "$ConceptType", name: "$ConceptType"}`          | Meta-meta (self-referential genesis)   |
-| `{type: "$ConceptType", name: "$PropositionType"}`      | Meta for predicates                    |
-| `{type: "$ConceptType", name: "Domain"}`                | Organizational unit type               |
-| `{type: "$PropositionType", name: "belongs_to_domain"}` | Domain membership predicate            |
-| `{type: "Domain", name: "CoreSchema"}`                  | Holds core schema definitions          |
-| `{type: "Domain", name: "Unsorted"}`                    | Holding area for uncategorized items   |
-| `{type: "Domain", name: "Archived"}`                    | Deprecated/obsolete items              |
-| `{type: "$ConceptType", name: "Person"}`                | Actors (AI, Human, Org, System)        |
-| `{type: "$ConceptType", name: "Event"}`                 | Episodic memory                        |
-| `{type: "$ConceptType", name: "Preference"}`            | First-class stable preference facts    |
-| `{type: "$ConceptType", name: "Insight"}`               | Self-reflective lessons of the agent   |
-| `{type: "$ConceptType", name: "Commitment"}`            | Prospective promises & deadlines       |
-| `{type: "$ConceptType", name: "SleepTask"}`             | Background maintenance tasks           |
-| `{type: "Person", name: "$self"}`                       | The waking mind (conversational agent) |
-| `{type: "Person", name: "$system"}`                     | The sleeping mind (maintenance agent)  |
+| Entity                                                  | Purpose                                                              |
+| ------------------------------------------------------- | -------------------------------------------------------------------- |
+| `{type: "$ConceptType", name: "$ConceptType"}`          | Meta-meta (self-referential genesis)                                 |
+| `{type: "$ConceptType", name: "$PropositionType"}`      | Meta for predicates                                                  |
+| `{type: "$ConceptType", name: "Domain"}`                | Organizational unit type                                             |
+| `{type: "$PropositionType", name: "belongs_to_domain"}` | Domain membership predicate                                          |
+| `{type: "Domain", name: "CoreSchema"}`                  | Holds core schema definitions                                        |
+| `{type: "Domain", name: "Unsorted"}`                    | Holding area for uncategorized items                                 |
+| `{type: "Domain", name: "Archived"}`                    | Deprecated/obsolete items                                            |
+| `{type: "Domain", name: "System"}`                      | Operational home for memory-system nodes (e.g., SleepTask instances) |
+| `{type: "$ConceptType", name: "Person"}`                | Actors (AI, Human, Org, System)                                      |
+| `{type: "$ConceptType", name: "Event"}`                 | Episodic memory                                                      |
+| `{type: "$ConceptType", name: "Preference"}`            | First-class stable preference facts                                  |
+| `{type: "$ConceptType", name: "Insight"}`               | Self-reflective lessons of the agent                                 |
+| `{type: "$ConceptType", name: "Commitment"}`            | Prospective promises & deadlines                                     |
+| `{type: "$ConceptType", name: "SleepTask"}`             | Background maintenance tasks                                         |
+| `{type: "Person", name: "$self"}`                       | The waking mind (conversational agent)                               |
+| `{type: "Person", name: "$system"}`                     | The sleeping mind (maintenance agent)                                |
 
 **Core predicates (pre-bootstrapped `$PropositionType`s)**: `belongs_to_domain`, `involves` (Event → Person), `mentions` (Event → any), `consolidated_to` (Event → semantic), `derived_from` (semantic → Event), `prefers` (Person → Preference), `learned` (Person → Insight), `committed_to` (Person → Commitment), `owed_to` (Commitment → Person), `assigned_to` (SleepTask → Person).
 
@@ -525,16 +533,16 @@ Serializes matched concepts/propositions into an idempotent `UPSERT` capsule for
 
 **Temporality / Lifecycle**
 
-| Field                          | Type   | Description                                                      |
-| ------------------------------ | ------ | ---------------------------------------------------------------- |
-| `created_at` / `observed_at`   | string | ISO-8601                                                         |
-| `expires_at`                   | string | ISO-8601 — signal for `$system` cleanup; **not** auto-filtered   |
-| `valid_from` / `valid_until`   | string | ISO-8601 validity window                                         |
-| `status`                       | string | `active` \| `draft` \| `reviewed` \| `deprecated` \| `retracted` |
-| `memory_tier`                  | string | `short-term` \| `long-term`                                      |
-| `superseded`                   | bool   | `true` for historical (state-evolved) facts                      |
-| `superseded_by` / `supersedes` | string | Pointers across the evolution chain                              |
-| `superseded_at`                | string | ISO-8601 time when the assertion was superseded                  |
+| Field                          | Type   | Description                                                                                                                            |
+| ------------------------------ | ------ | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `created_at` / `observed_at`   | string | ISO-8601                                                                                                                               |
+| `expires_at`                   | string | ISO-8601 — signal for `$system` cleanup; **not** auto-filtered                                                                         |
+| `valid_from` / `valid_until`   | string | ISO-8601 validity window                                                                                                               |
+| `status`                       | string | `active` \| `draft` \| `reviewed` \| `deprecated` \| `retracted` — assertion lifecycle, distinct from a type's own `attributes.status` |
+| `memory_tier`                  | string | `short-term` \| `long-term`                                                                                                            |
+| `superseded`                   | bool   | `true` for historical (state-evolved) facts                                                                                            |
+| `superseded_by` / `supersedes` | string | Pointers across the evolution chain                                                                                                    |
+| `superseded_at`                | string | ISO-8601 time when the assertion was superseded                                                                                        |
 
 **Context / Auditing**
 
@@ -641,7 +649,7 @@ Messages may carry `role`, `content`, optional `name` (durable speaker id) and `
 - **Extraction budget**: a typical conversation yields 1 Event + 0–3 semantic concepts. Before exceeding ~5 semantic writes, re-check each against the Don't-Store list — over-extraction, not under-extraction, is the primary failure mode.
 - Prefer one batched read step and one batched write step when possible. Batch independent `SEARCH`, `DESCRIBE`, and `UPSERT` commands.
 - Reuse core schema aggressively. Create new types or predicates only when repeated future use is likely.
-- **Error recovery**: on a KIP error, apply the returned `hint`, correct, and retry once. Never re-send a failing command verbatim; if the retry fails, note it in `Warnings` and continue.
+- **Error recovery**: on a KIP error, apply the returned `hint`, correct, and retry once. Never re-send a failing command verbatim; if the retry fails, note it in `Warnings` and continue. Blind retries are safe only when the failure proves the command never executed (syntax/validation errors); after an ambiguous failure (e.g., a `KIP_4001` timeout) on a non-idempotent `UPDATE` (`ADD` counters), verify state before re-running.
 - After successful writes, stop with the compact output format below.
 
 ---
@@ -730,7 +738,7 @@ UPSERT {
   // Omit this block and the involves link if no participant is resolved.
   CONCEPT ?participant {
     {type: "Person", name: :participant_id}
-    SET ATTRIBUTES { person_class: "Human" }
+    SET ATTRIBUTES { person_class: :person_class }  // resolved: "Human" | "AI" | "Organization"; omit the key when unsure
   }
   CONCEPT ?event {
     {type: "Event", name: :event_name}
@@ -760,6 +768,7 @@ WITH METADATA {
 - **Naming**: `"<EventClass>:<date>:<topic_slug>"` (deterministic → idempotent).
 - **`expires_at` defaults**: `Conversation` / `WebpageView` / `ToolExecution` → `start_time + 90d`; `SelfReflection` → `+180d`; sensitive / one-shot → `+7d` or `+1d`; ceremonial events the user wants kept → omit. Per KIP §2.10, `expires_at` is a *signal* to background cleanup; it does not auto-filter queries. Never set on stable semantic concepts (`Person`, `Preference`, `Insight`, `Domain`, `$self`, `$system`, `$ConceptType`, `$PropositionType`) unless genuinely temporary.
 - **`involves` vs `mentions`**: `involves` for direct participants (Maintenance uses this to cluster events for cross-event pattern extraction); `mentions` for entities only referenced in content.
+- **`person_class`**: resolve from participant context ("Human" / "AI" / "Organization"). Shallow merge means a guessed class overwrites a correct one on an existing Person — omit the key when unsure.
 
 #### 5b. Semantic — Stable Concepts
 
@@ -776,7 +785,7 @@ UPSERT {
   }
   CONCEPT ?person {
     {type: "Person", name: :person_id}
-    SET ATTRIBUTES { name: :display_name, person_class: "Human" }
+    SET ATTRIBUTES { name: :display_name, person_class: :person_class }
     SET PROPOSITIONS {
       ("prefers", ?pref)
       ("belongs_to_domain", ?domain)
@@ -944,7 +953,7 @@ UPSERT {
     }
     SET PROPOSITIONS {
       ("assigned_to", {type: "Person", name: "$system"})
-      ("belongs_to_domain", {type: "Domain", name: "Unsorted"})
+      ("belongs_to_domain", {type: "Domain", name: "System"})
     }
   }
 }
@@ -956,14 +965,15 @@ WITH METADATA { source: :source, author: "$self", confidence: 1.0, created_at: :
 
 ### Phase 8: State Evolution — Handle Contradictions
 
-When new info contradicts existing knowledge, never silently overwrite. Mark the old proposition `superseded`, store the new fact normally, and create a high-priority `SleepTask` if the contradiction is complex.
+When new info contradicts existing knowledge, never silently overwrite. **Order matters**: ① store the new fact normally (§5b), ② `FIND` both link IDs, ③ mark the old proposition `superseded` by ID. Create a high-priority `SleepTask` if the contradiction is complex.
 
-First identify the existing proposition; never use a structural `PROPOSITION` block to mark an old fact unless you have just matched it, because structural `UPSERT` can create a missing link.
+Always mark the old fact via `(id: ...)` — a structural `PROPOSITION` block would create the link if it were missing.
 
 ```prolog
-FIND(?old_link.id, ?old_link.metadata.created_at, ?old_link.metadata.observed_at)
+FIND(?old_link.id, ?new_link.id)
 WHERE {
   ?old_link ({type: "Person", name: :person_name}, "prefers", {type: "Preference", name: :old_pref})
+  ?new_link ({type: "Person", name: :person_name}, "prefers", {type: "Preference", name: :new_pref})
 }
 LIMIT 1
 ```
@@ -976,7 +986,7 @@ UPSERT {
 }
 WITH METADATA {
   source: :source, author: "$self", created_at: :timestamp, observed_at: :timestamp,
-  superseded: true, superseded_at: :timestamp, superseded_by: :new_link_ref,
+  superseded: true, superseded_at: :timestamp, superseded_by: :new_link_id,
   confidence: 0.1
 }
 ```

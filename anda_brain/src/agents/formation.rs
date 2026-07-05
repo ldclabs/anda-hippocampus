@@ -331,7 +331,7 @@ impl FormationAgent {
             Some(n) => n,
             None => load_notes_from_legacy(ctx).await.unwrap_or_default(),
         };
-        let should_review = prompt.len() >= 10000;
+        let should_review = estimate_tokens(&prompt) >= 10000;
         let mut runner = ctx.clone().completion_iter(
             CompletionRequest {
                 instructions: format!(
@@ -376,9 +376,7 @@ impl FormationAgent {
                 Ok(None) => break,
                 Ok(Some(res)) => {
                     let now_ms = unix_ms();
-                    let ready_for_review =
-                        review_pending && res.failed_reason.is_none() && runner.is_idle();
-                    let is_done = runner.is_done() || runner.is_idle() && !ready_for_review;
+                    let is_done = runner.is_done() || runner.is_idle() && !review_pending;
 
                     append_runner_history(
                         conversation,
@@ -431,7 +429,8 @@ impl FormationAgent {
                         break;
                     }
 
-                    if ready_for_review {
+                    if review_pending && runner.is_idle() {
+                        runner.prune_req_raw_history();
                         runner.follow_up(REVIEW_INSTRUCTIONS.to_string());
                         review_pending = false;
                         continue;
@@ -1514,7 +1513,8 @@ mod tests {
         let ctx = space
             .ctx_for_test(SELF_USER_ID, FormationAgent::NAME)
             .unwrap();
-        let large_text = "x".repeat(10_500);
+        // ~44k chars ≈ 11k estimated tokens, above the 10k-token review threshold
+        let large_text = "x".repeat(44_000);
         let mut conversation = stored_conversation(
             &space,
             vec![json!(Message {
@@ -1545,7 +1545,8 @@ mod tests {
         let ctx = space
             .ctx_for_test(SELF_USER_ID, FormationAgent::NAME)
             .unwrap();
-        let large_text = "x".repeat(10_500);
+        // ~44k chars ≈ 11k estimated tokens, above the 10k-token review threshold
+        let large_text = "x".repeat(44_000);
         let mut conversation = stored_conversation(
             &space,
             vec![json!(Message {

@@ -3,13 +3,11 @@ use axum::{
     Json,
     body::Bytes,
     extract::{Path, Query, State},
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
 };
 use ic_auth_types::ByteArrayB64;
-use markdown::{CompileOptions, Options, ParseOptions, to_html, to_html_with_options};
 use rand::Rng;
 use serde_json::json;
-use std::sync::LazyLock;
 
 use crate::{
     agents::SELF_USER_ID,
@@ -19,20 +17,8 @@ use crate::{
 };
 
 const SKILL_MARKDOWN: &str = include_str!("../SKILL.md");
-const WEBSITE_MARKDOWN: &str = include_str!("../WEBSITE.md");
-const WEBSITE_CN_MARKDOWN: &str = include_str!("../WEBSITE_cn.md");
-const APP_HTML: &str = include_str!("../app.html");
 const FAVICON: &[u8] = include_bytes!("../favicon.ico");
 const APPLE_TOUCH_ICON: &[u8] = include_bytes!("../apple-touch-icon.webp");
-
-pub static WEBSITE: LazyLock<String> =
-    LazyLock::new(|| APP_HTML.replace("%sveltekit.body%", &markdown_to_html(WEBSITE_MARKDOWN)));
-
-pub static WEBSITE_CN: LazyLock<String> = LazyLock::new(|| {
-    APP_HTML
-        .replacen("<html lang=\"en\"", "<html lang=\"zh-CN\"", 1)
-        .replace("%sveltekit.body%", &markdown_to_html(WEBSITE_CN_MARKDOWN))
-});
 
 fn ensure_sharding(app: &AppState, sharding: u32) -> Result<(), AppError> {
     if sharding != app.sharding {
@@ -67,25 +53,6 @@ pub async fn get_information(State(app): State<AppState>) -> impl IntoResponse {
     });
 
     Json(info)
-}
-
-pub async fn get_website(Accept(ct, is_cn): Accept) -> Response {
-    match ct.response_type() {
-        ContentType::Markdown(true) => {
-            if is_cn {
-                ct.response(WEBSITE_CN_MARKDOWN).into_response()
-            } else {
-                ct.response(WEBSITE_MARKDOWN).into_response()
-            }
-        }
-        _ => {
-            if is_cn {
-                Html(WEBSITE_CN.as_str()).into_response()
-            } else {
-                Html(WEBSITE.as_str()).into_response()
-            }
-        }
-    }
 }
 
 pub async fn get_skill(State(_app): State<AppState>) -> impl IntoResponse {
@@ -758,31 +725,14 @@ pub async fn update_space_tier(
     Ok(ct.response(RpcResponse::success(rt)))
 }
 
-fn markdown_to_html(md: &str) -> String {
-    to_html_with_options(
-        md,
-        &Options {
-            parse: ParseOptions::gfm(),
-            compile: CompileOptions {
-                allow_any_img_src: true,
-                allow_dangerous_html: true,
-                allow_dangerous_protocol: true,
-                gfm_tagfilter: false,
-                ..CompileOptions::gfm()
-            },
-        },
-    )
-    .unwrap_or_else(|_| to_html(md))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         add_space_token, apple_touch_icon, create_space, execute_kip_readonly, favicon, get_byok,
         get_conversation, get_conversation_delta, get_formation_status, get_info, get_information,
-        get_or_init_user, get_skill, get_website, list_conversations, list_space_tokens,
-        markdown_to_html, post_formation, post_maintenance, post_recall, restart_formation,
-        revoke_space_token, update_byok, update_space, update_space_tier,
+        get_or_init_user, get_skill, list_conversations, list_space_tokens, post_formation,
+        post_maintenance, post_recall, restart_formation, revoke_space_token, update_byok,
+        update_space, update_space_tier,
     };
     use crate::{
         agents::SELF_USER_ID,
@@ -1005,23 +955,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn markdown_to_html_renders_gfm_tables() {
-        let html = markdown_to_html("| name | count |\n| --- | ---: |\n| alice | 7 |");
-
-        assert!(html.contains("<table>"));
-        assert!(html.contains("<td>alice</td>"));
-        assert!(html.contains("<td align=\"right\">7</td>"));
-    }
-
-    #[test]
-    fn markdown_to_html_preserves_allowed_raw_html() {
-        let html = markdown_to_html("# Title\n\n<span data-kind=\"raw\">ok</span>");
-
-        assert!(html.contains("<h1>Title</h1>"));
-        assert!(html.contains("<span data-kind=\"raw\">ok</span>"));
-    }
-
     #[tokio::test]
     async fn static_and_information_handlers_return_expected_formats() {
         let app = test_app_state("handler_static", 9);
@@ -1053,22 +986,6 @@ mod tests {
         );
         let skill_text = response_text(skill).await;
         assert!(skill_text.contains("Anda Brain"));
-
-        let website_md = get_website(accept_from_headers(Some("text/markdown"), None, None)).await;
-        assert_eq!(
-            website_md.headers().get(header::CONTENT_TYPE).unwrap(),
-            "text/markdown; charset=utf-8"
-        );
-        assert!(response_text(website_md).await.contains("Anda Brain"));
-
-        let website_cn = get_website(accept_from_headers(
-            Some("text/html"),
-            None,
-            Some("zh-CN,en"),
-        ))
-        .await;
-        let website_cn = response_text(website_cn).await;
-        assert!(website_cn.contains("<html lang=\"zh-CN\""));
     }
 
     #[tokio::test]

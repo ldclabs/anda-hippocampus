@@ -302,7 +302,6 @@ fn build_router(
     cancel_token: CancellationToken,
 ) -> Router<AppState> {
     let mut router = Router::new()
-        .route("/", routing::get(get_website))
         .route("/favicon.ico", routing::get(favicon))
         .route("/apple-touch-icon.webp", routing::get(apple_touch_icon))
         .route("/info", routing::get(get_information))
