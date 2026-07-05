@@ -872,6 +872,7 @@ mod tests {
             current_version: 7,
             current_checksum: "sha3-256:doc".to_string(),
             tags: vec![],
+            acl_label: String::new(),
             source_uri: None,
             metadata: BTreeMap::new(),
             created_by: "a".to_string(),
@@ -925,6 +926,7 @@ mod tests {
             current_version: 2,
             current_checksum: String::new(),
             tags: vec![],
+            acl_label: String::new(),
             source_uri: None,
             metadata: BTreeMap::new(),
             created_by: String::new(),
@@ -958,7 +960,7 @@ mod tests {
             byte_end: 5,
             checksum: "sha3-256:chunk".to_string(),
             chunker_version: 1,
-            acl_label: None,
+            acl_label: String::new(),
         };
         let extraction = Extraction {
             concepts: vec![],

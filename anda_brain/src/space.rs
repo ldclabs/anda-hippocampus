@@ -499,6 +499,7 @@ impl Space {
             scope: input.scope,
             name: input.name,
             expires_at: input.expires_at,
+            labels: input.labels,
             created_at: now_ms,
             updated_at: now_ms,
             ..Default::default()
@@ -587,6 +588,16 @@ impl Space {
             self.db
                 .set_extension_from("wiki_digest".to_string(), wiki_digest);
         }
+        if let Some(audit_reads) = input.wiki_audit_reads {
+            changed = true;
+            self.db
+                .set_extension_from("wiki_audit_reads".to_string(), audit_reads);
+            self.wiki.set_audit_reads(audit_reads);
+        }
+        if let Some(defaults) = input.wiki_acl_defaults {
+            changed = true;
+            self.wiki.set_acl_defaults(defaults).await?;
+        }
         if changed {
             self.db.flush_metadata(now_ms).await?;
         }
@@ -623,6 +634,10 @@ impl Space {
             maintenance_at: self.maintenance.get_processed_at(),
             wiki_docs: self.wiki.docs_count(),
             wiki_chunks: self.wiki.chunks_count(),
+            wiki_versions: self.wiki.versions_count(),
+            wiki_queries: self.wiki.queries_count(),
+            wiki_digested: self.wiki_digest.cursor(),
+            wiki_stale_docs: self.wiki.stale_report_cached().stale_docs,
             ..Default::default()
         };
 
@@ -781,6 +796,30 @@ impl Space {
                 Some(usage)
             });
         Ok(rt)
+    }
+
+    /// Non-LLM wiki housekeeping (PRD §7.4 Full tier): audit-log retention
+    /// pruning and the stale-document report. Cheap enough to run alongside
+    /// every digest kick.
+    pub fn kick_wiki_housekeeping(self: &Arc<Self>) {
+        let space = self.clone();
+        tokio::spawn(async move {
+            let now_ms = unix_ms();
+            if let Err(err) = space
+                .wiki
+                .prune_events(crate::wiki::DEFAULT_EVENT_RETENTION, now_ms)
+                .await
+            {
+                log::warn!(target: "brain", space_id = space.id; "wiki event prune failed: {err:?}");
+            }
+            if let Err(err) = space
+                .wiki
+                .stale_report(now_ms, crate::wiki::DEFAULT_STALE_AFTER_MS)
+                .await
+            {
+                log::warn!(target: "brain", space_id = space.id; "wiki stale report failed: {err:?}");
+            }
+        });
     }
 
     /// Fire-and-forget digest kick used by startup and post-maintenance
@@ -1023,6 +1062,7 @@ impl Space {
         let models = Arc::new(Models::from_clone(models.as_ref()));
         let memory = Arc::new(memory);
         let wiki_digest = Arc::new(WikiDigest::new(wiki.clone(), memory.clone()));
+        wiki.set_audit_reads(db.get_extension_as("wiki_audit_reads").unwrap_or(false));
         let memory_r = TimedMemoryReadonly::new(memory.clone());
         let memory_tool = MemoryTool::new(memory.clone());
         let note_tool = NoteTool::new();
@@ -1118,6 +1158,7 @@ impl Space {
             }
             // Resume any wiki digest backlog left from before the restart.
             this_clone.kick_wiki_digest();
+            this_clone.kick_wiki_housekeeping();
             // Resume formation if it was interrupted before. A missing marker
             // means nothing was processed yet, so resume from the beginning.
             let conversation = this_clone.formation.get_processed().unwrap_or_default();
@@ -1207,6 +1248,7 @@ impl BrainHook for Hooks {
         // Post-sleep digest: fold freshly committed wiki knowledge into the
         // graph while formation is quiet (PRD §7.3, Daydream cadence).
         space.kick_wiki_digest();
+        space.kick_wiki_housekeeping();
     }
 
     async fn try_start_maintenance(&self, formation_id: DocumentId) -> Option<DocumentId> {
@@ -1575,9 +1617,7 @@ mod tests {
             .update(
                 UpdateSpaceInput {
                     name: Some("before fork".to_string()),
-                    description: None,
-                    public: None,
-                    wiki_digest: None,
+                    ..Default::default()
                 },
                 unix_ms(),
             )
@@ -1607,9 +1647,7 @@ mod tests {
         fork.update(
             UpdateSpaceInput {
                 name: Some("after fork".to_string()),
-                description: None,
-                public: None,
-                wiki_digest: None,
+                ..Default::default()
             },
             unix_ms(),
         )
@@ -2028,6 +2066,7 @@ mod tests {
                     scope: TokenScope::Read,
                     name: "reader".to_string(),
                     expires_at: Some(2000),
+                    labels: None,
                 },
                 1100,
             )
@@ -2091,6 +2130,7 @@ mod tests {
                         scope: TokenScope::Read,
                         name: format!("reader-{idx}"),
                         expires_at: None,
+                        labels: None,
                     },
                     idx,
                 )
@@ -2104,6 +2144,7 @@ mod tests {
                     scope: TokenScope::Read,
                     name: "overflow".to_string(),
                     expires_at: None,
+                    labels: None,
                 },
                 101,
             )
@@ -2557,6 +2598,88 @@ mod tests {
         wait_until_idle(&space).await;
         assert!(full > quick);
         assert_eq!(space.maintenance_for_test().get_processed_at().full, 168);
+    }
+
+    /// M4 acceptance: an exported OKF bundle plus its manifest replays into
+    /// an empty space with every document checksum intact.
+    #[tokio::test]
+    async fn wiki_export_bundle_replays_into_empty_space() {
+        use crate::wiki::{WikiBundleEntry, WikiCommitInput, WikiImportInput};
+
+        let app = test_app_state("wiki_replay_src");
+        let source = create_loaded_space(&app, "wiki_replay_source").await;
+        for (title, body) in [
+            ("部署指南", "# 部署指南\n\n回滚使用上一版本快照。\n"),
+            ("安全政策", "# 安全政策\n\n密钥必须存放在 KMS。\n"),
+        ] {
+            let mut input = WikiCommitInput {
+                title: title.to_string(),
+                content: body.to_string(),
+                ..Default::default()
+            };
+            input.namespace = Some("kb".to_string());
+            source
+                .wiki
+                .commit("op".to_string(), input, unix_ms())
+                .await
+                .unwrap();
+        }
+        let export = source
+            .wiki
+            .export_bundle("op".to_string(), Some("kb".to_string()), unix_ms())
+            .await
+            .unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(
+            &export
+                .entries
+                .iter()
+                .find(|e| e.path == "manifest.json")
+                .unwrap()
+                .content,
+        )
+        .unwrap();
+
+        // Replay into a brand-new space.
+        let replay_app = test_app_state("wiki_replay_dst");
+        let target = create_loaded_space(&replay_app, "wiki_replay_target").await;
+        let entries: Vec<WikiBundleEntry> = export
+            .entries
+            .iter()
+            .filter(|e| e.path.ends_with(".md"))
+            .cloned()
+            .collect();
+        let imported = target
+            .wiki
+            .import_bundle(
+                "op".to_string(),
+                WikiImportInput {
+                    entries,
+                    namespace: Some("kb".to_string()),
+                },
+                unix_ms(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(imported.created, export.docs);
+
+        // Every replayed document matches the manifest checksum: the bundle
+        // is a faithful backup.
+        for doc in manifest["docs"].as_array().unwrap() {
+            let path = doc["path"].as_str().unwrap();
+            let checksum = doc["checksum"].as_str().unwrap();
+            let restored = imported
+                .docs
+                .iter()
+                .find(|d| d.path == path)
+                .unwrap_or_else(|| panic!("missing {path}"));
+            let info = target.wiki.get_doc(restored.doc_id).await.unwrap();
+            assert_eq!(info.current_checksum, checksum, "checksum drift for {path}");
+        }
+
+        // SpaceInfo exposes the M4 wiki metrics.
+        let info = target.get_info();
+        assert_eq!(info.wiki_docs, export.docs);
+        assert!(info.wiki_versions >= export.docs);
     }
 
     /// Replays scripted completion responses in order; used to drive the

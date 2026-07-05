@@ -20,6 +20,10 @@ pub const EVENT_CITATION_VERIFY_FAILED: &str = "CitationVerifyFailed";
 pub const EVENT_IMPORT_COMPLETED: &str = "ImportCompleted";
 pub const EVENT_EXPORT_COMPLETED: &str = "ExportCompleted";
 pub const EVENT_DIGEST_EXTRACTED: &str = "DigestExtracted";
+pub const EVENT_WIKI_QUERIED: &str = "WikiQueried";
+pub const EVENT_WIKI_READ: &str = "WikiRead";
+pub const EVENT_STALE_REPORT: &str = "StaleReport";
+pub const EVENT_EVENTS_PRUNED: &str = "EventsPruned";
 
 /// Document registry row. `current_version == 0` marks a document that is
 /// still initializing (created but never activated): invisible to reads and
@@ -34,6 +38,9 @@ pub struct WikiDocRecord {
     pub current_version: u64,
     pub current_checksum: String,
     pub tags: Vec<String>,
+    /// ACL label; empty = readable by any space reader. Restricted tokens
+    /// see only unlabeled documents plus their granted labels (PRD §8.2).
+    pub acl_label: String,
     pub source_uri: Option<String>,
     pub metadata: BTreeMap<String, Json>,
     pub created_by: String,
@@ -77,7 +84,9 @@ pub struct WikiChunkRecord {
     pub byte_end: u64,
     pub checksum: String,
     pub chunker_version: u64,
-    pub acl_label: Option<String>,
+    /// Denormalized from the document so the ACL prefilter runs inside the
+    /// same AndaDB query as retrieval (empty = unlabeled).
+    pub acl_label: String,
 }
 
 /// Append-only audit row for writes and background tasks. Reads are not

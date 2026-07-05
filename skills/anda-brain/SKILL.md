@@ -441,6 +441,19 @@ GET  /v1/{space_id}/wiki/events?kind=&doc_id=
 
 `verify` answers `valid`, `superseded` (a newer version exists — it names it), or `invalid`. Versions are immutable, so citations never rot.
 
+**Access control (ACL labels):**
+
+Documents may carry an `acl_label` (set via commit, or inherited from a per-namespace default configured with `update_space {"wiki_acl_defaults": {"hr": "hr-internal"}}`). Space tokens may carry `labels`: a token with labels sees only unlabeled documents plus its granted labels — enforced as a filter clause inside the same database query as retrieval, so over-broad results are structurally impossible. Tokens without labels and CWT holders are unrestricted; anonymous readers of public spaces see unlabeled content only. Denials surface as 404 (existence does not leak); the audit log requires an unrestricted token. Note: OKF bundles do not carry ACL labels (the exchange format cannot express enterprise ACLs) — imported documents inherit namespace defaults.
+
+```
+POST /v1/{space_id}/management/add_space_token
+{"scope": "read", "name": "analyst", "labels": ["engineering"]}
+```
+
+**Read auditing and housekeeping:**
+
+`update_space {"wiki_audit_reads": true}` events every external search/read (`WikiQueried` / `WikiRead`, with the real actor); agent reads stay covered by recall conversation logs. Housekeeping runs automatically after maintenance cycles and on startup: the audit log is pruned to its retention cap (the prune itself is evented), and a stale-document report is refreshed. `GET /v1/{space_id}/info` exposes `wiki_docs / wiki_chunks / wiki_versions / wiki_queries / wiki_digested / wiki_stale_docs`.
+
 **Graph bridge (WikiDigest, opt-in):**
 
 ```

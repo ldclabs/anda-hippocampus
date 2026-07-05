@@ -35,8 +35,8 @@ use crate::{
         RecallInput, TokenScope,
     },
     wiki::{
-        WikiCommitInput, WikiError, WikiReadInput, WikiSearchInput, WikiSearchMode, WikiSelector,
-        WikiVerifyInput,
+        WikiAccess, WikiCommitInput, WikiError, WikiReadInput, WikiSearchInput, WikiSearchMode,
+        WikiSelector, WikiVerifyInput,
     },
 };
 
@@ -437,6 +437,19 @@ impl AndaBrainMcpServer {
         scope: TokenScope,
         access: &McpAccess,
     ) -> Result<Arc<Space>, ErrorData> {
+        Ok(self
+            .load_authorized_space_with_token(scope, access)
+            .await?
+            .0)
+    }
+
+    /// Like [`Self::load_authorized_space`] but also returns the verified
+    /// space token so wiki tools can honor its ACL labels (PRD §8.2).
+    async fn load_authorized_space_with_token(
+        &self,
+        scope: TokenScope,
+        access: &McpAccess,
+    ) -> Result<(Arc<Space>, Option<crate::types::SpaceToken>), ErrorData> {
         if let Some(sharding) = access.sharding
             && sharding != self.app.sharding
         {
@@ -476,13 +489,15 @@ impl AndaBrainMcpServer {
             }
             Err(err) => return Err(err),
         };
+        let mut space_token = None;
         if cwt.is_none() && !(scope == TokenScope::Read && space.is_public()) {
-            space
-                .verify_space_token(access.auth_token.clone(), scope, now_ms)
-                .map_err(|_| unauthorized(scope))?;
+            space_token = Some(
+                space
+                    .verify_space_token(access.auth_token.clone(), scope, now_ms)
+                    .map_err(|_| unauthorized(scope))?,
+            );
         }
-
-        Ok(space)
+        Ok((space, space_token))
     }
 
     pub async fn ensure_space_available(&self) -> Result<(), ErrorData> {
@@ -647,10 +662,13 @@ impl AndaBrainMcpServer {
         access: &McpAccess,
         input: WikiSearchToolInput,
     ) -> Result<CallToolResult, ErrorData> {
-        let space = self.load_authorized_space(TokenScope::Read, access).await?;
+        let (space, st) = self
+            .load_authorized_space_with_token(TokenScope::Read, access)
+            .await?;
+        let scope = mcp_wiki_access(st.as_ref());
         let output = space
             .wiki
-            .search(input.into())
+            .search_scoped(&scope, input.into(), unix_ms())
             .await
             .map_err(wiki_tool_error)?;
         structured_result(output)
@@ -661,10 +679,13 @@ impl AndaBrainMcpServer {
         access: &McpAccess,
         input: WikiReadToolInput,
     ) -> Result<CallToolResult, ErrorData> {
-        let space = self.load_authorized_space(TokenScope::Read, access).await?;
+        let (space, st) = self
+            .load_authorized_space_with_token(TokenScope::Read, access)
+            .await?;
+        let scope = mcp_wiki_access(st.as_ref());
         let output = space
             .wiki
-            .read(input.try_into()?)
+            .read_scoped(&scope, input.try_into()?, unix_ms())
             .await
             .map_err(wiki_tool_error)?;
         structured_result(output)
@@ -675,11 +696,14 @@ impl AndaBrainMcpServer {
         access: &McpAccess,
         input: WikiVerifyToolInput,
     ) -> Result<CallToolResult, ErrorData> {
-        let space = self.load_authorized_space(TokenScope::Read, access).await?;
+        let (space, st) = self
+            .load_authorized_space_with_token(TokenScope::Read, access)
+            .await?;
+        let scope = mcp_wiki_access(st.as_ref());
         let output = space
             .wiki
-            .verify(
-                SELF_USER_ID.to_string(),
+            .verify_scoped(
+                &scope,
                 WikiVerifyInput {
                     uri: Some(input.uri),
                     checksum: input.checksum,
@@ -690,6 +714,17 @@ impl AndaBrainMcpServer {
             .await
             .map_err(wiki_tool_error)?;
         structured_result(output)
+    }
+}
+
+/// MCP wiki read scope: labeled space tokens are restricted; CWT holders
+/// and label-less tokens are unrestricted.
+fn mcp_wiki_access(st: Option<&crate::types::SpaceToken>) -> WikiAccess {
+    WikiAccess {
+        actor: st
+            .map(|st| format!("st:{}", st.name.trim()))
+            .unwrap_or_else(|| SELF_USER_ID.to_string()),
+        labels: st.and_then(|st| st.labels.clone()),
     }
 }
 
@@ -721,6 +756,8 @@ pub struct WikiCommitToolInput {
     pub source_uri: Option<String>,
     /// Commit message: why this change.
     pub message: Option<String>,
+    /// ACL label; omit to keep/inherit, empty string to clear.
+    pub acl_label: Option<String>,
 }
 
 impl From<WikiCommitToolInput> for WikiCommitInput {
@@ -733,6 +770,7 @@ impl From<WikiCommitToolInput> for WikiCommitInput {
             title: input.title,
             content: input.content,
             tags: input.tags,
+            acl_label: input.acl_label,
             source_uri: input.source_uri,
             message: input.message,
             metadata: None,

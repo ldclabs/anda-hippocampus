@@ -220,9 +220,10 @@ impl Tool<BaseCtx> for WikiCommitTool {
                     "content": {"type": "string", "description": "Full Markdown content (whole document, not a diff)."},
                     "tags": {"type": ["array", "null"], "items": {"type": "string"}, "description": "Tags for filtering."},
                     "source_uri": {"type": ["string", "null"], "description": "External origin, when imported."},
-                    "message": {"type": ["string", "null"], "description": "Commit message: why this change."}
+                    "message": {"type": ["string", "null"], "description": "Commit message: why this change."},
+                    "acl_label": {"type": ["string", "null"], "description": "ACL label; null keeps/inherits, empty string clears."}
                 },
-                "required": ["doc_id", "parent_version", "namespace", "slug", "title", "content", "tags", "source_uri", "message"],
+                "required": ["doc_id", "parent_version", "namespace", "slug", "title", "content", "tags", "source_uri", "message", "acl_label"],
                 "additionalProperties": false
             }),
             strict: Some(true),

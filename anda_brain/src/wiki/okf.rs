@@ -145,6 +145,9 @@ impl WikiService {
                 title: title.clone(),
                 content: body.to_string(),
                 tags: parsed.as_ref().and_then(|fm| fm.tags.clone()),
+                // OKF cannot express enterprise ACLs (PRD §9): imported docs
+                // keep their stored label or inherit the namespace default.
+                acl_label: None,
                 source_uri: parsed.as_ref().and_then(|fm| fm.resource.clone()),
                 message: Some(format!("okf import: {}", entry.path)),
                 metadata: if metadata.is_empty() {

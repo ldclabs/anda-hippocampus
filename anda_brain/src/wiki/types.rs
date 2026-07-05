@@ -83,6 +83,10 @@ pub struct WikiCommitInput {
     /// `None` keeps the stored tags on update; `Some` replaces them.
     #[serde(default)]
     pub tags: Option<Vec<String>>,
+    /// ACL label. `None` keeps the stored label (or inherits the namespace
+    /// default on create); `Some("")` clears it.
+    #[serde(default)]
+    pub acl_label: Option<String>,
     /// `None` keeps the stored value on update.
     #[serde(default)]
     pub source_uri: Option<String>,
@@ -142,6 +146,8 @@ pub struct WikiDocInfo {
     pub current_version: u64,
     pub current_checksum: String,
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub acl_label: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_uri: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -163,6 +169,7 @@ impl From<WikiDocRecord> for WikiDocInfo {
             current_version: doc.current_version,
             current_checksum: doc.current_checksum,
             tags: doc.tags,
+            acl_label: doc.acl_label,
             source_uri: doc.source_uri,
             metadata: doc.metadata,
             created_by: doc.created_by,
@@ -461,6 +468,41 @@ pub struct WikiExportOutput {
     /// Concept `.md` files plus generated `index.md` and `manifest.json`.
     pub entries: Vec<WikiBundleEntry>,
     pub docs: usize,
+}
+
+/// Caller identity for scoped (HTTP/MCP) wiki reads. `labels: None` means
+/// unrestricted (CWT holders and legacy space tokens); `Some(list)` grants
+/// unlabeled content plus the listed labels. The filter runs inside the
+/// same AndaDB query as retrieval, so over-broad results are structurally
+/// impossible.
+#[derive(Debug, Clone, Default)]
+pub struct WikiAccess {
+    pub actor: String,
+    pub labels: Option<Vec<String>>,
+}
+
+impl WikiAccess {
+    pub fn unrestricted(actor: impl Into<String>) -> Self {
+        Self {
+            actor: actor.into(),
+            labels: None,
+        }
+    }
+
+    pub fn allows(&self, label: &str) -> bool {
+        match &self.labels {
+            None => true,
+            Some(labels) => label.is_empty() || labels.iter().any(|l| l == label),
+        }
+    }
+}
+
+/// Last housekeeping stale scan, persisted for `SpaceInfo`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct WikiStaleReport {
+    pub stale_docs: u64,
+    pub checked_docs: u64,
+    pub checked_at: u64,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]

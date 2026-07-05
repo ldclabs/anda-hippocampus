@@ -44,6 +44,10 @@ const SENTINEL_TTL_MS: u64 = 10 * 60 * 1000;
 const SCAN_PAGE: usize = 200;
 /// Cap for `Include` filter key lists (AndaDB rejects larger ones).
 const MAX_INCLUDE_KEYS: usize = 4096;
+/// Default audit-log retention (PRD §3.4).
+pub const DEFAULT_EVENT_RETENTION: usize = 100_000;
+/// Documents untouched for this long count as stale (PRD §7.4).
+pub const DEFAULT_STALE_AFTER_MS: u64 = 180 * 24 * 3600 * 1000;
 
 #[derive(Clone)]
 pub struct WikiService {
@@ -53,6 +57,9 @@ pub struct WikiService {
     chunks: Arc<Collection>,
     events: Arc<Collection>,
     write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// When set, scoped (HTTP/MCP) reads are evented; agent reads stay
+    /// covered by the recall conversation log (PRD §3.4).
+    audit_reads: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl WikiService {
@@ -105,7 +112,17 @@ impl WikiService {
             chunks,
             events,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            audit_reads: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
+    }
+
+    pub fn set_audit_reads(&self, enabled: bool) {
+        self.audit_reads
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn audit_reads(&self) -> bool {
+        self.audit_reads.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn docs_count(&self) -> usize {
@@ -180,6 +197,10 @@ impl WikiService {
             && doc.title == input.title
             && input.tags.as_ref().is_none_or(|tags| *tags == doc.tags)
             && input
+                .acl_label
+                .as_ref()
+                .is_none_or(|label| label.trim() == doc.acl_label)
+            && input
                 .namespace
                 .as_ref()
                 .is_none_or(|ns| *ns == doc.namespace)
@@ -206,6 +227,15 @@ impl WikiService {
             (Some(tags), _) => tags.clone(),
             (None, Some(doc)) => doc.tags.clone(),
             (None, None) => Vec::new(),
+        };
+        // None keeps the stored label; on create it inherits the namespace
+        // default. Some("") clears explicitly.
+        let acl_label = match (&input.acl_label, &existing) {
+            (Some(label), _) => label.trim().to_string(),
+            (None, Some(doc)) => doc.acl_label.clone(),
+            (None, None) => {
+                self.acl_default_for(input.namespace.as_deref().unwrap_or(DEFAULT_NAMESPACE))
+            }
         };
 
         let (doc_id, created, namespace, slug, prev_version) = match &existing {
@@ -239,6 +269,7 @@ impl WikiService {
                     current_version: 0,
                     current_checksum: String::new(),
                     tags: tags.clone(),
+                    acl_label: acl_label.clone(),
                     source_uri: input.source_uri.clone(),
                     metadata: input.metadata.clone().unwrap_or_default(),
                     created_by: actor.clone(),
@@ -285,7 +316,7 @@ impl WikiService {
                 byte_end: draft.byte_end as u64,
                 checksum: chunk_checksum(&checksum, draft.byte_start, draft.byte_end, text),
                 chunker_version: CHUNKER_VERSION as u64,
-                acl_label: None,
+                acl_label: acl_label.clone(),
             };
             chunk_ids.push(self.chunks.add_from(&record).await?);
         }
@@ -305,6 +336,7 @@ impl WikiService {
                 "tags".to_string(),
                 Fv::Array(tags.iter().cloned().map(Fv::Text).collect()),
             ),
+            ("acl_label".to_string(), Fv::Text(acl_label.clone())),
             ("updated_by".to_string(), Fv::Text(actor.clone())),
             ("updated_at".to_string(), Fv::U64(now_ms)),
         ]);
@@ -459,7 +491,52 @@ impl WikiService {
     /// One-call BM25 retrieval over the chunk plane. Visibility (current
     /// version, namespace, archive state) is entirely in the filter, which
     /// AndaDB applies in the same query while preserving relevance order.
-    pub async fn search(&self, mut input: WikiSearchInput) -> Result<WikiSearchOutput, WikiError> {
+    /// Unrestricted view: agent tools and internal callers.
+    pub async fn search(&self, input: WikiSearchInput) -> Result<WikiSearchOutput, WikiError> {
+        self.bump_query_count();
+        self.search_inner(input, None).await
+    }
+
+    /// Label-scoped retrieval for external (HTTP/MCP) callers: the ACL
+    /// prefilter is part of the same AndaDB query, and the read is evented
+    /// when `audit_reads` is enabled.
+    pub async fn search_scoped(
+        &self,
+        access: &WikiAccess,
+        input: WikiSearchInput,
+        now_ms: u64,
+    ) -> Result<WikiSearchOutput, WikiError> {
+        self.bump_query_count();
+        let query = input.query.clone();
+        let output = self.search_inner(input, access.labels.as_deref()).await?;
+        if self.audit_reads() {
+            // Read-audit failures never fail the read.
+            let _ = self
+                .write_event(
+                    EVENT_WIKI_QUERIED,
+                    None,
+                    None,
+                    access.actor.clone(),
+                    BTreeMap::from([
+                        ("query".to_string(), Json::from(query)),
+                        ("hits".to_string(), Json::from(output.hits.len() as u64)),
+                        (
+                            "restricted".to_string(),
+                            Json::from(access.labels.is_some()),
+                        ),
+                    ]),
+                    now_ms,
+                )
+                .await;
+        }
+        Ok(output)
+    }
+
+    async fn search_inner(
+        &self,
+        mut input: WikiSearchInput,
+        labels: Option<&[String]>,
+    ) -> Result<WikiSearchOutput, WikiError> {
         input.normalize();
         if input.query.is_empty() {
             return Err(WikiError::Invalid("query cannot be empty".into()));
@@ -510,6 +587,9 @@ impl WikiService {
                         .collect(),
                 ),
             ))));
+        }
+        if let Some(labels) = labels {
+            filters.push(Box::new(acl_filter(labels)));
         }
 
         let fetch = match input.mode {
@@ -893,6 +973,14 @@ impl WikiService {
         &self,
         input: WikiListDocsInput,
     ) -> Result<WikiDocListOutput, WikiError> {
+        self.list_docs_inner(input, None).await
+    }
+
+    async fn list_docs_inner(
+        &self,
+        input: WikiListDocsInput,
+        labels: Option<&[String]>,
+    ) -> Result<WikiDocListOutput, WikiError> {
         let limit = input.limit.unwrap_or(20).clamp(1, 100);
         let cursor = self.cursor_or_max(&self.docs, &input.cursor)?;
 
@@ -924,6 +1012,9 @@ impl WikiService {
                 "tags".to_string(),
                 RangeQuery::Eq(Fv::Text(tag.clone())),
             ))));
+        }
+        if let Some(labels) = labels {
+            filters.push(Box::new(acl_filter(labels)));
         }
 
         let rows: Vec<WikiDocRecord> = self
@@ -1028,6 +1119,299 @@ impl WikiService {
                 .collect(),
             next_cursor,
         })
+    }
+
+    // ─── Scoped (external) read paths ───────────────────────────────────────
+
+    fn guard_doc<'a>(
+        &self,
+        doc: &'a WikiDocRecord,
+        access: &WikiAccess,
+    ) -> Result<&'a WikiDocRecord, WikiError> {
+        if access.allows(&doc.acl_label) {
+            Ok(doc)
+        } else {
+            // NotFound, not Forbidden: restricted tokens must not learn that
+            // a labeled document exists.
+            Err(WikiError::NotFound(format!(
+                "document {} not found",
+                doc._id
+            )))
+        }
+    }
+
+    pub async fn get_doc_scoped(
+        &self,
+        access: &WikiAccess,
+        doc_id: u64,
+    ) -> Result<WikiDocInfo, WikiError> {
+        let doc = self.doc_record(doc_id).await?;
+        self.guard_doc(&doc, access)?;
+        Ok(doc.into())
+    }
+
+    pub async fn read_scoped(
+        &self,
+        access: &WikiAccess,
+        input: WikiReadInput,
+        now_ms: u64,
+    ) -> Result<WikiReadOutput, WikiError> {
+        let doc = self.doc_record(input.doc_id).await?;
+        self.guard_doc(&doc, access)?;
+        let output = self.read(input).await?;
+        if self.audit_reads() {
+            let _ = self
+                .write_event(
+                    EVENT_WIKI_READ,
+                    Some(output.doc_id),
+                    Some(output.version_id),
+                    access.actor.clone(),
+                    BTreeMap::from([(
+                        "restricted".to_string(),
+                        Json::from(access.labels.is_some()),
+                    )]),
+                    now_ms,
+                )
+                .await;
+        }
+        Ok(output)
+    }
+
+    pub async fn list_docs_scoped(
+        &self,
+        access: &WikiAccess,
+        input: WikiListDocsInput,
+    ) -> Result<WikiDocListOutput, WikiError> {
+        self.list_docs_inner(input, access.labels.as_deref()).await
+    }
+
+    pub async fn list_versions_scoped(
+        &self,
+        access: &WikiAccess,
+        doc_id: u64,
+        cursor: Option<String>,
+        limit: Option<usize>,
+    ) -> Result<WikiVersionListOutput, WikiError> {
+        let doc = self.doc_record(doc_id).await?;
+        self.guard_doc(&doc, access)?;
+        self.list_versions(doc_id, cursor, limit).await
+    }
+
+    pub async fn verify_scoped(
+        &self,
+        access: &WikiAccess,
+        input: WikiVerifyInput,
+        now_ms: u64,
+    ) -> Result<WikiVerifyOutput, WikiError> {
+        // Resolve the doc first so labeled content cannot be probed through
+        // verification quotes.
+        if let Some(uri) = &input.uri
+            && let Some((_, doc_id, _, _, _)) = parse_citation_uri(uri)
+            && let Ok(doc) = self.doc_record(doc_id).await
+        {
+            self.guard_doc(&doc, access)?;
+        }
+        if let Some(doc_id) = input.doc_id
+            && let Ok(doc) = self.doc_record(doc_id).await
+        {
+            self.guard_doc(&doc, access)?;
+        }
+        self.verify(access.actor.clone(), input, now_ms).await
+    }
+
+    // ─── ACL defaults, counters, housekeeping ───────────────────────────────
+
+    /// Namespace → default ACL label map, applied to newly created documents
+    /// that do not set a label explicitly.
+    pub async fn set_acl_defaults(
+        &self,
+        defaults: BTreeMap<String, String>,
+    ) -> Result<(), WikiError> {
+        let defaults: BTreeMap<String, String> = defaults
+            .into_iter()
+            .map(|(ns, label)| (ns.trim().to_string(), label.trim().to_string()))
+            .filter(|(ns, _)| !ns.is_empty())
+            .collect();
+        self.docs
+            .save_extension(
+                "wiki_acl_defaults".to_string(),
+                serde_json::to_value(&defaults)
+                    .map_err(|err| WikiError::Db(err.to_string()))?
+                    .into(),
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub fn acl_defaults(&self) -> BTreeMap<String, String> {
+        self.docs
+            .get_extension_as::<BTreeMap<String, String>>("wiki_acl_defaults")
+            .unwrap_or_default()
+    }
+
+    fn acl_default_for(&self, namespace: &str) -> String {
+        self.acl_defaults()
+            .get(namespace)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn versions_count(&self) -> usize {
+        self.versions.metadata().stats.num_documents as usize
+    }
+
+    pub fn queries_count(&self) -> u64 {
+        self.docs
+            .get_extension_as::<u64>("wiki_query_count")
+            .unwrap_or_default()
+    }
+
+    fn bump_query_count(&self) {
+        let _ = self
+            .docs
+            .set_extension_from_with::<_, u64>("wiki_query_count".to_string(), |v| {
+                Some(v.unwrap_or_default().saturating_add(1))
+            });
+    }
+
+    pub fn stale_report_cached(&self) -> WikiStaleReport {
+        self.docs
+            .get_extension_as::<WikiStaleReport>("wiki_stale_report")
+            .unwrap_or_default()
+    }
+
+    /// Trims the audit log to the retention cap, oldest first. The prune
+    /// itself is evented so the gap is explained in the remaining log.
+    pub async fn prune_events(&self, max_keep: usize, now_ms: u64) -> Result<usize, WikiError> {
+        let mut removed = 0usize;
+        loop {
+            let total = self.events.metadata().stats.num_documents as usize;
+            if total <= max_keep {
+                break;
+            }
+            let excess = (total - max_keep).min(Collection::MAX_SEARCH_LIMIT);
+            // Gt(0) + no Lt: ascending ids, i.e. the oldest entries first.
+            let ids = self
+                .events
+                .search_ids(Query {
+                    search: None,
+                    filter: Some(Filter::Field((
+                        "_id".to_string(),
+                        RangeQuery::Gt(Fv::U64(0)),
+                    ))),
+                    limit: Some(excess),
+                })
+                .await?;
+            if ids.is_empty() {
+                break;
+            }
+            for id in ids {
+                self.events.remove(id).await?;
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            self.write_event(
+                EVENT_EVENTS_PRUNED,
+                None,
+                None,
+                "system".to_string(),
+                BTreeMap::from([("removed".to_string(), Json::from(removed as u64))]),
+                now_ms,
+            )
+            .await?;
+        }
+        Ok(removed)
+    }
+
+    /// Counts active documents whose current version is older than the
+    /// threshold; persists the result for `SpaceInfo` and events it when
+    /// stale documents exist.
+    pub async fn stale_report(
+        &self,
+        now_ms: u64,
+        stale_after_ms: u64,
+    ) -> Result<WikiStaleReport, WikiError> {
+        let threshold = now_ms.saturating_sub(stale_after_ms);
+        let mut report = WikiStaleReport {
+            checked_at: now_ms,
+            ..Default::default()
+        };
+        let mut sample: Vec<Json> = Vec::new();
+
+        let mut cursor = self.docs.max_document_id() + 1;
+        loop {
+            let docs: Vec<WikiDocRecord> = self
+                .docs
+                .search_as(Query {
+                    search: None,
+                    filter: Some(Filter::And(vec![
+                        Box::new(Filter::Field((
+                            "_id".to_string(),
+                            RangeQuery::Lt(Fv::U64(cursor)),
+                        ))),
+                        Box::new(Filter::Field((
+                            "current_version".to_string(),
+                            RangeQuery::Gt(Fv::U64(0)),
+                        ))),
+                        Box::new(Filter::Field((
+                            "status".to_string(),
+                            RangeQuery::Eq(Fv::Text(DOC_STATUS_ACTIVE.to_string())),
+                        ))),
+                    ])),
+                    limit: Some(SCAN_PAGE),
+                })
+                .await?;
+            let Some(min_id) = docs.iter().map(|d| d._id).min() else {
+                break;
+            };
+            cursor = min_id;
+            let page_len = docs.len();
+            for doc in docs {
+                if doc.namespace == evalset::EVAL_NAMESPACE {
+                    continue;
+                }
+                report.checked_docs += 1;
+                if doc.updated_at < threshold {
+                    report.stale_docs += 1;
+                    if sample.len() < 20 {
+                        sample.push(serde_json::json!({
+                            "doc_id": doc._id,
+                            "slug": doc.slug,
+                            "updated_at": doc.updated_at,
+                        }));
+                    }
+                }
+            }
+            if page_len < SCAN_PAGE {
+                break;
+            }
+        }
+
+        self.docs
+            .save_extension(
+                "wiki_stale_report".to_string(),
+                serde_json::to_value(&report)
+                    .map_err(|err| WikiError::Db(err.to_string()))?
+                    .into(),
+            )
+            .await?;
+        if report.stale_docs > 0 {
+            self.write_event(
+                EVENT_STALE_REPORT,
+                None,
+                None,
+                "system".to_string(),
+                BTreeMap::from([
+                    ("stale_docs".to_string(), Json::from(report.stale_docs)),
+                    ("checked_docs".to_string(), Json::from(report.checked_docs)),
+                    ("sample".to_string(), Json::from(sample)),
+                ]),
+                now_ms,
+            )
+            .await?;
+        }
+        Ok(report)
     }
 
     // ─── Maintenance ────────────────────────────────────────────────────────
@@ -1462,6 +1846,21 @@ fn version_info(version: &WikiVersionRecord, id: u64) -> WikiVersionInfo {
     }
 }
 
+/// ACL prefilter clause: unlabeled content plus the granted labels. Runs
+/// inside the same AndaDB query as retrieval/listing.
+fn acl_filter(labels: &[String]) -> Filter {
+    let mut allowed: Vec<Fv> = Vec::with_capacity(labels.len() + 1);
+    allowed.push(Fv::Text(String::new()));
+    allowed.extend(
+        labels
+            .iter()
+            .take(MAX_INCLUDE_KEYS - 1)
+            .cloned()
+            .map(Fv::Text),
+    );
+    Filter::Field(("acl_label".to_string(), RangeQuery::Include(allowed)))
+}
+
 /// Pages are ascending "newest N below cursor"; the next cursor is the
 /// smallest id in a full page (same convention as conversation listing).
 fn page_cursor<T>(rows: &[T], limit: usize, id_of: impl Fn(&T) -> u64) -> Option<String> {
@@ -1485,6 +1884,7 @@ async fn init_wiki_docs(collection: &mut Collection) -> Result<(), DBError> {
     collection
         .create_btree_index_nx(&["current_version"])
         .await?;
+    collection.create_btree_index_nx(&["acl_label"]).await?;
     collection.create_bm25_index_nx(&["title", "tags"]).await?;
     Ok(())
 }
@@ -1501,6 +1901,7 @@ async fn init_wiki_chunks(collection: &mut Collection) -> Result<(), DBError> {
     collection.create_btree_index_nx(&["version_id"]).await?;
     collection.create_btree_index_nx(&["namespace"]).await?;
     collection.create_btree_index_nx(&["current"]).await?;
+    collection.create_btree_index_nx(&["acl_label"]).await?;
     collection
         .create_bm25_index_nx(&["title", "heading_path", "text"])
         .await?;
@@ -1966,7 +2367,7 @@ mod tests {
                 byte_end: 6,
                 checksum: "sha3-256:dead".to_string(),
                 chunker_version: CHUNKER_VERSION as u64,
-                acl_label: None,
+                acl_label: String::new(),
             })
             .await
             .unwrap();
@@ -1982,6 +2383,7 @@ mod tests {
                 current_version: 0,
                 current_checksum: String::new(),
                 tags: vec![],
+                acl_label: String::new(),
                 source_uri: None,
                 metadata: BTreeMap::new(),
                 created_by: "a".to_string(),
@@ -2352,5 +2754,270 @@ mod m2_tests {
         let merged = wiki.search(q).await.unwrap();
         assert_eq!(merged.hits.len(), 1);
         assert!(merged.hits[0].text.contains("量子轨道谐振"));
+    }
+}
+
+#[cfg(test)]
+mod m4_tests {
+    use super::tests::{commit_input, test_wiki};
+    use super::*;
+
+    fn restricted(actor: &str, labels: &[&str]) -> WikiAccess {
+        WikiAccess {
+            actor: actor.to_string(),
+            labels: Some(labels.iter().map(|s| s.to_string()).collect()),
+        }
+    }
+
+    /// M4 acceptance: a probe document behind a label never reaches a
+    /// restricted caller — the ACL clause runs inside the same AndaDB query
+    /// as retrieval.
+    #[tokio::test]
+    async fn acl_probe_is_filtered_at_the_database_level() {
+        let wiki = test_wiki("wiki_acl_probe").await;
+        wiki.commit(
+            "admin".to_string(),
+            commit_input("公开手册", "# 公开手册\n\n公开的探针词：晨雾灯塔。\n"),
+            1000,
+        )
+        .await
+        .unwrap();
+        let mut secret = commit_input("机密预案", "# 机密预案\n\n机密的探针词：夜航坐标。\n");
+        secret.acl_label = Some("secret".to_string());
+        let secret = wiki
+            .commit("admin".to_string(), secret, 1100)
+            .await
+            .unwrap();
+        assert_eq!(secret.doc.acl_label, "secret");
+
+        // Unrestricted: both probes hit.
+        let all = wiki
+            .search(WikiSearchInput::from_query("夜航坐标".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(all.hits.len(), 1);
+
+        // Restricted to a different label: the secret probe is invisible,
+        // unlabeled content still hits.
+        let outsider = restricted("outsider", &["public-team"]);
+        let miss = wiki
+            .search_scoped(
+                &outsider,
+                WikiSearchInput::from_query("夜航坐标".to_string()),
+                2000,
+            )
+            .await
+            .unwrap();
+        assert!(miss.hits.is_empty());
+        assert_eq!(miss.total_docs_matched, 0);
+        let open_hit = wiki
+            .search_scoped(
+                &outsider,
+                WikiSearchInput::from_query("晨雾灯塔".to_string()),
+                2001,
+            )
+            .await
+            .unwrap();
+        assert_eq!(open_hit.hits.len(), 1);
+
+        // Granted label: visible again.
+        let insider = restricted("insider", &["secret"]);
+        let hit = wiki
+            .search_scoped(
+                &insider,
+                WikiSearchInput::from_query("夜航坐标".to_string()),
+                2002,
+            )
+            .await
+            .unwrap();
+        assert_eq!(hit.hits.len(), 1);
+
+        // Read/list/get/versions honor the same boundary; denial reads as
+        // NotFound so existence does not leak.
+        assert!(matches!(
+            wiki.read_scoped(
+                &outsider,
+                WikiReadInput {
+                    doc_id: secret.doc.id,
+                    version: None,
+                    selector: WikiSelector::Full,
+                },
+                2003,
+            )
+            .await,
+            Err(WikiError::NotFound(_))
+        ));
+        assert!(matches!(
+            wiki.get_doc_scoped(&outsider, secret.doc.id).await,
+            Err(WikiError::NotFound(_))
+        ));
+        assert!(matches!(
+            wiki.list_versions_scoped(&outsider, secret.doc.id, None, None)
+                .await,
+            Err(WikiError::NotFound(_))
+        ));
+        let listed = wiki
+            .list_docs_scoped(&outsider, WikiListDocsInput::default())
+            .await
+            .unwrap();
+        assert!(listed.docs.iter().all(|d| d.acl_label.is_empty()));
+        assert!(matches!(
+            wiki.verify_scoped(
+                &outsider,
+                WikiVerifyInput {
+                    uri: Some(citation_uri(
+                        "test_space",
+                        secret.doc.id,
+                        secret.version.id,
+                        0,
+                        4
+                    )),
+                    ..Default::default()
+                },
+                2004,
+            )
+            .await,
+            Err(WikiError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn acl_label_inherits_namespace_default_and_stays_idempotent() {
+        let wiki = test_wiki("wiki_acl_defaults").await;
+        wiki.set_acl_defaults(BTreeMap::from([(
+            "hr".to_string(),
+            "hr-internal".to_string(),
+        )]))
+        .await
+        .unwrap();
+
+        let mut input = commit_input("薪酬制度", "# 薪酬制度\n\n薪酬保密条款内容。\n");
+        input.namespace = Some("hr".to_string());
+        let out = wiki.commit("admin".to_string(), input, 1000).await.unwrap();
+        assert_eq!(out.doc.acl_label, "hr-internal");
+
+        // Same commit again (no acl_label supplied): idempotent, label kept.
+        let mut again = commit_input("薪酬制度", "# 薪酬制度\n\n薪酬保密条款内容。\n");
+        again.namespace = Some("hr".to_string());
+        again.doc_id = Some(out.doc.id);
+        again.parent_version = Some(out.version.id);
+        let repeat = wiki.commit("admin".to_string(), again, 1100).await.unwrap();
+        assert!(repeat.idempotent);
+
+        // Explicit clear.
+        let mut clear = commit_input("薪酬制度", "# 薪酬制度\n\n对外公开版本。\n");
+        clear.doc_id = Some(out.doc.id);
+        clear.parent_version = Some(out.version.id);
+        clear.acl_label = Some(String::new());
+        let cleared = wiki.commit("admin".to_string(), clear, 1200).await.unwrap();
+        assert!(cleared.doc.acl_label.is_empty());
+    }
+
+    #[tokio::test]
+    async fn audit_reads_events_only_when_enabled() {
+        let wiki = test_wiki("wiki_audit_reads").await;
+        let out = wiki
+            .commit(
+                "admin".to_string(),
+                commit_input("审计文档", "# 审计文档\n\n审计探针内容。\n"),
+                1000,
+            )
+            .await
+            .unwrap();
+        let access = WikiAccess::unrestricted("auditor");
+
+        // Disabled (default): scoped reads leave no events.
+        wiki.search_scoped(
+            &access,
+            WikiSearchInput::from_query("审计探针".to_string()),
+            2000,
+        )
+        .await
+        .unwrap();
+        let events = wiki
+            .list_events(Some(EVENT_WIKI_QUERIED.to_string()), None, None, Some(10))
+            .await
+            .unwrap();
+        assert!(events.events.is_empty());
+        assert_eq!(wiki.queries_count(), 1);
+
+        // Enabled: search and read are evented with the real actor.
+        wiki.set_audit_reads(true);
+        wiki.search_scoped(
+            &access,
+            WikiSearchInput::from_query("审计探针".to_string()),
+            2100,
+        )
+        .await
+        .unwrap();
+        wiki.read_scoped(
+            &access,
+            WikiReadInput {
+                doc_id: out.doc.id,
+                version: None,
+                selector: WikiSelector::Toc,
+            },
+            2200,
+        )
+        .await
+        .unwrap();
+        let queried = wiki
+            .list_events(Some(EVENT_WIKI_QUERIED.to_string()), None, None, Some(10))
+            .await
+            .unwrap();
+        assert_eq!(queried.events.len(), 1);
+        assert_eq!(queried.events[0].actor, "auditor");
+        let read = wiki
+            .list_events(Some(EVENT_WIKI_READ.to_string()), None, None, Some(10))
+            .await
+            .unwrap();
+        assert_eq!(read.events.len(), 1);
+        assert_eq!(wiki.queries_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn event_prune_keeps_cap_and_stale_report_counts() {
+        let wiki = test_wiki("wiki_housekeeping").await;
+        for i in 0..6u64 {
+            wiki.commit(
+                "admin".to_string(),
+                commit_input(
+                    &format!("文档{i}"),
+                    &format!("# 文档{i}\n\n内容编号 {i}。\n"),
+                ),
+                1000 + i,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(wiki.events.metadata().stats.num_documents, 6);
+
+        // Prune to 3: the three oldest go, the prune itself is evented.
+        let removed = wiki.prune_events(3, 5000).await.unwrap();
+        assert_eq!(removed, 3);
+        let remaining = wiki.list_events(None, None, None, Some(50)).await.unwrap();
+        assert_eq!(remaining.events.len(), 4); // 3 kept + EventsPruned
+        assert!(
+            remaining
+                .events
+                .iter()
+                .any(|e| e.kind == EVENT_EVENTS_PRUNED)
+        );
+
+        // Stale report: everything is ancient relative to `now`.
+        let report = wiki
+            .stale_report(1000 + 365 * 24 * 3600 * 1000, DEFAULT_STALE_AFTER_MS)
+            .await
+            .unwrap();
+        assert_eq!(report.stale_docs, 6);
+        assert_eq!(report.checked_docs, 6);
+        assert_eq!(wiki.stale_report_cached().stale_docs, 6);
+        // Fresh threshold: nothing stale, cached report replaced.
+        let report = wiki
+            .stale_report(2000, DEFAULT_STALE_AFTER_MS)
+            .await
+            .unwrap();
+        assert_eq!(report.stale_docs, 0);
+        assert_eq!(wiki.stale_report_cached().stale_docs, 0);
     }
 }
