@@ -29,7 +29,10 @@ use super::{
     BrainHook, SELF_USER_ID, append_runner_history, compact_runner_if_needed,
     push_completed_history,
 };
-use crate::types::RecallInput;
+use crate::{
+    types::RecallInput,
+    wiki::{WikiReadTool, WikiSearchTool},
+};
 
 // Kept for reference; the runtime prompt comes from `prompts::active_prompt`
 // so the eval optimizer can install candidate prompts.
@@ -359,7 +362,11 @@ impl Agent<AgentCtx> for RecallAgent {
 
     /// Returns a list of tool names that this agent depends on
     fn tool_dependencies(&self) -> Vec<String> {
-        vec![MemoryReadonly::NAME.to_string()]
+        vec![
+            MemoryReadonly::NAME.to_string(),
+            WikiSearchTool::NAME.to_string(),
+            WikiReadTool::NAME.to_string(),
+        ]
     }
 
     async fn run(
@@ -850,7 +857,14 @@ mod tests {
             RecallAgent::NAME
         );
         let tools = Agent::<AgentCtx>::tool_dependencies(space.recall.as_ref());
-        assert_eq!(tools, vec!["execute_kip_readonly".to_string()]);
+        assert_eq!(
+            tools,
+            vec![
+                "execute_kip_readonly".to_string(),
+                "wiki_search".to_string(),
+                "wiki_read".to_string(),
+            ]
+        );
     }
 
     #[tokio::test]

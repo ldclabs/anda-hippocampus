@@ -733,6 +733,37 @@ pub async fn get_wiki_export(
     Ok(ct.response(RpcResponse::success(rt)))
 }
 
+/// POST /v1/{space_id}/wiki/digest — distill pending wiki versions into the
+/// Cognitive Nexus (requires the space to have wiki_digest enabled)
+pub async fn post_wiki_digest(
+    State(app): State<AppState>,
+    Path(space_id): Path<String>,
+    Accept(ct, _): Accept,
+    HeaderVals(token, sharding): HeaderVals,
+) -> Result<impl IntoResponse, AppError> {
+    ensure_sharding(&app, sharding)?;
+
+    let now_ms = unix_ms();
+    let t = app
+        .check_auth_if(&token, &space_id, TokenScope::Write, now_ms)
+        .map_err(|_| AppError::unauthorized())?;
+    let space = app
+        .load_space(&space_id, false)
+        .await
+        .map_err(AppError::bad_request)?;
+    if t.is_none() {
+        space
+            .verify_space_token(token, TokenScope::Write, now_ms)
+            .map_err(|_| AppError::unauthorized())?;
+    }
+
+    let rt = space
+        .run_wiki_digest(SELF_USER_ID)
+        .await
+        .map_err(AppError::bad_request)?;
+    Ok(ct.response(RpcResponse::success(rt)))
+}
+
 /// POST /v1/{space_id}/maintenance
 pub async fn post_maintenance(
     State(app): State<AppState>,
@@ -1567,6 +1598,7 @@ mod tests {
             name: Some("Handler Brain".to_string()),
             description: Some("handler coverage".to_string()),
             public: Some(true),
+            ..Default::default()
         };
         let updated = ok_json(
             update_space(
@@ -1850,8 +1882,7 @@ mod tests {
         };
         let update_input = UpdateSpaceInput {
             name: Some("ignored".to_string()),
-            description: None,
-            public: None,
+            ..Default::default()
         };
 
         let info = err_json(
@@ -2236,9 +2267,8 @@ mod tests {
         space
             .update(
                 UpdateSpaceInput {
-                    name: None,
-                    description: None,
                     public: Some(true),
+                    ..Default::default()
                 },
                 unix_ms(),
             )

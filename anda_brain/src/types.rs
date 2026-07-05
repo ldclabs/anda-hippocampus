@@ -321,11 +321,18 @@ pub struct RevokeSpaceTokenInput {
     pub token: String,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct UpdateSpaceInput {
+    #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
     pub public: Option<bool>,
+    /// Enables/disables the WikiDigest background extraction for this space
+    /// (PRD §7.3; disabled by default).
+    #[serde(default)]
+    pub wiki_digest: Option<bool>,
 }
 
 #[derive(Debug, Default, Serialize, Clone, PartialEq, Eq)]

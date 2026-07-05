@@ -465,6 +465,10 @@ fn build_router(
         )
         .route("/v1/{space_id}/wiki/export", routing::get(get_wiki_export))
         .route(
+            "/v1/{space_id}/wiki/digest",
+            routing::post(post_wiki_digest),
+        )
+        .route(
             "/v1/{space_id}/execute_kip_readonly",
             routing::post(execute_kip_readonly),
         )

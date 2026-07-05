@@ -441,6 +441,15 @@ GET  /v1/{space_id}/wiki/events?kind=&doc_id=
 
 `verify` answers `valid`, `superseded` (a newer version exists — it names it), or `invalid`. Versions are immutable, so citations never rot.
 
+**Graph bridge (WikiDigest, opt-in):**
+
+```
+PATCH /v1/{space_id}/management/update_space   {"wiki_digest": true}
+POST  /v1/{space_id}/wiki/digest
+```
+
+When enabled, committed wiki versions are distilled into the Cognitive Nexus: an LLM proposes subject–predicate–object facts per section, and the runtime writes them as KIP propositions whose metadata always carries `source: "wiki"`, a `wiki://` citation with checksum, and the extractor fingerprint — provenance is attached by construction, not by prompt discipline. Re-committing a document supersedes facts the new version no longer asserts (`metadata.status: "superseded"`, `metadata.superseded_by` → the new version). Recall answers can therefore explain *why* a graph fact is believed and quote the exact source passage. The digest also runs automatically after maintenance cycles and on space startup, and each run re-verifies a sample of recorded citations. Disabled by default because it writes to the graph.
+
 **OKF interchange (requires full-scope token):**
 
 ```

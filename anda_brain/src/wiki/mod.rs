@@ -7,6 +7,7 @@
 //! composition belongs to the calling agent.
 
 mod chunk;
+mod digest;
 pub mod evalset;
 mod model;
 mod okf;
@@ -14,6 +15,7 @@ mod tool;
 mod types;
 
 pub use chunk::{CHUNKER_VERSION, chunk_markdown, normalize_content, slugify, slugify_path};
+pub use digest::{DigestedFact, WIKI_DIGEST_EXTRACTOR, WikiDigest, WikiDigestReport};
 pub use model::*;
 pub use okf::OKF_VERSION;
 pub use tool::{WikiCommitTool, WikiReadTool, WikiSearchTool};
