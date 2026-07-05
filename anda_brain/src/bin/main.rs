@@ -427,6 +427,39 @@ fn build_router(
             routing::post(post_maintenance),
         )
         .route(
+            "/v1/{space_id}/wiki/docs",
+            routing::post(post_wiki_commit).get(list_wiki_docs),
+        )
+        .route(
+            "/v1/{space_id}/wiki/docs/{doc_id}",
+            routing::get(get_wiki_doc),
+        )
+        .route(
+            "/v1/{space_id}/wiki/docs/{doc_id}/content",
+            routing::get(get_wiki_content),
+        )
+        .route(
+            "/v1/{space_id}/wiki/docs/{doc_id}/versions",
+            routing::get(list_wiki_versions),
+        )
+        .route(
+            "/v1/{space_id}/wiki/docs/{doc_id}/archive",
+            routing::post(post_wiki_archive),
+        )
+        .route(
+            "/v1/{space_id}/wiki/docs/{doc_id}/restore",
+            routing::post(post_wiki_restore),
+        )
+        .route(
+            "/v1/{space_id}/wiki/search",
+            routing::post(post_wiki_search),
+        )
+        .route(
+            "/v1/{space_id}/wiki/verify",
+            routing::post(post_wiki_verify),
+        )
+        .route("/v1/{space_id}/wiki/events", routing::get(list_wiki_events))
+        .route(
             "/v1/{space_id}/execute_kip_readonly",
             routing::post(execute_kip_readonly),
         )

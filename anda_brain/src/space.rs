@@ -55,6 +55,7 @@ use crate::{
         MaintenanceScope, ModelConfig, RecallInput, SpaceInfo, SpaceTier, SpaceToken, TokenScope,
         UpdateSpaceInput,
     },
+    wiki::{WikiCommitTool, WikiReadTool, WikiSearchTool, WikiService},
 };
 
 pub static FUNCTION_DEFINITION: LazyLock<FunctionDefinition> = LazyLock::new(|| {
@@ -454,6 +455,7 @@ pub struct Space {
     pub recall: Arc<RecallAgent>,
     pub db: Arc<AndaDB>,
     pub memory: Arc<MemoryManagement>,
+    pub wiki: Arc<WikiService>,
 }
 
 impl Space {
@@ -508,7 +510,7 @@ impl Space {
         token: String,
         scope: TokenScope,
         now_ms: u64,
-    ) -> Result<(), BoxError> {
+    ) -> Result<SpaceToken, BoxError> {
         // Space tokens always carry the "ST" prefix. Rejecting other keys here
         // keeps non-token extensions (e.g. "byok", "tier") out of the
         // credential lookup below.
@@ -529,10 +531,7 @@ impl Space {
                 None
             });
 
-        if token.is_none() {
-            return Err("invalid space token".into());
-        }
-        Ok(())
+        token.ok_or_else(|| "invalid space token".into())
     }
 
     pub async fn revoke_space_token(&self, token: &str) -> Result<bool, BoxError> {
@@ -614,6 +613,8 @@ impl Space {
             formation_processed_id: self.formation.get_processed().unwrap_or_default(),
             maintenance_processed_id: self.maintenance.get_processed().unwrap_or_default(),
             maintenance_at: self.maintenance.get_processed_at(),
+            wiki_docs: self.wiki.docs_count(),
+            wiki_chunks: self.wiki.chunks_count(),
             ..Default::default()
         };
 
@@ -953,6 +954,7 @@ impl Space {
             resources,
             kip_function_definitions: FUNCTION_DEFINITION.clone(),
         };
+        let wiki = Arc::new(WikiService::connect(id.clone(), db.clone()).await?);
 
         // create a new models instance for each space to allow per-space customization in the future (e.g., different model providers or credentials)
         let models = Arc::new(Models::from_clone(models.as_ref()));
@@ -986,10 +988,18 @@ impl Space {
             .register_tool(Arc::new(memory_r))?
             .register_tool(Arc::new(memory_tool))?
             .register_tool(Arc::new(note_tool))?
+            .register_tool(Arc::new(WikiSearchTool::new(wiki.clone())))?
+            .register_tool(Arc::new(WikiReadTool::new(wiki.clone())))?
+            .register_tool(Arc::new(WikiCommitTool::new(wiki.clone())))?
             .register_agent(formation.clone(), None)?
             .register_agent(recall.clone(), None)?
             .register_agent(maintenance.clone(), None)?
-            .export_tools(vec![MemoryTool::NAME.to_string()])
+            .export_tools(vec![
+                MemoryTool::NAME.to_string(),
+                WikiSearchTool::NAME.to_string(),
+                WikiReadTool::NAME.to_string(),
+                WikiCommitTool::NAME.to_string(),
+            ])
             .export_agents(vec![
                 RecallAgent::NAME.to_string(),
                 FormationAgent::NAME.to_string(),
@@ -1007,6 +1017,7 @@ impl Space {
             recall,
             maintenance,
             memory,
+            wiki,
             engine,
             pinned,
         });
@@ -1028,6 +1039,17 @@ impl Space {
             }
             if let Err(err) = this_clone.recall.init().await {
                 log::warn!(target: "brain", space_id = this_clone.id; "recall history init failed: {err:?}");
+            }
+            // Startup repair: reclaim wiki commit-crash leftovers before the
+            // space serves queries built on them.
+            match this_clone.wiki.orphan_sweep(unix_ms()).await {
+                Ok(report) if !report.is_empty() => {
+                    log::warn!(target: "brain", space_id = this_clone.id, report:serde = report; "wiki orphan sweep repaired state");
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    log::warn!(target: "brain", space_id = this_clone.id; "wiki orphan sweep failed: {err:?}");
+                }
             }
             // Resume formation if it was interrupted before. A missing marker
             // means nothing was processed yet, so resume from the beginning.

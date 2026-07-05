@@ -39,6 +39,10 @@ pub struct SpaceInfo {
     pub formation_processed_id: u64,
     pub maintenance_processed_id: u64,
     pub maintenance_at: MaintenanceAt,
+    #[serde(default)]
+    pub wiki_docs: usize,
+    #[serde(default)]
+    pub wiki_chunks: usize,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]

@@ -47,6 +47,8 @@ mimalloc = { workspace = true }
 rand = { workspace = true }
 rmcp = { workspace = true }
 schemars = { workspace = true }
+sha3 = { workspace = true }
+unicode-normalization = { workspace = true }
 
 [dev-dependencies]
 cose2 = { workspace = true }

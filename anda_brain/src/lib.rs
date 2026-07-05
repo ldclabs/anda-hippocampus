@@ -10,6 +10,7 @@ pub mod mcp;
 pub mod payload;
 pub mod space;
 pub mod types;
+pub mod wiki;
 
 pub fn parse_ed25519_pubkeys(input: &str) -> Result<Vec<VerifyingKey>, BoxError> {
     if input.is_empty() {
