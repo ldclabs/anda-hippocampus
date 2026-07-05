@@ -1,0 +1,9 @@
+{
+  "id": "quick_every_2",
+  "wait_timeout_ms": 180000,
+  "poll_interval_ms": 250,
+  "maintenance_every_n_turns": 2,
+  "maintenance_scope": "quick",
+  "max_checkpoint_latency_ms": 30000,
+  "max_checkpoint_total_tokens": 25000
+}

@@ -1,0 +1,7 @@
+{
+  "id": "llm_judge",
+  "maintenance_every_n_turns": 2,
+  "maintenance_scope": "daydream",
+  "checkpoint_samples": 3,
+  "judge": "llm"
+}

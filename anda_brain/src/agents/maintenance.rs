@@ -26,6 +26,9 @@ use super::{
 };
 use crate::types::{MaintenanceAt, MaintenanceInput, MaintenanceScope};
 
+// Kept for reference; the runtime prompt comes from `prompts::active_prompt`
+// so the eval optimizer can install candidate prompts.
+#[allow(dead_code)]
 const SELF_INSTRUCTIONS: &str = include_str!("../../assets/BrainMaintenance.md");
 
 /// Resets the AtomicBool to false on drop (panic guard for processing flag).
@@ -306,7 +309,7 @@ impl MaintenanceAgent {
             CompletionRequest {
                 instructions: format!(
                     "{}\n\n---\n\n# `DESCRIBE PRIMER` Result:\n{}\n\n---\n\n# Your Notes:\n{}\n\n# Current Datetime: {}",
-                    SELF_INSTRUCTIONS,
+                    super::prompts::active_prompt(super::prompts::PromptTarget::Maintenance),
                     primer,
                     serde_json::to_string(&notes.items).unwrap_or_default(),
                     local_date_hour(now_ms).unwrap_or_default()

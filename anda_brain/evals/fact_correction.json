@@ -1,0 +1,63 @@
+{
+  "id": "fact_correction",
+  "description": "Checks whether a corrected user fact supersedes an older stored fact.",
+  "hidden_profile": {
+    "shipping": {
+      "old_city": "Tokyo",
+      "current_city": "Berlin"
+    }
+  },
+  "default_context": {
+    "counterparty": "user_042",
+    "agent": "eval_agent",
+    "source": "longitudinal_eval",
+    "topic": "shipping_address"
+  },
+  "timeline": [
+    {
+      "turn": 1,
+      "type": "normal",
+      "timestamp": "2026-05-01T09:00:00Z",
+      "user": "For shipping swag, use Tokyo as my city."
+    },
+    {
+      "turn": 2,
+      "type": "normal",
+      "timestamp": "2026-05-15T09:00:00Z",
+      "user": "Correction: my shipping city is Berlin now, not Tokyo."
+    },
+    {
+      "turn": 3,
+      "type": "checkpoint_synthetic",
+      "timestamp": "2026-05-20T09:00:00Z",
+      "query": "What city should I use for shipping the conference badge?",
+      "evaluation": {
+        "scoring_rubric": "The answer should use the corrected shipping city and avoid the stale city.",
+        "required_answer_terms": ["Berlin"],
+        "forbidden_answer_terms": ["Tokyo"],
+        "expected_memories": [
+          {
+            "id": "current_shipping_city",
+            "description": "User's current shipping city is Berlin.",
+            "mode": "should_exist",
+            "probe": {
+              "command": "SEARCH CONCEPT \"current shipping city Berlin not Tokyo\" MODE \"semantic\" THRESHOLD 0.6 LIMIT 10",
+              "readonly": true
+            },
+            "answer_terms": ["Berlin"],
+            "trace_terms": ["Berlin", "shipping"]
+          },
+          {
+            "id": "stale_shipping_city",
+            "description": "Tokyo should not remain the active shipping city after correction.",
+            "mode": "should_not_exist",
+            "probe": {
+              "command": "FIND(?city) WHERE { ?person {type: \"Person\", name: \"user_042\"} ?link (?person, \"ships_to\", ?city) FILTER(CONTAINS(?city.name, \"Tokyo\") || CONTAINS(?city.attributes.description, \"Tokyo\")) FILTER(IS_NULL(?link.metadata.superseded) || ?link.metadata.superseded != true) } LIMIT 10",
+              "readonly": true
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

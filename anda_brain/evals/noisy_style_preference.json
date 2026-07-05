@@ -1,0 +1,105 @@
+{
+  "id": "noisy_style_preference",
+  "description": "Longitudinal pressure scenario: style preferences stated early must survive injected chit-chat noise and a simulated follow-up, measured at two checkpoints for trajectory.",
+  "hidden_profile": {
+    "style": {
+      "prefers_concise": true,
+      "prefers_direct": true,
+      "dislikes_hype": true
+    },
+    "projects": {
+      "blog": "technical blog about distributed systems"
+    }
+  },
+  "default_context": {
+    "counterparty": "user_042",
+    "agent": "eval_agent",
+    "source": "longitudinal_eval",
+    "topic": "writing_style"
+  },
+  "noise": {
+    "between_turns": 4,
+    "seed": 42
+  },
+  "timeline": [
+    {
+      "turn": 1,
+      "type": "normal",
+      "timestamp": "2026-01-01T10:00:00Z",
+      "user": "Can you help me polish this technical blog post about distributed systems?"
+    },
+    {
+      "turn": 2,
+      "type": "normal",
+      "timestamp": "2026-01-02T10:00:00Z",
+      "user": "Please make it more concise and direct. Less hype, less academic setup."
+    },
+    {
+      "turn": 3,
+      "type": "simulated",
+      "timestamp": "2026-01-05T10:00:00Z",
+      "intent": "Casually mention that you're drafting another blog post and remind the assistant of your writing taste without stating it verbatim."
+    },
+    {
+      "turn": 4,
+      "type": "checkpoint_organic",
+      "timestamp": "2026-01-10T10:00:00Z",
+      "query": "Can you rewrite this intro to sound more like me?",
+      "evaluation": {
+        "scoring_rubric": "The answer should apply the user's learned writing-style preference: concise, direct, no hype. Paraphrases of the style count fully.",
+        "required_answer_terms": ["concise", "direct"],
+        "forbidden_answer_terms": ["salesy"],
+        "expected_memories": [
+          {
+            "id": "style_preference",
+            "description": "User prefers concise, direct writing and dislikes hype.",
+            "mode": "should_exist",
+            "assertion": "a writing-style preference for user_042 stating they want concise, direct prose without hype",
+            "search": "concise direct writing style no hype preference",
+            "probe": {
+              "command": "SEARCH CONCEPT \"concise direct writing style\" MODE \"semantic\" THRESHOLD 0.6 LIMIT 10",
+              "readonly": true
+            },
+            "answer_terms": ["concise", "direct"],
+            "trace_terms": ["concise", "direct", "writing"]
+          }
+        ]
+      }
+    },
+    {
+      "turn": 5,
+      "type": "maintenance",
+      "timestamp": "2026-01-15T03:00:00Z",
+      "maintenance": {
+        "trigger": "on_demand",
+        "scope": "quick",
+        "timestamp": "2026-01-15T03:00:00Z"
+      }
+    },
+    {
+      "turn": 6,
+      "type": "checkpoint_synthetic",
+      "timestamp": "2026-01-20T10:00:00Z",
+      "query": "I'm writing the launch announcement for my blog. Any style guidance before I start?",
+      "evaluation": {
+        "scoring_rubric": "The answer should proactively surface the remembered style preference (concise, direct, avoid hype) and connect it to the user's blog project.",
+        "required_answer_terms": ["concise"],
+        "expected_memories": [
+          {
+            "id": "style_preference_after_maintenance",
+            "description": "Style preference remains recallable after noise and maintenance.",
+            "mode": "should_exist",
+            "assertion": "a writing-style preference for user_042 stating they want concise, direct prose without hype",
+            "search": "concise direct writing style no hype preference",
+            "probe": {
+              "command": "SEARCH CONCEPT \"concise direct writing style\" MODE \"semantic\" THRESHOLD 0.6 LIMIT 10",
+              "readonly": true
+            },
+            "answer_terms": ["concise"],
+            "trace_terms": ["concise", "writing"]
+          }
+        ]
+      }
+    }
+  ]
+}

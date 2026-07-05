@@ -1,0 +1,77 @@
+{
+  "id": "preference_reversal",
+  "description": "Checks whether newer preferences supersede stale preferences instead of both being treated equally.",
+  "hidden_profile": {
+    "food": {
+      "old_preference": "likes BBQ",
+      "current_preference": "vegetarian"
+    }
+  },
+  "default_context": {
+    "counterparty": "user_042",
+    "agent": "eval_agent",
+    "source": "longitudinal_eval",
+    "topic": "food_preferences"
+  },
+  "timeline": [
+    {
+      "turn": 1,
+      "type": "normal",
+      "timestamp": "2026-03-01T10:00:00Z",
+      "user": "I love BBQ restaurants."
+    },
+    {
+      "turn": 2,
+      "type": "normal",
+      "timestamp": "2026-04-01T10:00:00Z",
+      "user": "Update: I'm vegetarian now, so please avoid meat-heavy restaurant recommendations."
+    },
+    {
+      "turn": 3,
+      "type": "maintenance",
+      "timestamp": "2026-04-02T03:00:00Z",
+      "maintenance": {
+        "trigger": "on_demand",
+        "scope": "quick",
+        "timestamp": "2026-04-02T03:00:00Z"
+      }
+    },
+    {
+      "turn": 4,
+      "type": "checkpoint_synthetic",
+      "timestamp": "2026-04-10T10:00:00Z",
+      "query": "Can you recommend a place for dinner?",
+      "evaluation": {
+        "scoring_rubric": "The answer should honor the newer vegetarian preference and avoid stale BBQ guidance.",
+        "required_answer_terms": ["vegetarian"],
+        "forbidden_answer_terms": ["BBQ", "barbecue", "meat-heavy"],
+        "expected_memories": [
+          {
+            "id": "current_vegetarian_preference",
+            "description": "User is currently vegetarian.",
+            "mode": "should_exist",
+            "assertion": "an active dietary preference stating that user_042 is vegetarian and wants to avoid meat-heavy restaurants",
+            "search": "vegetarian avoid meat-heavy restaurants dietary preference",
+            "probe": {
+              "command": "SEARCH CONCEPT \"vegetarian avoid meat-heavy restaurants\" MODE \"semantic\" THRESHOLD 0.6 LIMIT 10",
+              "readonly": true
+            },
+            "answer_terms": ["vegetarian"],
+            "trace_terms": ["vegetarian", "meat-heavy"]
+          },
+          {
+            "id": "stale_bbq_preference",
+            "description": "Old BBQ preference should not remain active after the vegetarian update.",
+            "mode": "should_not_exist",
+            "assertion": "an active, non-superseded preference stating that user_042 currently likes BBQ or meat-heavy restaurants",
+            "search": "BBQ barbecue restaurant preference user_042",
+            "probe": {
+              "command": "FIND(?pref) WHERE { ?person {type: \"Person\", name: \"user_042\"} ?link (?person, \"prefers\", ?pref) FILTER(CONTAINS(?pref.name, \"BBQ\") || CONTAINS(?pref.attributes.description, \"BBQ\") || CONTAINS(?pref.name, \"barbecue\") || CONTAINS(?pref.attributes.description, \"barbecue\")) FILTER(IS_NULL(?link.metadata.superseded) || ?link.metadata.superseded != true) } LIMIT 10",
+              "readonly": true
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -31,6 +31,9 @@ use super::{
 };
 use crate::types::RecallInput;
 
+// Kept for reference; the runtime prompt comes from `prompts::active_prompt`
+// so the eval optimizer can install candidate prompts.
+#[allow(dead_code)]
 const SELF_INSTRUCTIONS: &str = include_str!("../../assets/BrainRecall.md");
 const RECALL_CONTEXT_TIMEOUT: Duration = Duration::from_secs(5);
 const RECALL_TOTAL_TIMEOUT: Duration = Duration::from_secs(180);
@@ -434,7 +437,7 @@ impl Agent<AgentCtx> for RecallAgent {
             CompletionRequest {
                 instructions: format!(
                     "{}\n\n---\n\n# `DESCRIBE PRIMER` Result:\n{}\n\n---\n\n# Your Notes:\n{}\n\n# Counterparty profile:\n{}\n\n# Current Datetime: {}",
-                    SELF_INSTRUCTIONS,
+                    super::prompts::active_prompt(super::prompts::PromptTarget::Recall),
                     primer,
                     serde_json::to_string(&notes).unwrap_or_default(),
                     serde_json::to_string(&counterparty_info).unwrap_or_default(),
