@@ -11,11 +11,12 @@
 use anda_core::{BoxError, CompletionRequest, ModelEffort};
 use serde::{Deserialize, Serialize};
 
-use super::{
-    AttributionSummary, EvalDriver, EvalSuiteReport,
-    judge::{parse_json_payload, truncate_chars},
-};
+use futures::future::BoxFuture;
+
+use super::{AttributionSummary, EvalSuiteReport};
 use crate::agents::prompts::{self, PromptTarget};
+use crate::assess::{AssessContext, parse_json_payload, truncate_chars};
+use crate::types::MemoryPolicy;
 
 const MAX_FAILURE_SUMMARY_CHARS: usize = 8_000;
 
@@ -157,14 +158,14 @@ struct ProposedEdits {
 }
 
 /// Asks the optimizer LLM for targeted edits to one prompt.
-pub async fn propose_edits<D>(
-    driver: &D,
+pub async fn propose_edits<C>(
+    driver: &C,
     target: PromptTarget,
     current_prompt: &str,
     failure_summary: &str,
 ) -> Result<Vec<PromptEdit>, BoxError>
 where
-    D: EvalDriver + ?Sized,
+    C: AssessContext + ?Sized,
 {
     let prompt = format!(
         "# Target agent\n{}\n\n# Attributed eval failures\n{}\n\n# Current prompt of the target agent\n{}",
@@ -189,12 +190,28 @@ where
         .collect())
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+/// Which genome the optimizer evolves (plan M10): agent prompt text, or the
+/// numeric `MemoryPolicy` knobs. Policy mutations are cheaper to evaluate
+/// and safer to apply than prompt edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenomeKind {
+    #[default]
+    Prompt,
+    Policy,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OptimizeConfig {
     /// Number of propose→evaluate→select generations.
     pub generations: usize,
 
-    /// Fixed target prompt; `None` picks per generation from attribution.
+    /// Which genome to evolve (default: prompt).
+    #[serde(default)]
+    pub genome: GenomeKind,
+
+    /// Fixed target prompt (prompt genome only); `None` picks per
+    /// generation from attribution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<PromptTarget>,
 
@@ -205,6 +222,28 @@ pub struct OptimizeConfig {
     /// Minimum absolute improvement even when no variance is measured.
     #[serde(default = "default_min_delta")]
     pub min_delta: f64,
+
+    /// Max allowed holdout regression when train accepts (plan M9): a
+    /// candidate that improves train but drops the holdout total more than
+    /// this below the holdout baseline is rejected as overfitting.
+    #[serde(default = "default_holdout_epsilon")]
+    pub holdout_epsilon: f64,
+}
+
+// `Default` must agree with the serde field defaults: a config built with
+// `..Default::default()` (the CLI path) gets the same noise-band floors as
+// one deserialized from JSON.
+impl Default for OptimizeConfig {
+    fn default() -> Self {
+        Self {
+            generations: 0,
+            genome: GenomeKind::default(),
+            target: None,
+            confidence_z: default_confidence_z(),
+            min_delta: default_min_delta(),
+            holdout_epsilon: default_holdout_epsilon(),
+        }
+    }
 }
 
 fn default_confidence_z() -> f64 {
@@ -215,13 +254,175 @@ fn default_min_delta() -> f64 {
     0.005
 }
 
+fn default_holdout_epsilon() -> f64 {
+    0.01
+}
+
+/// One bounded numeric mutation of the memory policy (plan M10).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PolicyPatch {
+    pub field: String,
+    pub value: f64,
+
+    #[serde(default)]
+    pub rationale: String,
+}
+
+/// Policy fields the optimizer may mutate: only knobs the runtime actually
+/// consumes. `version`, structural knobs, and the declared-but-unwired
+/// fields (`recall_reinforcement`, `correction_penalty`,
+/// `recall_search_threshold`, `recall_max_rounds`) stay out of the genome —
+/// mutating a knob nothing reads measures pure sampling noise, which the
+/// accept gate can mistake for an improvement. Wire a field into the
+/// runtime first, then add it here.
+pub const POLICY_PATCH_FIELDS: &[&str] = &[
+    "confidence_decay_factor",
+    "decay_floor",
+    "stale_event_threshold_days",
+    "unsorted_max_backlog",
+    "orphan_max_count",
+    "self_test_queries_per_cycle",
+];
+
+/// Mutation bound for fractional fields: at most ±50% of the current value
+/// (±0.05 absolute floor for values near zero), keeping evolution gradual
+/// and reviewable.
+fn bounded_f64(field: &str, old: f64, new: f64) -> Result<f64, BoxError> {
+    if !new.is_finite() {
+        return Err(format!("`{field}` mutation must be a finite number").into());
+    }
+    let delta = (new - old).abs();
+    if delta > (old.abs() * 0.5).max(0.05) {
+        return Err(
+            format!("`{field}` mutation from {old} to {new} exceeds the ±50% step bound").into(),
+        );
+    }
+    Ok(new)
+}
+
+/// Mutation bound for integer fields: at most ±50% (±1 absolute floor so
+/// zero-valued knobs can still move).
+fn bounded_u32(field: &str, old: u32, new: f64) -> Result<u32, BoxError> {
+    if !new.is_finite() || new < 0.0 {
+        return Err(format!("`{field}` mutation must be a non-negative number").into());
+    }
+    let rounded = new.round();
+    let delta = (rounded - f64::from(old)).abs();
+    if delta > (f64::from(old) * 0.5).max(1.0) {
+        return Err(format!(
+            "`{field}` mutation from {old} to {rounded} exceeds the ±50% step bound"
+        )
+        .into());
+    }
+    Ok(rounded as u32)
+}
+
+/// Applies one patch with the step bound and full policy validation; a bad
+/// patch can never install a bad policy.
+pub fn apply_policy_patch(
+    policy: &MemoryPolicy,
+    patch: &PolicyPatch,
+) -> Result<MemoryPolicy, BoxError> {
+    let mut next = policy.clone();
+    let field = patch.field.as_str();
+    match field {
+        "confidence_decay_factor" => {
+            next.confidence_decay_factor =
+                bounded_f64(field, policy.confidence_decay_factor, patch.value)?;
+        }
+        "decay_floor" => {
+            next.decay_floor = bounded_f64(field, policy.decay_floor, patch.value)?;
+        }
+        "stale_event_threshold_days" => {
+            next.stale_event_threshold_days =
+                bounded_u32(field, policy.stale_event_threshold_days, patch.value)?;
+        }
+        "unsorted_max_backlog" => {
+            next.unsorted_max_backlog =
+                bounded_u32(field, policy.unsorted_max_backlog, patch.value)?;
+        }
+        "orphan_max_count" => {
+            next.orphan_max_count = bounded_u32(field, policy.orphan_max_count, patch.value)?;
+        }
+        "self_test_queries_per_cycle" => {
+            next.self_test_queries_per_cycle =
+                bounded_u32(field, policy.self_test_queries_per_cycle, patch.value)?;
+        }
+        other => {
+            return Err(format!(
+                "`{other}` is not a tunable policy field; expected one of {POLICY_PATCH_FIELDS:?}"
+            )
+            .into());
+        }
+    }
+    next.validate()?;
+    Ok(next)
+}
+
+const POLICY_OPTIMIZER_INSTRUCTIONS: &str = r#"You tune the numeric memory-policy knobs of an AI memory system (decay, reinforcement, backlog targets, self-test and recall budgets). You will receive the current policy as JSON, the list of tunable fields, and a summary of attributed eval failures.
+
+Propose 1 to 3 minimal mutations that address the observed failure modes. Rules:
+- `field` must be one of the tunable fields.
+- `value` is the new numeric value; it must stay within ±50% of the current value and within each field's documented range.
+- Prefer one decisive knob over many timid ones; explain the causal link in `rationale`.
+
+Respond with ONLY a JSON object:
+{"patches": [{"field": "confidence_decay_factor", "value": 0.9, "rationale": "..."}]}
+If no mutation is likely to help, respond {"patches": []}."#;
+
+#[derive(Debug, Default, Deserialize)]
+struct ProposedPatches {
+    #[serde(default)]
+    patches: Vec<PolicyPatch>,
+}
+
+/// Asks the optimizer LLM for bounded policy mutations.
+pub async fn propose_policy_patches<C>(
+    proposer: &C,
+    current: &MemoryPolicy,
+    failure_summary: &str,
+) -> Result<Vec<PolicyPatch>, BoxError>
+where
+    C: AssessContext + ?Sized,
+{
+    let prompt = format!(
+        "# Current memory policy\n{}\n\n# Tunable fields\n{POLICY_PATCH_FIELDS:?}\n\n# Attributed eval failures\n{failure_summary}",
+        serde_json::to_string_pretty(current).unwrap_or_default(),
+    );
+    let output = proposer
+        .complete(CompletionRequest {
+            instructions: POLICY_OPTIMIZER_INSTRUCTIONS.to_string(),
+            prompt,
+            effort: Some(ModelEffort::High),
+            ..Default::default()
+        })
+        .await?;
+    let proposed: ProposedPatches = parse_json_payload(&output.content)?;
+    Ok(proposed.patches)
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct GenerationReport {
     pub generation: usize,
-    pub target: PromptTarget,
+
+    /// Prompt-genome generations only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<PromptTarget>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub edits: Vec<PromptEdit>,
+
+    /// Policy-genome generations only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub patches: Vec<PolicyPatch>,
+
     pub baseline_total: f64,
     pub candidate_total: Option<f64>,
+
+    /// Holdout suite total, when a holdout gate ran for this generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holdout_total: Option<f64>,
+
     pub decision: GenerationDecision,
 }
 
@@ -235,6 +436,10 @@ pub struct OptimizeReport {
     /// Final accepted prompt text per target, only for targets that changed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accepted_prompts: Vec<AcceptedPrompt>,
+
+    /// Final accepted memory policy (policy genome only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_policy: Option<MemoryPolicy>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -243,174 +448,243 @@ pub struct AcceptedPrompt {
     pub text: String,
 }
 
-/// The generation loop. `fitness(generation)` must run the eval suite against
-/// whatever prompt overrides are currently installed and return its report;
-/// generation 0 is the baseline. The loop installs candidate prompts through
-/// `agents::prompts::set_override` and restores them on rejection.
-pub async fn run_optimize<D, F, Fut>(
-    proposer: &D,
+/// A boxed fitness function for the optional holdout suite.
+pub type BoxedFitness =
+    Box<dyn FnMut(usize) -> BoxFuture<'static, Result<EvalSuiteReport, BoxError>> + Send>;
+
+/// The candidate genome one generation proposes.
+enum Candidate {
+    Prompt { target: PromptTarget, text: String },
+    Policy { policy: MemoryPolicy },
+}
+
+/// The generation loop. `fitness(generation)` must run the train eval suite
+/// against whatever genome overrides are currently installed and return its
+/// report; generation 0 is the baseline. Candidates install through
+/// `agents::prompts::set_override` (prompt genome) or
+/// `MemoryPolicy::set_eval_override` (policy genome) and are restored on
+/// rejection. When `holdout` is given, a train win must also keep the
+/// held-out suite within `holdout_epsilon` of its baseline — the
+/// anti-overfitting gate (plan M9).
+pub async fn run_optimize<C, F, Fut>(
+    proposer: &C,
     config: &OptimizeConfig,
     mut fitness: F,
+    mut holdout: Option<BoxedFitness>,
 ) -> Result<OptimizeReport, BoxError>
 where
-    D: EvalDriver + ?Sized,
+    C: AssessContext + ?Sized,
     F: FnMut(usize) -> Fut,
     Fut: Future<Output = Result<EvalSuiteReport, BoxError>>,
 {
     let mut baseline = fitness(0).await?;
     let baseline_total = baseline.score.total;
+    if baseline.total_stddev.is_none() {
+        // Without variance data the noise band collapses to `min_delta`
+        // alone, and ordinary LLM run-to-run variance can be "accepted" as
+        // an improvement — especially poisonous for numeric policy patches.
+        log::warn!(
+            target: "eval",
+            "optimizer running without variance data (checkpoint_samples=1): \
+             the accept gate is only min_delta={:.4}; use --checkpoint-samples > 1",
+            config.min_delta
+        );
+    }
+    let mut holdout_baseline = match holdout.as_mut() {
+        Some(holdout) => Some(holdout(0).await?.score.total),
+        None => None,
+    };
     let mut report = OptimizeReport {
         baseline_total,
         final_total: baseline_total,
         ..Default::default()
     };
-    // Track locally-accepted texts so rejection restores the last good state.
-    let mut accepted: Vec<(PromptTarget, String)> = Vec::new();
+    // Track locally-accepted genomes so rejection restores the last good state.
+    let mut accepted_prompts: Vec<(PromptTarget, String)> = Vec::new();
+    let mut accepted_policy: Option<MemoryPolicy> = None;
 
     for generation in 1..=config.generations {
-        let target = config
-            .target
-            .unwrap_or_else(|| pick_target(&baseline.attribution));
-        let current_prompt = prompts::active_prompt(target);
         let failure_summary = summarize_failures(&baseline);
-        let edits = propose_edits(proposer, target, &current_prompt, &failure_summary).await?;
+        let mut record = GenerationReport {
+            generation,
+            baseline_total: baseline.score.total,
+            ..Default::default()
+        };
 
-        if edits.is_empty() {
-            report.generations.push(GenerationReport {
-                generation,
-                target,
-                edits,
-                baseline_total: baseline.score.total,
-                candidate_total: None,
-                decision: GenerationDecision {
-                    accepted: false,
-                    reason: "optimizer proposed no edits".to_string(),
-                },
-            });
-            continue;
-        }
-
-        let mut candidate_text = current_prompt.to_string();
-        let mut apply_error = None;
-        for edit in &edits {
-            match apply_edit(&candidate_text, &edit.find, &edit.replace) {
-                Ok(next) => candidate_text = next,
-                Err(err) => {
-                    apply_error = Some(err.to_string());
-                    break;
+        // Propose and build the candidate genome.
+        let candidate = match config.genome {
+            GenomeKind::Prompt => {
+                let target = config
+                    .target
+                    .unwrap_or_else(|| pick_target(&baseline.attribution));
+                record.target = Some(target);
+                let current_prompt = prompts::active_prompt(target);
+                let edits =
+                    propose_edits(proposer, target, &current_prompt, &failure_summary).await?;
+                if edits.is_empty() {
+                    record.decision = GenerationDecision {
+                        accepted: false,
+                        reason: "optimizer proposed no edits".to_string(),
+                    };
+                    report.generations.push(record);
+                    continue;
                 }
+                record.edits = edits.clone();
+                let mut text = current_prompt.to_string();
+                let mut apply_error = None;
+                for edit in &edits {
+                    match apply_edit(&text, &edit.find, &edit.replace) {
+                        Ok(next) => text = next,
+                        Err(err) => {
+                            apply_error = Some(err.to_string());
+                            break;
+                        }
+                    }
+                }
+                if let Some(err) = apply_error {
+                    record.decision = GenerationDecision {
+                        accepted: false,
+                        reason: format!("edit could not be applied: {err}"),
+                    };
+                    report.generations.push(record);
+                    continue;
+                }
+                Candidate::Prompt { target, text }
+            }
+            GenomeKind::Policy => {
+                let current = accepted_policy.clone().unwrap_or_default();
+                let patches = propose_policy_patches(proposer, &current, &failure_summary).await?;
+                if patches.is_empty() {
+                    record.decision = GenerationDecision {
+                        accepted: false,
+                        reason: "optimizer proposed no patches".to_string(),
+                    };
+                    report.generations.push(record);
+                    continue;
+                }
+                record.patches = patches.clone();
+                let mut policy = current;
+                let mut apply_error = None;
+                for patch in &patches {
+                    match apply_policy_patch(&policy, patch) {
+                        Ok(next) => policy = next,
+                        Err(err) => {
+                            apply_error = Some(err.to_string());
+                            break;
+                        }
+                    }
+                }
+                if let Some(err) = apply_error {
+                    record.decision = GenerationDecision {
+                        accepted: false,
+                        reason: format!("patch could not be applied: {err}"),
+                    };
+                    report.generations.push(record);
+                    continue;
+                }
+                Candidate::Policy { policy }
+            }
+        };
+
+        // Install the candidate genome.
+        match &candidate {
+            Candidate::Prompt { target, text } => {
+                prompts::set_override(*target, Some(text.clone()));
+            }
+            Candidate::Policy { policy } => {
+                MemoryPolicy::set_eval_override(Some(policy.clone()));
             }
         }
-        if let Some(err) = apply_error {
-            report.generations.push(GenerationReport {
-                generation,
-                target,
-                edits,
-                baseline_total: baseline.score.total,
-                candidate_total: None,
-                decision: GenerationDecision {
-                    accepted: false,
-                    reason: format!("edit could not be applied: {err}"),
-                },
-            });
-            continue;
-        }
 
-        prompts::set_override(target, Some(candidate_text.clone()));
-        let candidate = fitness(generation).await?;
-        let decision = decide(
+        let candidate_suite = fitness(generation).await?;
+        record.candidate_total = Some(candidate_suite.score.total);
+        let mut decision = decide(
             baseline.score.total,
             baseline.total_stddev,
-            candidate.score.total,
-            candidate.total_stddev,
+            candidate_suite.score.total,
+            candidate_suite.total_stddev,
             config.confidence_z,
             config.min_delta,
         );
 
-        if decision.accepted {
-            accepted.retain(|(kept, _)| *kept != target);
-            accepted.push((target, candidate_text));
-            report.final_total = candidate.score.total;
-            report.accepted_generations += 1;
-            report.generations.push(GenerationReport {
-                generation,
-                target,
-                edits,
-                baseline_total: baseline.score.total,
-                candidate_total: Some(candidate.score.total),
-                decision,
-            });
-            baseline = candidate;
-        } else {
-            // Revert to the last accepted text for this target (or default).
-            let restore = accepted
-                .iter()
-                .find(|(kept, _)| *kept == target)
-                .map(|(_, text)| text.clone());
-            prompts::set_override(target, restore);
-            report.generations.push(GenerationReport {
-                generation,
-                target,
-                edits,
-                baseline_total: baseline.score.total,
-                candidate_total: Some(candidate.score.total),
-                decision,
-            });
+        // Holdout gate: a train win that regresses held-out scenarios is
+        // overfitting, not progress.
+        if decision.accepted
+            && let Some(holdout) = holdout.as_mut()
+        {
+            let hold_total = holdout(generation).await?.score.total;
+            record.holdout_total = Some(hold_total);
+            let base = holdout_baseline.unwrap_or_default();
+            if hold_total < base - config.holdout_epsilon {
+                decision = GenerationDecision {
+                    accepted: false,
+                    reason: format!(
+                        "train improved but holdout regressed: {hold_total:.4} < {:.4} (baseline {base:.4} − epsilon {})",
+                        base - config.holdout_epsilon,
+                        config.holdout_epsilon
+                    ),
+                };
+            } else {
+                holdout_baseline = Some(hold_total);
+            }
         }
+
+        if decision.accepted {
+            match candidate {
+                Candidate::Prompt { target, text } => {
+                    accepted_prompts.retain(|(kept, _)| *kept != target);
+                    accepted_prompts.push((target, text));
+                }
+                Candidate::Policy { policy } => {
+                    accepted_policy = Some(policy);
+                }
+            }
+            report.final_total = candidate_suite.score.total;
+            report.accepted_generations += 1;
+            baseline = candidate_suite;
+        } else {
+            // Restore the last accepted genome state.
+            match &candidate {
+                Candidate::Prompt { target, .. } => {
+                    let restore = accepted_prompts
+                        .iter()
+                        .find(|(kept, _)| kept == target)
+                        .map(|(_, text)| text.clone());
+                    prompts::set_override(*target, restore);
+                }
+                Candidate::Policy { .. } => {
+                    MemoryPolicy::set_eval_override(accepted_policy.clone());
+                }
+            }
+        }
+        record.decision = decision;
+        report.generations.push(record);
     }
 
-    report.accepted_prompts = accepted
+    report.accepted_prompts = accepted_prompts
         .into_iter()
         .map(|(target, text)| AcceptedPrompt { target, text })
         .collect();
+    report.accepted_policy = accepted_policy;
     Ok(report)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eval::{EvalAgentResult, EvalScore};
-    use crate::types::{FormationInput, MaintenanceInput, RecallInput};
+    use crate::eval::EvalScore;
     use anda_core::AgentOutput;
     use anda_kip::{Request, Response};
     use std::sync::Mutex;
 
-    /// Minimal driver: only `complete` matters for the optimizer.
+    /// Minimal assess context: only `complete` matters for the optimizer.
     #[derive(Default)]
     struct FakeProposer {
         responses: Mutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
-    impl super::super::EvalDriver for FakeProposer {
-        async fn remember(
-            &self,
-            _input: FormationInput,
-        ) -> Result<EvalAgentResult, anda_core::BoxError> {
-            Err("not used".into())
-        }
-
-        async fn recall(
-            &self,
-            _input: RecallInput,
-        ) -> Result<EvalAgentResult, anda_core::BoxError> {
-            Err("not used".into())
-        }
-
-        async fn maintain(
-            &self,
-            _input: MaintenanceInput,
-        ) -> Result<EvalAgentResult, anda_core::BoxError> {
-            Err("not used".into())
-        }
-
-        async fn execute_kip_readonly(
-            &self,
-            _request: Request,
-        ) -> Result<Response, anda_core::BoxError> {
-            Err("not used".into())
-        }
-
+    impl AssessContext for FakeProposer {
         async fn complete(
             &self,
             _req: anda_core::CompletionRequest,
@@ -423,6 +697,13 @@ mod tests {
                 content: responses.remove(0),
                 ..Default::default()
             })
+        }
+
+        async fn execute_kip_readonly(
+            &self,
+            _request: Request,
+        ) -> Result<Response, anda_core::BoxError> {
+            Err("not used".into())
         }
     }
 
@@ -480,17 +761,21 @@ mod tests {
         let config = OptimizeConfig {
             generations: 2,
             target: Some(PromptTarget::Recall),
-            confidence_z: 1.0,
-            min_delta: 0.005,
+            ..Default::default()
         };
 
-        let report = run_optimize(&proposer, &config, move |_generation| {
-            let totals = totals_ref.clone();
-            async move {
-                let total = totals.lock().unwrap().remove(0);
-                Ok(suite_with_total(total, None))
-            }
-        })
+        let report = run_optimize(
+            &proposer,
+            &config,
+            move |_generation| {
+                let totals = totals_ref.clone();
+                async move {
+                    let total = totals.lock().unwrap().remove(0);
+                    Ok(suite_with_total(total, None))
+                }
+            },
+            None,
+        )
         .await
         .unwrap();
 
@@ -592,5 +877,221 @@ mod tests {
         assert!(summary.contains("bad_grounding"));
         assert!(summary.contains("memory not retrieved"));
         assert!(summary.len() <= MAX_FAILURE_SUMMARY_CHARS + 64);
+    }
+
+    #[test]
+    fn apply_policy_patch_bounds_and_validates() {
+        let policy = MemoryPolicy::default();
+
+        // Bounded fractional change applies.
+        let next = apply_policy_patch(
+            &policy,
+            &PolicyPatch {
+                field: "confidence_decay_factor".to_string(),
+                value: 0.9,
+                rationale: String::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(next.confidence_decay_factor, 0.9);
+
+        // Integer fields round.
+        let next = apply_policy_patch(
+            &policy,
+            &PolicyPatch {
+                field: "unsorted_max_backlog".to_string(),
+                value: 25.4,
+                rationale: String::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(next.unsorted_max_backlog, 25);
+
+        // The ±50% step bound rejects jumps.
+        for (field, value) in [
+            ("unsorted_max_backlog", 100.0),
+            ("confidence_decay_factor", 0.4),
+        ] {
+            let err = apply_policy_patch(
+                &policy,
+                &PolicyPatch {
+                    field: field.to_string(),
+                    value,
+                    rationale: String::new(),
+                },
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("step bound"), "{field}: {err}");
+        }
+
+        // A zero-valued integer knob can still take its first step.
+        let zeroed = MemoryPolicy {
+            self_test_queries_per_cycle: 0,
+            ..Default::default()
+        };
+        let next = apply_policy_patch(
+            &zeroed,
+            &PolicyPatch {
+                field: "self_test_queries_per_cycle".to_string(),
+                value: 1.0,
+                rationale: String::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(next.self_test_queries_per_cycle, 1);
+
+        // Unknown fields are rejected: the genome is a closed set.
+        assert!(
+            apply_policy_patch(
+                &policy,
+                &PolicyPatch {
+                    field: "version".to_string(),
+                    value: 2.0,
+                    rationale: String::new(),
+                },
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    // Serializes tests that mutate process-wide override state.
+    #[allow(clippy::await_holding_lock)]
+    async fn run_optimize_policy_genome_installs_and_reverts_policy() {
+        let _guard = prompts::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        MemoryPolicy::set_eval_override(None);
+
+        let patch = |value: f64| {
+            serde_json::json!({
+                "patches": [{
+                    "field": "confidence_decay_factor",
+                    "value": value,
+                    "rationale": "test"
+                }]
+            })
+            .to_string()
+        };
+        // Gen 1 improves (accept 0.9); gen 2 regresses (reject 0.85 →
+        // override restored to the accepted 0.9).
+        let proposer = FakeProposer {
+            responses: Mutex::new(vec![patch(0.9), patch(0.85)]),
+        };
+        let totals = std::sync::Arc::new(Mutex::new(vec![0.5, 0.9, 0.3]));
+        let totals_ref = totals.clone();
+        let config = OptimizeConfig {
+            generations: 2,
+            genome: GenomeKind::Policy,
+            ..Default::default()
+        };
+
+        let report = run_optimize(
+            &proposer,
+            &config,
+            move |_generation| {
+                let totals = totals_ref.clone();
+                async move {
+                    let total = totals.lock().unwrap().remove(0);
+                    Ok(suite_with_total(total, None))
+                }
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.accepted_generations, 1);
+        assert_eq!(
+            report
+                .accepted_policy
+                .as_ref()
+                .unwrap()
+                .confidence_decay_factor,
+            0.9
+        );
+        assert!(report.generations[0].target.is_none());
+        assert_eq!(report.generations[0].patches.len(), 1);
+        assert!(!report.generations[1].decision.accepted);
+        // The rejected candidate was reverted to the accepted policy.
+        assert_eq!(
+            MemoryPolicy::eval_override()
+                .unwrap()
+                .confidence_decay_factor,
+            0.9
+        );
+
+        MemoryPolicy::set_eval_override(None);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn run_optimize_holdout_gate_rejects_overfitting() {
+        let _guard = prompts::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        prompts::clear_overrides();
+        prompts::set_override(
+            PromptTarget::Recall,
+            Some("BASE PROMPT with UNIQUE_NEEDLE inside".to_string()),
+        );
+
+        let edit = serde_json::json!({
+            "edits": [{
+                "target": "recall",
+                "find": "UNIQUE_NEEDLE",
+                "replace": "OVERFIT",
+                "rationale": "test"
+            }]
+        })
+        .to_string();
+        let proposer = FakeProposer {
+            responses: Mutex::new(vec![edit]),
+        };
+        // Train improves (0.5 → 0.9) but holdout regresses (0.6 → 0.4).
+        let train_totals = std::sync::Arc::new(Mutex::new(vec![0.5, 0.9]));
+        let train_ref = train_totals.clone();
+        let holdout_totals = std::sync::Arc::new(Mutex::new(vec![0.6, 0.4]));
+        let holdout_ref = holdout_totals.clone();
+        let holdout: BoxedFitness = Box::new(move |_generation| {
+            let totals = holdout_ref.clone();
+            Box::pin(async move {
+                let total = totals.lock().unwrap().remove(0);
+                Ok(suite_with_total(total, None))
+            })
+        });
+        let config = OptimizeConfig {
+            generations: 1,
+            target: Some(PromptTarget::Recall),
+            ..Default::default()
+        };
+
+        let report = run_optimize(
+            &proposer,
+            &config,
+            move |_generation| {
+                let totals = train_ref.clone();
+                async move {
+                    let total = totals.lock().unwrap().remove(0);
+                    Ok(suite_with_total(total, None))
+                }
+            },
+            Some(holdout),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.accepted_generations, 0);
+        let generation = &report.generations[0];
+        assert_eq!(generation.candidate_total, Some(0.9));
+        assert_eq!(generation.holdout_total, Some(0.4));
+        assert!(!generation.decision.accepted);
+        assert!(generation.decision.reason.contains("holdout regressed"));
+        // The overfitting edit was reverted (back to the last accepted state
+        // — with no prior acceptance, the compiled default).
+        let active = prompts::active_prompt(PromptTarget::Recall);
+        assert!(!active.contains("OVERFIT"));
+
+        prompts::clear_overrides();
     }
 }

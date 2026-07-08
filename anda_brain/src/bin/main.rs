@@ -30,7 +30,8 @@ use anda_brain::{
     eval::{
         EvalExperimentReport, EvalGate, EvalGateReport, EvalProfile, EvalReport, EvalScenario,
         EvalScore, EvalSuiteReport, EvalValidationReport, EvalValidationSeverity,
-        optimize::{OptimizeConfig, OptimizeReport, run_optimize},
+        mine::{MineConfig, mine_scenarios},
+        optimize::{BoxedFitness, GenomeKind, OptimizeConfig, OptimizeReport, run_optimize},
         run_formation_phase, run_policy_phase, run_scenario, shared_formation_issues,
         validate_eval_plan,
     },
@@ -38,6 +39,7 @@ use anda_brain::{
     mcp::{McpHttpServerConfig, McpServerConfig, build_streamable_http_service, run_stdio_server},
     parse_ed25519_pubkeys,
     space::{AppState, copy_space_objects, delete_space_objects},
+    types::{MemoryPolicy, ModelConfig as BrainModelConfig},
 };
 
 #[global_allocator]
@@ -131,6 +133,9 @@ struct Cli {
     command: Option<Commands>,
 }
 
+// A CLI enum is constructed exactly once; boxing the Eval variant would only
+// obscure the clap derive.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Clone)]
 pub enum Commands {
     Local {
@@ -237,15 +242,85 @@ pub enum Commands {
         #[arg(long = "confidence-z", env = "EVAL_CONFIDENCE_Z")]
         confidence_z: Option<f64>,
 
-        /// Run the prompt optimize loop with the eval suite as fitness.
-        /// Target: `formation` | `recall` | `maintenance` | `auto` (auto
-        /// picks per generation from failure attribution)
+        /// Run the optimize loop with the eval suite as fitness. Genome:
+        /// `formation` | `recall` | `maintenance` | `auto` (prompt edits;
+        /// auto picks the target per generation from failure attribution)
+        /// or `policy` (bounded numeric MemoryPolicy mutations)
         #[arg(long = "optimize", env = "EVAL_OPTIMIZE")]
         optimize: Option<String>,
 
         /// Number of propose→evaluate→select generations for --optimize
         #[arg(long = "generations", env = "EVAL_GENERATIONS", default_value_t = 3)]
         generations: usize,
+
+        /// Held-out scenario file(s) for --optimize: a train win must not
+        /// regress this suite (anti-overfitting gate). Repeatable.
+        #[arg(
+            long = "holdout-scenario",
+            env = "EVAL_HOLDOUT_SCENARIO",
+            value_delimiter = ',',
+            num_args = 1..
+        )]
+        holdout_scenario: Vec<String>,
+
+        /// Independent judge model family (used when the API key is set)
+        #[arg(
+            long = "judge-model-family",
+            env = "JUDGE_MODEL_FAMILY",
+            default_value = "openai"
+        )]
+        judge_model_family: String,
+
+        /// Independent judge model name
+        #[arg(
+            long = "judge-model-name",
+            env = "JUDGE_MODEL_NAME",
+            default_value = ""
+        )]
+        judge_model_name: String,
+
+        /// API key for the independent judge model; empty disables it (the
+        /// judge then shares the evaluated system's model)
+        #[arg(
+            long = "judge-model-api-key",
+            env = "JUDGE_MODEL_API_KEY",
+            default_value = ""
+        )]
+        judge_model_api_key: String,
+
+        /// API base for the independent judge model
+        #[arg(
+            long = "judge-model-api-base",
+            env = "JUDGE_MODEL_API_BASE",
+            default_value = ""
+        )]
+        judge_model_api_base: String,
+
+        /// Mine eval scenarios from a real space's correction ledger instead
+        /// of running scenarios (mutually exclusive with --scenario and
+        /// --optimize; the space must already exist)
+        #[arg(long = "mine", env = "EVAL_MINE", default_value_t = false)]
+        mine: bool,
+
+        /// Review directory mined scenarios are written to
+        #[arg(
+            long = "mine-out",
+            env = "EVAL_MINE_OUT",
+            default_value = "./anda_brain/evals/mined"
+        )]
+        mine_out: String,
+
+        /// Only corrections observed within this many days are mined
+        #[arg(long = "since-days", env = "EVAL_SINCE_DAYS", default_value_t = 30)]
+        since_days: u32,
+
+        /// Max scenarios produced per mining run
+        #[arg(
+            long = "max-scenarios",
+            env = "EVAL_MAX_SCENARIOS",
+            default_value_t = 8
+        )]
+        max_scenarios: usize,
 
         /// Directory for accepted prompts and the optimize report
         #[arg(
@@ -399,6 +474,24 @@ fn build_router(
         )
         .route("/v1/{space_id}/formation", routing::post(post_formation))
         .route("/v1/{space_id}/recall", routing::post(post_recall))
+        .route(
+            "/v1/{space_id}/recall_structured",
+            routing::post(post_recall_structured),
+        )
+        .route("/v1/{space_id}/probe", routing::post(post_probe))
+        .route("/v1/{space_id}/memory/pin", routing::post(post_memory_pin))
+        .route(
+            "/v1/{space_id}/memory/forget",
+            routing::post(post_memory_forget),
+        )
+        .route(
+            "/v1/{space_id}/memory_status",
+            routing::get(get_memory_status),
+        )
+        .route(
+            "/v1/{space_id}/management/shadow_eval",
+            routing::post(post_shadow_eval),
+        )
         .route(
             "/v1/{space_id}/maintenance",
             routing::post(post_maintenance),
@@ -692,7 +785,26 @@ struct EvalCommandConfig {
     optimize: Option<String>,
     generations: usize,
     optimize_out: String,
+    holdout_paths: Vec<String>,
+    judge_model: Option<BrainModelConfig>,
+    mine: bool,
+    mine_out: String,
+    since_days: u32,
+    max_scenarios: usize,
     keep_spaces: bool,
+}
+
+/// Shared plumbing every eval run needs; cheap to clone (AppState is
+/// internally shared).
+#[derive(Clone)]
+struct EvalRunEnv {
+    app_state: AppState,
+    auto_create_tier: u32,
+    run_id: u64,
+    keep_spaces: bool,
+    /// Independent judge model (plan M9), installed on every run-scoped
+    /// space (including shared-formation forks).
+    judge_model: Option<BrainModelConfig>,
 }
 
 enum EvalCommandReport {
@@ -841,8 +953,39 @@ async fn run_eval_command(cli: &Cli, config: EvalCommandConfig) -> Result<(), Bo
         optimize,
         generations,
         optimize_out,
+        holdout_paths,
+        judge_model,
+        mine,
+        mine_out,
+        since_days,
+        max_scenarios,
         keep_spaces,
     } = config;
+
+    // Mining is its own mode: it reads an existing space, runs no scenarios.
+    if mine {
+        if !scenario_paths.is_empty()
+            || !holdout_paths.is_empty()
+            || optimize.is_some()
+            || shared_formation
+            || gate.is_configured()
+        {
+            return Err(
+                "--mine is exclusive: drop --scenario/--holdout-scenario/--optimize/--shared-formation/--min-score/--max-findings"
+                    .into(),
+            );
+        }
+        return run_mine_command(
+            cli,
+            &space_id,
+            &mine_out,
+            since_days,
+            max_scenarios,
+            output_path,
+            summary_only,
+        )
+        .await;
+    }
 
     if scenario_paths.is_empty() {
         return Err("at least one --scenario is required".into());
@@ -870,7 +1013,23 @@ async fn run_eval_command(cli: &Cli, config: EvalCommandConfig) -> Result<(), Bo
             validation.passed = !validation.has_errors();
         }
     }
-    let optimize_target = optimize.as_deref().map(parse_optimize_target).transpose()?;
+    let optimize_mode = optimize.as_deref().map(parse_optimize_mode).transpose()?;
+
+    // Holdout scenarios (anti-overfitting gate for --optimize) validate
+    // under the same profiles.
+    let holdout_scenarios: Vec<EvalScenario> = holdout_paths
+        .iter()
+        .map(|path| read_json_file::<EvalScenario>(path))
+        .collect::<Result<_, _>>()?;
+    if !holdout_scenarios.is_empty() {
+        if optimize_mode.is_none() {
+            return Err("--holdout-scenario requires --optimize".into());
+        }
+        let holdout_validation = validate_eval_plan(&holdout_scenarios, &profile_values);
+        if holdout_validation.has_errors() {
+            return Err(eval_validation_error(&holdout_validation).into());
+        }
+    }
 
     if validate_only {
         let report = if summary_only {
@@ -895,8 +1054,15 @@ async fn run_eval_command(cli: &Cli, config: EvalCommandConfig) -> Result<(), Bo
     }
 
     let (app_state, _) = build_app_state(cli)?;
+    let env = EvalRunEnv {
+        app_state,
+        auto_create_tier,
+        run_id: anda_engine::unix_ms(),
+        keep_spaces,
+        judge_model,
+    };
 
-    if let Some(target) = optimize_target {
+    if let Some((genome, target)) = optimize_mode {
         if profiles.len() != 1 {
             return Err("--optimize requires exactly one --profile".into());
         }
@@ -907,46 +1073,28 @@ async fn run_eval_command(cli: &Cli, config: EvalCommandConfig) -> Result<(), Bo
             );
         }
         return run_optimize_command(
-            &app_state,
+            &env,
             &space_id,
             &profiles[0],
             &scenarios,
-            auto_create_tier,
+            &holdout_scenarios,
+            genome,
             target,
             generations,
             gate.confidence_z,
             &optimize_out,
             output_path,
             summary_only,
-            keep_spaces,
         )
         .await;
     }
 
-    let run_id = anda_engine::unix_ms();
     let mut report = if shared_formation {
-        let experiment = run_shared_formation_experiment(
-            &app_state,
-            &space_id,
-            &profiles,
-            &scenarios,
-            auto_create_tier,
-            run_id,
-            keep_spaces,
-        )
-        .await?;
+        let experiment =
+            run_shared_formation_experiment(&env, &space_id, &profiles, &scenarios).await?;
         EvalCommandReport::Experiment(experiment)
     } else if profiles.len() == 1 {
-        let mut suite = run_eval_suite(
-            &app_state,
-            &space_id,
-            &profiles[0],
-            &scenarios,
-            auto_create_tier,
-            run_id,
-            keep_spaces,
-        )
-        .await?;
+        let mut suite = run_eval_suite(&env, &space_id, &profiles[0], &scenarios).await?;
         if scenarios.len() == 1 {
             // One scenario, one profile: report the bare scenario shape.
             EvalCommandReport::Scenario(suite.reports.remove(0))
@@ -956,16 +1104,7 @@ async fn run_eval_command(cli: &Cli, config: EvalCommandConfig) -> Result<(), Bo
     } else {
         let mut suites = Vec::with_capacity(profiles.len());
         for profile in &profiles {
-            let suite = run_eval_suite(
-                &app_state,
-                &space_id,
-                profile,
-                &scenarios,
-                auto_create_tier,
-                run_id,
-                keep_spaces,
-            )
-            .await?;
+            let suite = run_eval_suite(&env, &space_id, profile, &scenarios).await?;
             suites.push(suite);
         }
         let experiment = EvalExperimentReport::from_suites(space_id, suites);
@@ -1156,13 +1295,10 @@ fn append_gate_summary(out: &mut String, gate_report: &EvalGateReport) {
 }
 
 async fn run_eval_suite(
-    app_state: &AppState,
+    env: &EvalRunEnv,
     base_space_id: &str,
     profile: &NamedEvalProfile,
     scenarios: &[EvalScenario],
-    auto_create_tier: u32,
-    run_id: u64,
-    keep_spaces: bool,
 ) -> Result<EvalSuiteReport, BoxError> {
     let mut reports = Vec::with_capacity(scenarios.len());
     for scenario in scenarios {
@@ -1172,14 +1308,14 @@ async fn run_eval_suite(
             base_space_id,
             &profile.id,
             &scenario.id,
-            &run_id.to_string(),
+            &env.run_id.to_string(),
         ]);
-        let space = load_eval_space(app_state, &scenario_space_id, auto_create_tier).await?;
+        let space = load_eval_space(env, &scenario_space_id).await?;
         // Close and clean the run-scoped space even when the scenario fails;
         // otherwise every aborted run leaks its objects into the store.
         let result = run_scenario(space.as_ref(), scenario, &profile.profile).await;
         let close_result = space.db.close().await;
-        cleanup_eval_space(app_state, &scenario_space_id, keep_spaces).await;
+        cleanup_eval_space(&env.app_state, &scenario_space_id, env.keep_spaces).await;
         reports.push(result?);
         close_result?;
     }
@@ -1201,14 +1337,15 @@ async fn cleanup_eval_space(app_state: &AppState, space_id: &str, keep_spaces: b
     }
 }
 
-fn parse_optimize_target(target: &str) -> Result<Option<PromptTarget>, BoxError> {
+fn parse_optimize_mode(target: &str) -> Result<(GenomeKind, Option<PromptTarget>), BoxError> {
     match target.trim().to_lowercase().as_str() {
-        "auto" => Ok(None),
-        "formation" => Ok(Some(PromptTarget::Formation)),
-        "recall" => Ok(Some(PromptTarget::Recall)),
-        "maintenance" => Ok(Some(PromptTarget::Maintenance)),
+        "auto" => Ok((GenomeKind::Prompt, None)),
+        "formation" => Ok((GenomeKind::Prompt, Some(PromptTarget::Formation))),
+        "recall" => Ok((GenomeKind::Prompt, Some(PromptTarget::Recall))),
+        "maintenance" => Ok((GenomeKind::Prompt, Some(PromptTarget::Maintenance))),
+        "policy" => Ok((GenomeKind::Policy, None)),
         other => Err(format!(
-            "invalid --optimize target `{other}`; expected formation|recall|maintenance|auto"
+            "invalid --optimize target `{other}`; expected formation|recall|maintenance|auto|policy"
         )
         .into()),
     }
@@ -1221,20 +1358,18 @@ fn parse_optimize_target(target: &str) -> Result<Option<PromptTarget>, BoxError>
 /// between suites measure the policy — not formation's LLM variance — and
 /// the most expensive phase runs once instead of once per profile.
 async fn run_shared_formation_experiment(
-    app_state: &AppState,
+    env: &EvalRunEnv,
     base_space_id: &str,
     profiles: &[NamedEvalProfile],
     scenarios: &[EvalScenario],
-    auto_create_tier: u32,
-    run_id: u64,
-    keep_spaces: bool,
 ) -> Result<EvalExperimentReport, BoxError> {
     let mut shared_reports = Vec::with_capacity(scenarios.len());
     let mut profile_reports: Vec<Vec<EvalReport>> = vec![Vec::new(); profiles.len()];
 
     for scenario in scenarios {
-        let base_id = compose_space_id(&[base_space_id, "form", &scenario.id, &run_id.to_string()]);
-        let space = load_eval_space(app_state, &base_id, auto_create_tier).await?;
+        let base_id =
+            compose_space_id(&[base_space_id, "form", &scenario.id, &env.run_id.to_string()]);
+        let space = load_eval_space(env, &base_id).await?;
         // The formation phase only reads timeouts from the profile. Clean the
         // base snapshot up even when a phase fails, so aborted runs do not
         // leak objects into the store.
@@ -1244,7 +1379,7 @@ async fn run_shared_formation_experiment(
         let report = match (formation_result, close_result) {
             (Ok(report), Ok(())) => report,
             (result, close_result) => {
-                cleanup_eval_space(app_state, &base_id, keep_spaces).await;
+                cleanup_eval_space(&env.app_state, &base_id, env.keep_spaces).await;
                 result?;
                 close_result?;
                 unreachable!("one of the results is an error");
@@ -1258,9 +1393,12 @@ async fn run_shared_formation_experiment(
             let base_id = base_id.clone();
             async move {
                 let fork_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-                copy_space_objects(&app_state.object_store(), &fork_store, &base_id).await?;
-                let fork_state = app_state.fork_with_store(fork_store);
+                copy_space_objects(&env.app_state.object_store(), &fork_store, &base_id).await?;
+                let fork_state = env.app_state.fork_with_store(fork_store);
                 let fork_space = fork_state.load_space(&base_id, true).await?;
+                if let Some(judge) = &env.judge_model {
+                    fork_space.set_judge_model(judge.clone())?;
+                }
                 let result =
                     run_policy_phase(fork_space.as_ref(), scenario, &profile.profile).await;
                 let close_result = fork_space.db.close().await;
@@ -1272,7 +1410,7 @@ async fn run_shared_formation_experiment(
         .await;
         // The base snapshot is only needed until every profile has forked it.
         // (Forks live in their own in-memory stores and vanish on drop.)
-        cleanup_eval_space(app_state, &base_id, keep_spaces).await;
+        cleanup_eval_space(&env.app_state, &base_id, env.keep_spaces).await;
         for (index, report) in fork_results?.into_iter().enumerate() {
             profile_reports[index].push(report);
         }
@@ -1295,59 +1433,73 @@ async fn run_shared_formation_experiment(
 /// human review; nothing is written back to `assets/`.
 #[allow(clippy::too_many_arguments)]
 async fn run_optimize_command(
-    app_state: &AppState,
+    env: &EvalRunEnv,
     base_space_id: &str,
     profile: &NamedEvalProfile,
     scenarios: &[EvalScenario],
-    auto_create_tier: u32,
+    holdout_scenarios: &[EvalScenario],
+    genome: GenomeKind,
     target: Option<PromptTarget>,
     generations: usize,
     confidence_z: Option<f64>,
     out_dir: &str,
     output_path: Option<String>,
     summary_only: bool,
-    keep_spaces: bool,
 ) -> Result<(), BoxError> {
-    let run_id = anda_engine::unix_ms();
     // Scratch space whose model powers the optimizer's proposal calls.
-    let proposer_id = compose_space_id(&[base_space_id, "optimizer", &run_id.to_string()]);
-    let proposer = load_eval_space(app_state, &proposer_id, auto_create_tier).await?;
+    let proposer_id = compose_space_id(&[base_space_id, "optimizer", &env.run_id.to_string()]);
+    let proposer = load_eval_space(env, &proposer_id).await?;
 
     let mut config = OptimizeConfig {
         generations,
+        genome,
         target,
         ..Default::default()
     };
     if let Some(z) = confidence_z {
         config.confidence_z = z;
     }
-    let fitness_state = app_state.clone();
+    let fitness_env = env.clone();
     let fitness_profile = profile.clone();
     let fitness_scenarios = scenarios.to_vec();
     let fitness_base = base_space_id.to_string();
-    let report = run_optimize(proposer.as_ref(), &config, move |generation| {
-        let app_state = fitness_state.clone();
-        let profile = fitness_profile.clone();
-        let scenarios = fitness_scenarios.clone();
-        let base = format!("{fitness_base}_g{generation}");
-        async move {
-            run_eval_suite(
-                &app_state,
-                &base,
-                &profile,
-                &scenarios,
-                auto_create_tier,
-                run_id,
-                keep_spaces,
-            )
-            .await
-        }
-    })
+    // Anti-overfitting gate (plan M9): train wins must also hold on the
+    // held-out suite, which runs in its own run-scoped spaces.
+    let holdout: Option<BoxedFitness> = if holdout_scenarios.is_empty() {
+        None
+    } else {
+        let env = env.clone();
+        let profile = profile.clone();
+        let scenarios = holdout_scenarios.to_vec();
+        let base = base_space_id.to_string();
+        Some(Box::new(move |generation: usize| {
+            let env = env.clone();
+            let profile = profile.clone();
+            let scenarios = scenarios.clone();
+            let base = format!("{base}_h{generation}");
+            Box::pin(async move { run_eval_suite(&env, &base, &profile, &scenarios).await })
+                as futures::future::BoxFuture<'static, Result<EvalSuiteReport, BoxError>>
+        }))
+    };
+    let report = run_optimize(
+        proposer.as_ref(),
+        &config,
+        move |generation| {
+            let env = fitness_env.clone();
+            let profile = fitness_profile.clone();
+            let scenarios = fitness_scenarios.clone();
+            let base = format!("{fitness_base}_g{generation}");
+            async move { run_eval_suite(&env, &base, &profile, &scenarios).await }
+        },
+        holdout,
+    )
     .await;
-    // Leave the process with pristine prompts regardless of the outcome.
+    // Leave the process with pristine prompts and policy regardless of the
+    // outcome.
     let close_result = proposer.db.close().await;
     prompts::clear_overrides();
-    cleanup_eval_space(app_state, &proposer_id, keep_spaces).await;
+    MemoryPolicy::set_eval_override(None);
+    cleanup_eval_space(&env.app_state, &proposer_id, env.keep_spaces).await;
     let report = match report {
         Ok(report) => report,
         Err(err) => return Err(err),
@@ -1362,6 +1514,12 @@ async fn run_optimize_command(
             PromptTarget::Maintenance => "BrainMaintenance.md",
         };
         std::fs::write(Path::new(out_dir).join(filename), &accepted.text)?;
+    }
+    if let Some(policy) = &report.accepted_policy {
+        std::fs::write(
+            Path::new(out_dir).join("memory_policy.json"),
+            serde_json::to_string_pretty(policy)?,
+        )?;
     }
     let report_json = serde_json::to_string_pretty(&report)?;
     std::fs::write(
@@ -1393,11 +1551,18 @@ fn optimize_summary(report: &OptimizeReport, out_dir: &str) -> String {
     )
     .ok();
     for generation in &report.generations {
+        let holdout = generation
+            .holdout_total
+            .map(|total| format!(" holdout={total:.4}"))
+            .unwrap_or_default();
         writeln!(
             out,
-            "- gen {} target={} candidate={} {} ({})",
+            "- gen {} target={} candidate={}{holdout} {} ({})",
             generation.generation,
-            generation.target.as_str(),
+            generation
+                .target
+                .map(|target| target.as_str())
+                .unwrap_or("policy"),
             generation
                 .candidate_total
                 .map(|total| format!("{total:.4}"))
@@ -1414,7 +1579,84 @@ fn optimize_summary(report: &OptimizeReport, out_dir: &str) -> String {
     if !report.accepted_prompts.is_empty() {
         writeln!(out, "accepted prompts written to {out_dir}").ok();
     }
+    if report.accepted_policy.is_some() {
+        writeln!(
+            out,
+            "accepted policy written to {out_dir}/memory_policy.json"
+        )
+        .ok();
+    }
     out
+}
+
+/// Scenario mining (plan M9): distills a real space's correction ledger into
+/// eval scenarios for human review. Read-only over the space; nothing is
+/// added to any suite automatically.
+async fn run_mine_command(
+    cli: &Cli,
+    space_id: &str,
+    mine_out: &str,
+    since_days: u32,
+    max_scenarios: usize,
+    output_path: Option<String>,
+    summary_only: bool,
+) -> Result<(), BoxError> {
+    let (app_state, _) = build_app_state(cli)?;
+    let space = app_state
+        .load_space(space_id, true)
+        .await
+        .map_err(|err| format!("--mine requires an existing space `{space_id}`: {err}"))?;
+    let now_ms = anda_engine::unix_ms();
+    let config = MineConfig {
+        since_ms: now_ms.saturating_sub(u64::from(since_days) * 86_400_000),
+        max_scenarios,
+    };
+    let result = mine_scenarios(space.as_ref(), &config).await;
+    space.db.close().await?;
+    let (mined, usage) = result?;
+
+    std::fs::create_dir_all(mine_out)?;
+    let mut entries = Vec::with_capacity(mined.len());
+    for item in &mined {
+        let path = Path::new(mine_out).join(format!(
+            "{}.json",
+            sanitize_space_id_part(&item.scenario.id)
+        ));
+        std::fs::write(&path, serde_json::to_string_pretty(&item.scenario)?)?;
+        entries.push(serde_json::json!({
+            "id": item.scenario.id,
+            "signal": item.signal,
+            "path": path.display().to_string(),
+        }));
+    }
+
+    let report_output = if summary_only {
+        let mut out = String::new();
+        writeln!(out, "Mined {} scenario(s) into {mine_out}", mined.len()).ok();
+        for entry in &entries {
+            writeln!(out, "- {} (from {})", entry["id"], entry["signal"]).ok();
+        }
+        writeln!(
+            out,
+            "usage: input_tokens={} output_tokens={}",
+            usage.input_tokens, usage.output_tokens
+        )
+        .ok();
+        writeln!(out, "review them before adding to train/holdout suites").ok();
+        out
+    } else {
+        serde_json::to_string_pretty(&serde_json::json!({
+            "mined": mined.len(),
+            "out_dir": mine_out,
+            "scenarios": entries,
+            "usage": usage,
+        }))?
+    };
+    match output_path {
+        Some(path) => std::fs::write(path, report_output)?,
+        None => println!("{report_output}"),
+    }
+    Ok(())
 }
 
 fn read_eval_profiles(paths: &[String]) -> Result<Vec<NamedEvalProfile>, BoxError> {
@@ -1446,17 +1688,19 @@ fn read_eval_profiles(paths: &[String]) -> Result<Vec<NamedEvalProfile>, BoxErro
 /// Eval spaces are run-scoped and therefore always freshly created; creation
 /// failures fall through to `load_space`, which is the authority on whether
 /// the run can proceed (e.g. `--keep-spaces` leftovers reloaded on purpose).
+/// The env's independent judge model, when configured, is installed on every
+/// space this loads.
 async fn load_eval_space(
-    app_state: &AppState,
+    env: &EvalRunEnv,
     space_id: &str,
-    auto_create_tier: u32,
 ) -> Result<Arc<anda_brain::space::Space>, BoxError> {
-    match app_state
+    match env
+        .app_state
         .admin_create_space(
             SELF_USER_ID,
             SELF_USER_ID,
             space_id.to_string(),
-            auto_create_tier,
+            env.auto_create_tier,
             anda_engine::unix_ms(),
         )
         .await
@@ -1467,7 +1711,11 @@ async fn load_eval_space(
         }
     }
 
-    app_state.load_space(space_id, true).await
+    let space = env.app_state.load_space(space_id, true).await?;
+    if let Some(judge) = &env.judge_model {
+        space.set_judge_model(judge.clone())?;
+    }
+    Ok(space)
 }
 
 fn profile_id_from_path(path: &str) -> String {
@@ -1598,9 +1846,27 @@ async fn main() -> Result<(), BoxError> {
             optimize,
             generations,
             optimize_out,
+            holdout_scenario,
+            judge_model_family,
+            judge_model_name,
+            judge_model_api_key,
+            judge_model_api_base,
+            mine,
+            mine_out,
+            since_days,
+            max_scenarios,
             keep_spaces,
             ..
         }) => {
+            // An empty API key means no independent judge: judge completions
+            // share the evaluated system's model (documented caveat).
+            let judge_model = (!judge_model_api_key.is_empty()).then(|| BrainModelConfig {
+                family: judge_model_family,
+                model: judge_model_name,
+                api_key: judge_model_api_key,
+                api_base: judge_model_api_base,
+                ..Default::default()
+            });
             run_eval_command(
                 &cli,
                 EvalCommandConfig {
@@ -1621,6 +1887,12 @@ async fn main() -> Result<(), BoxError> {
                     optimize,
                     generations,
                     optimize_out,
+                    holdout_paths: holdout_scenario,
+                    judge_model,
+                    mine,
+                    mine_out,
+                    since_days,
+                    max_scenarios,
                     keep_spaces,
                 },
             )
@@ -1852,6 +2124,15 @@ mod tests {
             optimize: None,
             generations: 3,
             optimize_out: "./eval_optimize".to_string(),
+            holdout_scenario: Vec::new(),
+            judge_model_family: "openai".to_string(),
+            judge_model_name: String::new(),
+            judge_model_api_key: String::new(),
+            judge_model_api_base: String::new(),
+            mine: false,
+            mine_out: "./anda_brain/evals/mined".to_string(),
+            since_days: 30,
+            max_scenarios: 8,
             keep_spaces: false,
             storage: Some(StorageCommand::Local {
                 db: path.to_string_lossy().to_string(),
@@ -1970,6 +2251,12 @@ mod tests {
                 validate_only: true,
                 summary_only: false,
                 auto_create_tier: 1,
+                holdout_paths: Vec::new(),
+                judge_model: None,
+                mine: false,
+                mine_out: "./anda_brain/evals/mined".to_string(),
+                since_days: 30,
+                max_scenarios: 8,
                 shared_formation: false,
                 checkpoint_samples: None,
                 optimize: None,
@@ -2028,6 +2315,12 @@ mod tests {
                 validate_only: true,
                 summary_only: true,
                 auto_create_tier: 1,
+                holdout_paths: Vec::new(),
+                judge_model: None,
+                mine: false,
+                mine_out: "./anda_brain/evals/mined".to_string(),
+                since_days: 30,
+                max_scenarios: 8,
                 shared_formation: false,
                 checkpoint_samples: None,
                 optimize: None,

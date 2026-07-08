@@ -4,13 +4,13 @@
 //! rubric-driven judgment on top so paraphrases are not false negatives and
 //! correct meta-references to superseded facts are not false positives.
 
-use anda_core::{BoxError, CompletionRequest, Json, ModelEffort, Usage};
+use anda_core::{BoxError, CompletionRequest, Json, ModelEffort};
 use serde::{Deserialize, Serialize};
 
-use super::{EvalDriver, EvalFinding, EvalFindingKind, MemoryExpectationMode, MemoryProbeReport};
-
-/// Upper bound applied to serialized evidence blobs fed to the judge.
-const MAX_EVIDENCE_CHARS: usize = 6_000;
+use super::{EvalFinding, EvalFindingKind, MemoryExpectationMode, MemoryProbeReport};
+use crate::assess::{
+    AssessContext, JudgeCall, MAX_EVIDENCE_CHARS, parse_json_payload, truncate_chars,
+};
 
 /// Judge scores for one checkpoint answer sample. All values are clamped to
 /// `0..=1` after parsing.
@@ -33,12 +33,6 @@ pub struct JudgeVerdict {
     pub reasoning: String,
 
     pub findings: Vec<EvalFinding>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct JudgeCall<T> {
-    pub verdict: T,
-    pub usage: Usage,
 }
 
 /// Wire shape for the judge output: findings are parsed leniently so a single
@@ -123,12 +117,12 @@ Also report findings, attributing each failure to the responsible stage:
 Respond with ONLY a JSON object:
 {"memory_utility": 0.0, "forgetting_quality": 0.0, "uncertainty_calibration": 0.0, "satisfaction": 0.0, "reasoning": "...", "findings": [{"kind": "bad_synthesis", "message": "...", "expectation_id": null}]}"#;
 
-pub(crate) async fn judge_checkpoint<D>(
-    driver: &D,
+pub(crate) async fn judge_checkpoint<C>(
+    driver: &C,
     input: JudgeCheckpointInput<'_>,
 ) -> Result<JudgeCall<JudgeVerdict>, BoxError>
 where
-    D: EvalDriver + ?Sized,
+    C: AssessContext + ?Sized,
 {
     let probes: Vec<Json> = input
         .probes
@@ -170,7 +164,7 @@ where
     );
 
     let output = driver
-        .complete(CompletionRequest {
+        .judge_complete(CompletionRequest {
             instructions: JUDGE_INSTRUCTIONS.to_string(),
             prompt,
             effort: Some(ModelEffort::Low),
@@ -183,79 +177,6 @@ where
         verdict: raw.into(),
         usage: output.usage,
     })
-}
-
-/// Verdict for one semantic graph probe.
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct AssertionVerdict {
-    pub holds: bool,
-
-    #[serde(default)]
-    pub reason: String,
-}
-
-const ASSERTION_INSTRUCTIONS: &str = r#"You are inspecting a knowledge graph for an AI memory system. You will receive a statement about what the graph may currently assert, plus raw evidence returned by a semantic graph search.
-
-Decide whether the evidence shows the statement currently holds in the graph. Superseded, archived, expired, or explicitly deactivated memories do NOT count as holding. Absence of any matching evidence means the statement does not hold. Do not assume facts beyond the evidence.
-
-Respond with ONLY a JSON object: {"holds": true, "reason": "..."}"#;
-
-pub(crate) async fn judge_assertion<D>(
-    driver: &D,
-    assertion: &str,
-    evidence: &Json,
-) -> Result<JudgeCall<AssertionVerdict>, BoxError>
-where
-    D: EvalDriver + ?Sized,
-{
-    let prompt = format!(
-        "# Statement to verify\n{}\n\n# Graph search evidence\n{}",
-        assertion,
-        truncate_chars(
-            &serde_json::to_string(evidence).unwrap_or_default(),
-            MAX_EVIDENCE_CHARS
-        ),
-    );
-
-    let output = driver
-        .complete(CompletionRequest {
-            instructions: ASSERTION_INSTRUCTIONS.to_string(),
-            prompt,
-            effort: Some(ModelEffort::Low),
-            ..Default::default()
-        })
-        .await?;
-
-    Ok(JudgeCall {
-        verdict: parse_json_payload(&output.content)?,
-        usage: output.usage,
-    })
-}
-
-/// Extracts the first JSON object from model output, tolerating code fences
-/// and prose around it.
-pub(crate) fn parse_json_payload<T: serde::de::DeserializeOwned>(
-    text: &str,
-) -> Result<T, BoxError> {
-    let start = text
-        .find('{')
-        .ok_or_else(|| format!("no JSON object in judge output: {text:.120}"))?;
-    let end = text
-        .rfind('}')
-        .ok_or_else(|| format!("unterminated JSON object in judge output: {text:.120}"))?;
-    if end < start {
-        return Err(format!("malformed JSON object in judge output: {text:.120}").into());
-    }
-    Ok(serde_json::from_str(&text[start..=end])?)
-}
-
-pub(crate) fn truncate_chars(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(max_chars).collect();
-    out.push_str("…(truncated)");
-    out
 }
 
 /// Maps a judge finding to the attribution kind used by the harness; unknown
@@ -286,27 +207,5 @@ mod tests {
         assert_eq!(verdict.reasoning, "good");
         assert_eq!(verdict.findings.len(), 1);
         assert_eq!(verdict.findings[0].kind, EvalFindingKind::BadSynthesis);
-    }
-
-    #[test]
-    fn parse_json_payload_rejects_non_json() {
-        assert!(parse_json_payload::<RawVerdict>("no json here").is_err());
-    }
-
-    #[test]
-    fn parse_assertion_verdict() {
-        let verdict: AssertionVerdict =
-            parse_json_payload("{\"holds\": false, \"reason\": \"superseded\"}").unwrap();
-        assert!(!verdict.holds);
-        assert_eq!(verdict.reason, "superseded");
-    }
-
-    #[test]
-    fn truncate_chars_bounds_output() {
-        let text = "x".repeat(100);
-        let out = truncate_chars(&text, 10);
-        assert!(out.starts_with("xxxxxxxxxx"));
-        assert!(out.ends_with("(truncated)"));
-        assert_eq!(truncate_chars("short", 10), "short");
     }
 }

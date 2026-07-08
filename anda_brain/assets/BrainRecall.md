@@ -953,7 +953,7 @@ Gaps:
    - On trajectory queries: include both, present chronologically.
    - Both current + superseded for same predicate → mention the evolution.
    - Prefer high `evidence_count` patterns over single-event observations.
-   - **Memory strength**: rank reinforced facts first — high `evidence_count` plus recently-refreshed `last_observed` signals a strong, trusted memory; tie-break by recency then confidence (multi-key `ORDER BY` expresses this directly). For Events, `salience_score` plays the same role (flashbulb memories surface first).
+   - **Memory strength**: rank reinforced facts first — high `evidence_count` plus recently-refreshed `last_observed` signals a strong, trusted memory; tie-break by recency then confidence (multi-key `ORDER BY` expresses this directly). For Events, `salience_score` plays the same role (flashbulb memories surface first). The runtime also maintains `last_recalled_at` / `recall_count` on link metadata from real usage — a frequently-recalled fact is a battle-tested one.
    - Self-narrative consistency (Pattern J): if `identity_narrative` and the latest `Insight` diverge, surface both — honesty about evolution is part of identity.
 6. **Currency / TTL filtering**: per KIP §2.10, `expires_at` is **never auto-applied**. Default: do not filter. Opt in only for explicit "current / now / still valid" queries:
 
@@ -1004,3 +1004,18 @@ Besides the graph, the space has a **wiki**: versioned reference documents (poli
 3. **Cross-validate**: graph propositions whose `metadata.source == "wiki"` carry a `metadata.citation` URI — when precision matters, `wiki_read` the cited section and quote the original text instead of the distilled fact.
 4. A superseded proposition (`metadata.status == "superseded"`) means the document moved on: follow `metadata.superseded_by` to the current version before answering.
 5. Never fabricate citations. If the wiki has no evidence, say so and answer from the graph with confidence marked.
+
+---
+
+## 🧾 Structured Self-Report (required)
+
+End every final answer with exactly one self-report block on its own line, after the prose:
+
+```
+<memory_meta>{"found": true, "uncertainty": 0.2}</memory_meta>
+```
+
+- `found`: `true` when the graph/wiki held memory relevant to the query; `false` when you answered from absence ("I have no memory of…"). Partial evidence counts as `true`.
+- `uncertainty`: your honest 0.0–1.0 doubt about the answer as a whole. `0.0` = directly supported by high-confidence, current memory; `0.5` = thin or conflicting evidence, hedged answer; `1.0` = effectively guessing. Calibrate against the evidence you actually retrieved — this number is audited against later corrections.
+
+The block is machine metadata: the runtime strips it before the user sees the answer. Never mention it in prose, never emit more than one, and never let it replace confidence transparency inside the answer itself.

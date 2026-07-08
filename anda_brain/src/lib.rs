@@ -4,8 +4,10 @@ use ic_cose_types::cose::{CoseKey, ed25519::VerifyingKey, get_cose_key_public};
 use std::str::FromStr;
 
 pub mod agents;
+pub mod assess;
 pub mod eval;
 pub mod handler;
+pub mod ledger;
 pub mod mcp;
 pub mod payload;
 pub mod space;

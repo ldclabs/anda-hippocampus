@@ -1,6 +1,6 @@
 use anda_cognitive_nexus::{CognitiveNexus, ConceptPK};
 use anda_core::{
-    AgentInput, AgentOutput, BoxError, FunctionDefinition, Principal, Resource, Usage,
+    AgentInput, AgentOutput, BoxError, FunctionDefinition, Message, Principal, Resource, Usage,
 };
 use anda_db::{
     collection::{Collection, CollectionConfig},
@@ -15,9 +15,9 @@ use anda_engine::{
     engine::Engine,
     extension::note::NoteTool,
     management::Management,
-    memory::{Conversation, Conversations, MemoryManagement, MemoryTool},
-    model::{ModelConfig as EngineModelConfig, Models, reqwest},
-    rfc3339_datetime_now, unix_ms,
+    memory::{Conversation, ConversationStatus, Conversations, MemoryManagement, MemoryTool},
+    model::{Model, ModelConfig as EngineModelConfig, Models, reqwest},
+    rfc3339_datetime, rfc3339_datetime_now, unix_ms,
 };
 use anda_kip::{
     KipError, KipErrorCode, META_SELF_NAME, PERSON_SELF_KIP, PERSON_SYSTEM_KIP, PERSON_TYPE,
@@ -27,10 +27,10 @@ use ic_auth_types::ByteBufB64;
 use ic_cose_types::cose::{
     SIGN1_TAG, cwt::cwt_from, ed25519::VerifyingKey, sign1::cose_sign1_from, skip_prefix,
 };
-use object_store::ObjectStore;
+use object_store::{ObjectStore, memory::InMemory};
 use serde_json::json;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     str::FromStr,
     sync::{
         Arc, LazyLock, OnceLock, Weak,
@@ -49,11 +49,16 @@ use crate::{
         BrainHook, FormationAgent, MaintenanceAgent, READONLY_KIP_TIMEOUT, RecallAgent,
         SELF_USER_ID, TimedMemoryReadonly,
     },
+    assess,
+    ledger::{MissCache, UsageLedger},
     payload::StringOr,
     types::{
         AddSpaceTokenInput, CWToken, FormationInput, FormationStatus, MaintenanceInput,
-        MaintenanceScope, ModelConfig, RecallInput, SpaceInfo, SpaceTier, SpaceToken, TokenScope,
-        UpdateSpaceInput,
+        MaintenanceScope, MemoryForgetEntity, MemoryForgetInput, MemoryForgetReport,
+        MemoryGraphCounters, MemoryMetrics, MemoryPolicy, MemorySettlementReport, MemoryStatus,
+        ModelConfig, ProbeOutput, RecallInput, RecallOutput, SchemaAudit, SelfTestReport,
+        ShadowEvalInput, ShadowReport, ShadowSample, SourceReliability, SpaceInfo, SpaceTier,
+        SpaceToken, TokenScope, UpdateSpaceInput,
     },
     wiki::{
         WikiCommitTool, WikiDigest, WikiDigestReport, WikiReadTool, WikiSearchTool, WikiService,
@@ -163,6 +168,175 @@ impl AppState {
     /// so nothing can reopen a half-removed space through the cache.
     pub async fn evict_space(&self, space_id: &str) {
         self.spaces.write().await.remove(space_id);
+    }
+
+    /// Forks a space into its own in-memory store, optionally installing a
+    /// candidate memory policy. Forks are fully isolated: nothing they do
+    /// can reach the source space's graph, ledger, or metrics.
+    async fn fork_space_for_shadow(
+        &self,
+        space_id: &str,
+        policy: Option<MemoryPolicy>,
+    ) -> Result<Arc<Space>, BoxError> {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        copy_space_objects(&self.object_store(), &store, space_id).await?;
+        let state = self.fork_with_store(store);
+        // autostart=false: the fork inherits the live space's formation
+        // cursor and wiki-digest backlog, and must NOT resume them — that
+        // would burn real LLM tokens twice and mutate both forks mid-replay,
+        // making the A/B comparison non-reproducible.
+        let fork = state.load_space_with(space_id, false, false).await?;
+        if let Some(policy) = policy {
+            fork.db
+                .set_extension_from(MemoryPolicy::EXTENSION_KEY.to_string(), policy);
+        }
+        Ok(fork)
+    }
+
+    /// On-demand shadow evaluation (plan M11): forks the space twice —
+    /// current policy vs candidate policy — settles both forks, replays
+    /// recent real recall queries on each, and lets the judge blind-compare
+    /// the answers (deterministically alternating A/B order to cancel
+    /// position bias). The live space is only read: replays run on forks,
+    /// so they can never pollute its conversations, usage ledger, or
+    /// metrics (plan guardrail 4). Promotion stays human: read the report,
+    /// then `update_space` with the candidate policy if it won.
+    pub async fn run_shadow_eval(
+        &self,
+        space_id: &str,
+        input: ShadowEvalInput,
+    ) -> Result<ShadowReport, BoxError> {
+        input.policy.validate()?;
+        // Unpinned: shadow evaluation must not exempt a cold space from idle
+        // eviction forever.
+        let space = self.load_space(space_id, false).await?;
+        // One shadow evaluation per space at a time: each run holds two full
+        // in-memory copies of the space, so concurrent retries would stack
+        // copies until the process OOMs (and race the `shadow_report` write).
+        let Ok(_shadow_guard) = space.shadow_lock.try_lock() else {
+            return Err("a shadow evaluation is already running for this space".into());
+        };
+        let now_ms = unix_ms();
+        let sample = input.replay_sample.unwrap_or(4).clamp(1, 16);
+
+        let queries = space.recent_recall_queries(sample).await?;
+        if queries.is_empty() {
+            return Err("no completed recall conversations to replay".into());
+        }
+
+        // Flush the live space so the forks see its latest persisted state,
+        // then fork twice: baseline keeps the current policy, candidate gets
+        // the proposed one. Settling both makes the comparison fair — same
+        // metabolism pass, different knobs.
+        space.db.flush_metadata(now_ms).await.ok();
+        let baseline = self.fork_space_for_shadow(space_id, None).await?;
+        let candidate = self
+            .fork_space_for_shadow(space_id, Some(input.policy.clone()))
+            .await?;
+        let _ = baseline
+            .settle_memory_metabolism(MaintenanceScope::Full, now_ms)
+            .await;
+        let _ = candidate
+            .settle_memory_metabolism(MaintenanceScope::Full, now_ms)
+            .await;
+
+        let mut report = ShadowReport {
+            compared_at: now_ms,
+            candidate_policy: input.policy,
+            ..Default::default()
+        };
+        for (index, query) in queries.iter().enumerate() {
+            let recall_input = || {
+                StringOr::Value(RecallInput {
+                    query: query.clone(),
+                    context: None,
+                })
+            };
+            let baseline_out = baseline.query(SELF_USER_ID, recall_input()).await;
+            let candidate_out = candidate.query(SELF_USER_ID, recall_input()).await;
+            let (baseline_answer, candidate_answer) = match (baseline_out, candidate_out) {
+                (Ok(baseline_out), Ok(candidate_out)) => {
+                    report.usage.accumulate(&baseline_out.usage);
+                    report.usage.accumulate(&candidate_out.usage);
+                    (baseline_out.content, candidate_out.content)
+                }
+                _ => {
+                    report.judge_errors += 1;
+                    report.samples.push(ShadowSample {
+                        query: crate::assess::truncate_chars(query, 200),
+                        winner: "error".to_string(),
+                        reason: "replay failed on one side".to_string(),
+                    });
+                    continue;
+                }
+            };
+            report.replayed += 1;
+
+            // Deterministic order alternation cancels position bias without
+            // sacrificing reproducibility.
+            let swap = index % 2 == 1;
+            let (answer_a, answer_b) = if swap {
+                (&candidate_answer, &baseline_answer)
+            } else {
+                (&baseline_answer, &candidate_answer)
+            };
+            let prompt = format!(
+                "# User query\n{query}\n\n# Answer A\n{answer_a}\n\n# Answer B\n{answer_b}"
+            );
+            let verdict = crate::assess::AssessContext::judge_complete(
+                space.as_ref(),
+                anda_core::CompletionRequest {
+                    instructions: SHADOW_JUDGE_INSTRUCTIONS.to_string(),
+                    prompt,
+                    effort: Some(anda_core::ModelEffort::Low),
+                    ..Default::default()
+                },
+            )
+            .await
+            .and_then(|output| {
+                report.usage.accumulate(&output.usage);
+                crate::assess::parse_json_payload::<ShadowVerdict>(&output.content)
+            });
+
+            let (winner, reason) = match verdict {
+                Ok(verdict) => {
+                    let winner = match (verdict.winner.trim().to_lowercase().as_str(), swap) {
+                        ("a", false) | ("b", true) => {
+                            report.baseline_wins += 1;
+                            "baseline"
+                        }
+                        ("b", false) | ("a", true) => {
+                            report.candidate_wins += 1;
+                            "candidate"
+                        }
+                        _ => {
+                            report.ties += 1;
+                            "tie"
+                        }
+                    };
+                    (winner.to_string(), verdict.reason)
+                }
+                Err(err) => {
+                    report.judge_errors += 1;
+                    ("error".to_string(), err.to_string())
+                }
+            };
+            report.samples.push(ShadowSample {
+                query: crate::assess::truncate_chars(query, 200),
+                winner,
+                reason,
+            });
+        }
+
+        // Forks live in memory and vanish on drop; closing is best-effort.
+        let _ = baseline.db.close().await;
+        let _ = candidate.db.close().await;
+
+        space
+            .db
+            .set_extension_from("shadow_report".to_string(), report.clone());
+        space.db.flush_metadata(unix_ms()).await.ok();
+        Ok(report)
     }
 
     /// A sibling `AppState` over a different object store, sharing model and
@@ -293,6 +467,19 @@ impl AppState {
     }
 
     pub async fn load_space(&self, space_id: &str, pinned: bool) -> Result<Arc<Space>, BoxError> {
+        self.load_space_with(space_id, pinned, true).await
+    }
+
+    /// `load_space` with control over background autostart. `autostart:
+    /// false` opens the space without resuming its formation backlog or wiki
+    /// digest — required for shadow forks, which are throwaway copies whose
+    /// backlog must not burn LLM tokens or mutate the fork mid-replay.
+    pub async fn load_space_with(
+        &self,
+        space_id: &str,
+        pinned: bool,
+        autostart: bool,
+    ) -> Result<Arc<Space>, BoxError> {
         let entry = {
             let spaces = self.spaces.read().await;
             spaces.get(space_id).cloned()
@@ -321,6 +508,7 @@ impl AppState {
                     self.http_client.clone(),
                     self.models.clone(),
                     pinned,
+                    autostart,
                 )
                 .await
             })
@@ -453,6 +641,23 @@ pub struct Space {
     models: Arc<Models>,
     maintenance: Arc<MaintenanceAgent>,
     pinned: bool,
+    /// Memory usage ledger (plan M1): off-graph recall/correction counters.
+    ledger: Arc<UsageLedger>,
+    /// Negative-knowledge cache (plan M5): probe queries the graph had
+    /// nothing for; cleared whenever formation completes.
+    miss_cache: Arc<MissCache>,
+    /// Serializes memory-metabolism settlements (plan M2); the settlement
+    /// itself is idempotent, the lock just avoids wasted duplicate passes.
+    settlement_lock: tokio::sync::Mutex<()>,
+    /// At most one dream self-test (plan M7) runs at a time; overlapping
+    /// kicks are skipped, not queued.
+    self_test_lock: tokio::sync::Mutex<()>,
+    /// At most one shadow evaluation (plan M11) per space: each run holds
+    /// two full in-memory copies, so stacking runs is an OOM vector.
+    shadow_lock: tokio::sync::Mutex<()>,
+    /// Independent judge model for eval runs (plan M9); unset means judge
+    /// completions share the space's default model (documented caveat).
+    judge_model: std::sync::RwLock<Option<Arc<Model>>>,
     pub formation: Arc<FormationAgent>,
     pub recall: Arc<RecallAgent>,
     pub db: Arc<AndaDB>,
@@ -569,6 +774,12 @@ impl Space {
     }
 
     pub async fn update(&self, input: UpdateSpaceInput, now_ms: u64) -> Result<(), BoxError> {
+        // Validate up front: a bad policy must reject the request before any
+        // other field of this update mutates in-memory extension state.
+        if let Some(policy) = &input.memory_policy {
+            policy.validate()?;
+        }
+
         let mut changed = false;
         if let Some(name) = input.name {
             changed = true;
@@ -598,10 +809,25 @@ impl Space {
             changed = true;
             self.wiki.set_acl_defaults(defaults).await?;
         }
+        if let Some(policy) = input.memory_policy {
+            changed = true;
+            self.db
+                .set_extension_from(MemoryPolicy::EXTENSION_KEY.to_string(), policy);
+        }
         if changed {
             self.db.flush_metadata(now_ms).await?;
         }
         Ok(())
+    }
+
+    /// The space's memory policy; absent means the process-wide eval
+    /// override (optimizer runs, plan M10) or [`MemoryPolicy::default`],
+    /// which reproduces the compiled-in behavior (plan module M-P).
+    pub fn memory_policy(&self) -> MemoryPolicy {
+        self.db
+            .get_extension_as(MemoryPolicy::EXTENSION_KEY)
+            .or_else(MemoryPolicy::eval_override)
+            .unwrap_or_default()
     }
 
     pub fn get_byok(&self) -> Option<ModelConfig> {
@@ -724,7 +950,7 @@ impl Space {
             .await
     }
 
-    pub async fn query(
+    async fn run_recall(
         &self,
         user: Principal,
         input: StringOr<RecallInput>,
@@ -742,12 +968,167 @@ impl Space {
             .await
     }
 
+    pub async fn query(
+        &self,
+        user: Principal,
+        input: StringOr<RecallInput>,
+    ) -> Result<AgentOutput, BoxError> {
+        let mut output = self.run_recall(user, input).await?;
+        // The self-report footer (plan M4) is machine metadata; plain-text
+        // callers must never see it. `query_structured` surfaces it instead.
+        let (answer, _) = assess::split_recall_meta(&output.content);
+        output.content = answer;
+        Ok(output)
+    }
+
+    /// Recall with machine-readable provenance (plan M4): the answer plus
+    /// trace-derived memory citations and the model's self-reported
+    /// `found`/`uncertainty`, so a business agent can decide whether to
+    /// assert, hedge, or ask.
+    pub async fn query_structured(
+        &self,
+        user: Principal,
+        input: StringOr<RecallInput>,
+    ) -> Result<RecallOutput, BoxError> {
+        let output = self.run_recall(user, input).await?;
+        let (answer, meta) = assess::split_recall_meta(&output.content);
+        let memories = match output.conversation {
+            Some(id) => match self.recall.conversations.get_conversation(id).await {
+                Ok(conversation) => {
+                    let messages: Vec<Message> = conversation
+                        .messages
+                        .into_iter()
+                        .filter_map(|message| serde_json::from_value::<Message>(message).ok())
+                        .collect();
+                    assess::extract_memory_citations(&assess::RecallTrace::from_messages(&messages))
+                }
+                Err(_) => Vec::new(),
+            },
+            None => Vec::new(),
+        };
+        let meta = meta.unwrap_or_default();
+        if let Some(uncertainty) = meta.uncertainty {
+            // Calibration raw material (plan M12): predicted uncertainty is
+            // later audited against actual correction rates.
+            self.bump_metrics(|metrics| {
+                metrics.uncertainty_reports += 1;
+                metrics.uncertainty_sum += uncertainty;
+            });
+        }
+        Ok(RecallOutput {
+            answer,
+            // The trace is the ground truth when the model does not report.
+            found: meta.found.unwrap_or(!memories.is_empty()),
+            uncertainty: meta.uncertainty,
+            memories,
+            conversation: output.conversation,
+            usage: output.usage,
+            failed_reason: output.failed_reason,
+        })
+    }
+
+    /// The user queries of the most recent completed recall conversations,
+    /// newest first — the shadow evaluation's replay corpus (plan M11).
+    pub(crate) async fn recent_recall_queries(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<String>, BoxError> {
+        let (conversations, _) = self
+            .recall
+            .conversations
+            .list_conversations_by_user(&SELF_USER_ID, None, Some(limit.saturating_mul(2)))
+            .await?;
+        let mut queries = Vec::new();
+        for conversation in conversations {
+            if conversation.status != ConversationStatus::Completed {
+                continue;
+            }
+            let Some(first) = conversation.messages.first() else {
+                continue;
+            };
+            let text: String = first
+                .get("content")
+                .and_then(serde_json::Value::as_array)
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default();
+            if text.trim().is_empty() {
+                continue;
+            }
+            // The stored prompt is either a serialized `RecallInput` or the
+            // raw query string.
+            let query = serde_json::from_str::<RecallInput>(&text)
+                .map(|input| input.query)
+                .unwrap_or(text);
+            queries.push(query);
+            if queries.len() >= limit {
+                break;
+            }
+        }
+        Ok(queries)
+    }
+
+    /// Records which graph entities a completed recall surfaced
+    /// (plan M1). Called from the conversation-end hook, off the hot path.
+    pub(crate) async fn record_recall_usage(
+        &self,
+        messages: &[serde_json::Value],
+    ) -> Result<u64, BoxError> {
+        let messages: Vec<Message> = messages
+            .iter()
+            .filter_map(|message| serde_json::from_value::<Message>(message.clone()).ok())
+            .collect();
+        let entities = assess::RecallTrace::from_messages(&messages).entity_ids();
+        let touched = if entities.is_empty() {
+            0
+        } else {
+            self.ledger.record_recall(&entities, unix_ms()).await?
+        };
+        self.bump_metrics(|metrics| {
+            metrics.recalls_completed += 1;
+            metrics.entities_recalled += touched;
+        });
+        Ok(touched)
+    }
+
     pub async fn maintenance(
         &self,
         user: Principal,
         mut input: MaintenanceInput,
     ) -> Result<AgentOutput, BoxError> {
         input.formation_id = self.formation.get_processed().unwrap_or_default();
+        // Callers that pass explicit parameters keep them; everyone else runs
+        // under the space's memory policy. Default policy values equal the
+        // defaults documented in BrainMaintenance.md, so an unset policy is
+        // not a behavior change (plan module M-P).
+        if input.parameters.is_none() {
+            input.parameters = Some(self.memory_policy().maintenance_parameters());
+        }
+        // Deterministic metabolism settles before the LLM cycle starts, so
+        // the agent assesses an already-settled graph. Settlement failures
+        // degrade the cycle, never abort it.
+        match self.settle_memory_metabolism(input.scope, unix_ms()).await {
+            Ok(report) => {
+                log::info!(
+                    target: "brain",
+                    space_id = self.id,
+                    report:serde = report;
+                    "memory metabolism settled"
+                );
+            }
+            Err(err) => {
+                log::warn!(
+                    target: "brain",
+                    space_id = self.id;
+                    "memory metabolism settlement failed: {err:?}"
+                );
+            }
+        }
         let rt = self
             .engine
             .agent_run(
@@ -761,6 +1142,1067 @@ impl Space {
             )
             .await?;
         Ok(rt)
+    }
+
+    /// The last memory-metabolism settlement report, when one has run.
+    pub fn memory_settlement(&self) -> Option<MemorySettlementReport> {
+        self.db.get_extension_as("memory_settlement")
+    }
+
+    /// Bumps the incrementally-updated observability counters (plan M12).
+    /// Writers pay one in-memory extension update; readers never pay a
+    /// heavy query.
+    fn bump_metrics(&self, update: impl FnOnce(&mut MemoryMetrics)) {
+        let now_ms = unix_ms();
+        let _ = self
+            .db
+            .set_extension_from_with("memory_metrics".to_string(), |value| {
+                let mut metrics: MemoryMetrics = value.unwrap_or_default();
+                update(&mut metrics);
+                metrics.updated_at = now_ms;
+                Some(metrics)
+            });
+    }
+
+    /// Memory observability snapshot (plan M12): incrementally-maintained
+    /// counters, derived rates, graph counts, and the latest module reports.
+    pub async fn memory_status(&self) -> MemoryStatus {
+        fn ratio(numerator: u64, denominator: u64) -> Option<f64> {
+            (denominator > 0).then(|| numerator as f64 / denominator as f64)
+        }
+
+        let metrics: MemoryMetrics = self
+            .db
+            .get_extension_as("memory_metrics")
+            .unwrap_or_default();
+        let formation = self.formation_status();
+        let graph = MemoryGraphCounters {
+            concepts: formation.concepts as u64,
+            propositions: formation.propositions as u64,
+            unsorted: assess::kip_count(self, assess::UNSORTED_COUNT_KQL).await,
+            orphans: assess::kip_count(self, assess::ORPHAN_COUNT_KQL).await,
+            predicate_types: assess::kip_count(self, assess::PREDICATE_TYPES_COUNT_KQL).await,
+        };
+        let maintenance_usage: Usage = self
+            .db
+            .get_extension_as("maintenance_usage")
+            .unwrap_or_default();
+        let maintenance_tokens = maintenance_usage
+            .input_tokens
+            .saturating_add(maintenance_usage.output_tokens);
+
+        MemoryStatus {
+            groundability: ratio(metrics.self_test_grounded, metrics.self_test_tested),
+            probe_hit_rate: ratio(
+                metrics.probe_hits,
+                metrics.probe_hits + metrics.probe_misses,
+            ),
+            correction_rate: ratio(metrics.corrections, metrics.recalls_completed),
+            avg_uncertainty: (metrics.uncertainty_reports > 0)
+                .then(|| metrics.uncertainty_sum / metrics.uncertainty_reports as f64),
+            maintenance_tokens_per_recall: ratio(maintenance_tokens, metrics.recalls_completed),
+            metrics,
+            graph,
+            last_settlement: self.memory_settlement(),
+            last_self_test: self.db.get_extension_as("memory_self_test"),
+            last_shadow: self.db.get_extension_as("shadow_report"),
+        }
+    }
+
+    /// Per-predicate link census (plan M8), run by full-scope settlements.
+    /// The counts feed the schema-sprawl metric and give the Maintenance
+    /// prompt's merge guidance real numbers to look at.
+    async fn audit_schema(&self, now_ms: u64) -> Result<(), BoxError> {
+        let response = self
+            .execute_kip_readonly(anda_kip::Request {
+                command: "FIND(?t.name) WHERE { ?t {type: \"$PropositionType\"} } LIMIT 100"
+                    .to_string(),
+                readonly: true,
+                ..Default::default()
+            })
+            .await?;
+        let mut names = BTreeSet::new();
+        if let anda_kip::Response::Ok { result, .. } = &response {
+            collect_string_leaves(result, &mut names);
+        }
+
+        let mut predicates = BTreeMap::new();
+        for name in names.into_iter().take(50) {
+            let count = assess::kip_count(
+                self,
+                &format!(
+                    "FIND(COUNT(?link)) WHERE {{ ?link (?s, {}, ?o) }}",
+                    kip_string_literal(&name)
+                ),
+            )
+            .await
+            .unwrap_or(0);
+            predicates.insert(name, count);
+        }
+        self.db.set_extension_from(
+            "schema_audit".to_string(),
+            SchemaAudit {
+                audited_at: now_ms,
+                predicates,
+            },
+        );
+        Ok(())
+    }
+
+    /// The last per-predicate schema census, when one has run.
+    pub fn schema_audit(&self) -> Option<SchemaAudit> {
+        self.db.get_extension_as("schema_audit")
+    }
+
+    /// Ledger rows corrected after `since_ms` — the scenario-mining signal
+    /// (plan M9).
+    pub async fn corrected_entities(
+        &self,
+        since_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<String>, BoxError> {
+        Ok(self
+            .ledger
+            .corrected_since(since_ms, limit)
+            .await?
+            .into_iter()
+            .map(|row| row.entity)
+            .collect())
+    }
+
+    /// Installs an independent judge model for eval runs (plan M9): judge
+    /// completions stop sharing the evaluated system's model and blind spots.
+    pub fn set_judge_model(&self, config: ModelConfig) -> Result<(), BoxError> {
+        if config.disabled {
+            return Err("judge model is disabled".into());
+        }
+        let engine_config: EngineModelConfig = config.into();
+        let model = engine_config.model(self.http_client.clone())?;
+        *self.judge_model.write().expect("judge model lock poisoned") = Some(Arc::new(model));
+        Ok(())
+    }
+
+    /// The installed judge model, when one exists.
+    pub(crate) fn judge_model(&self) -> Option<Arc<Model>> {
+        self.judge_model
+            .read()
+            .expect("judge model lock poisoned")
+            .clone()
+    }
+
+    /// Test-only judge model injection without a provider config.
+    #[cfg(test)]
+    pub(crate) fn set_judge_model_for_test(&self, model: Model) {
+        *self.judge_model.write().expect("judge model lock poisoned") = Some(Arc::new(model));
+    }
+
+    /// Executes a settlement-built write KIP request. Only deterministic,
+    /// code-generated commands go through here — never model output.
+    async fn execute_kip_settlement(
+        &self,
+        request: anda_kip::Request,
+    ) -> Result<anda_kip::Response, BoxError> {
+        match timeout(
+            SETTLEMENT_KIP_TIMEOUT,
+            request.execute(self.memory.nexus.as_ref()),
+        )
+        .await
+        {
+            Ok((_, res)) => Ok(res),
+            Err(_) => Err(format!(
+                "settlement KIP execution timed out after {} seconds",
+                SETTLEMENT_KIP_TIMEOUT.as_secs()
+            )
+            .into()),
+        }
+    }
+
+    /// Deterministic memory metabolism (plan M2/M3), run before each
+    /// maintenance cycle. Three idempotent passes:
+    ///
+    /// 1. **Reinforcement flush** (every scope): usage-ledger counters for
+    ///    recalled propositions are written onto graph metadata
+    ///    (`last_recalled_at`, `recall_count`), where the decay filter and
+    ///    the Recall/Maintenance prompts can see them.
+    /// 2. **Bulk confidence decay** (full scope only, self rate-limited via
+    ///    `decay_applied_at`): the Phase-7 decay the Maintenance prompt used
+    ///    to run by hand, now usage-modulated — recently recalled, pinned,
+    ///    superseded, and system-truth links are exempt.
+    /// 3. **Correction discovery** (every scope): newly superseded links are
+    ///    recorded in the ledger and aggregated per `metadata.source` into
+    ///    the `source_reliability` extension.
+    pub async fn settle_memory_metabolism(
+        &self,
+        scope: MaintenanceScope,
+        now_ms: u64,
+    ) -> Result<MemorySettlementReport, BoxError> {
+        let _guard = self.settlement_lock.lock().await;
+        let policy = self.memory_policy();
+        let mut report = MemorySettlementReport {
+            settled_at: now_ms,
+            ..Default::default()
+        };
+
+        // 1) Reinforcement flush: drain dirty ledger rows in batches. The
+        // dirty flag — not a time-window watermark — is the cursor, so a row
+        // whose KIP write fails (or that arrives past a batch limit) stays
+        // dirty and is retried by every later settlement; usage counts can
+        // no longer be lost. Rows already attempted this pass are skipped so
+        // persistent failures cannot spin the loop.
+        let mut attempted: BTreeSet<u64> = BTreeSet::new();
+        for _ in 0..SETTLEMENT_MAX_BATCHES {
+            let rows = self
+                .ledger
+                .unflushed_recalls(SETTLEMENT_BATCH_LIMIT)
+                .await?;
+            let mut progressed = false;
+            for row in &rows {
+                if !attempted.insert(row._id) {
+                    continue;
+                }
+                progressed = true;
+                if !crate::assess::is_proposition_entity_id(&row.entity) {
+                    // Concept usage stays ledger-only: decay targets links, and
+                    // marking the row flushed keeps it out of future scans.
+                    self.ledger
+                        .mark_flushed(row._id, row.recall_count, now_ms)
+                        .await?;
+                    continue;
+                }
+                let command = reinforcement_update_command(
+                    &row.entity,
+                    row.last_recalled_at,
+                    row.recall_count,
+                );
+                match self
+                    .execute_kip_settlement(anda_kip::Request {
+                        command,
+                        ..Default::default()
+                    })
+                    .await
+                {
+                    Ok(anda_kip::Response::Ok { .. }) => {
+                        report.reinforced += 1;
+                        self.ledger
+                            .mark_flushed(row._id, row.recall_count, now_ms)
+                            .await?;
+                    }
+                    // Stays dirty: retried on the next settlement.
+                    Ok(anda_kip::Response::Err { .. }) | Err(_) => {
+                        report.flush_retries += 1;
+                    }
+                }
+            }
+            if !progressed || rows.len() < SETTLEMENT_BATCH_LIMIT {
+                break;
+            }
+        }
+
+        // 2) Bulk decay, full scope only (mirrors the old Phase-7 cadence).
+        // A failing decay pass degrades — corrections and the schema census
+        // below still run. The loudest expected cause is the engine's
+        // full-scan solution cap (KIP_4002 at 65,536 propositions): decay
+        // stops working on graphs past that size, which must page an
+        // operator, not vanish into a debug log.
+        if scope == MaintenanceScope::Full {
+            report.decay_ran = true;
+            let command = decay_update_command(&policy, now_ms);
+            for _ in 0..SETTLEMENT_MAX_BATCHES {
+                let response = self
+                    .execute_kip_settlement(anda_kip::Request {
+                        command: command.clone(),
+                        ..Default::default()
+                    })
+                    .await?;
+                let updated = match &response {
+                    anda_kip::Response::Ok { result, .. } => result
+                        .get("updated")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    anda_kip::Response::Err { .. } => {
+                        log::error!(
+                            target: "brain",
+                            space_id = self.id;
+                            "bulk decay pass failed — confidence decay is NOT running \
+                             (graph past the full-scan engine cap?): {response:?}"
+                        );
+                        report.decay_error = Some(format!("{response:?}"));
+                        break;
+                    }
+                };
+                report.decayed += updated;
+                if updated < SETTLEMENT_BATCH_LIMIT as u64 {
+                    break;
+                }
+            }
+        }
+
+        // 3) Correction discovery: superseded links not yet marked settled.
+        // The `correction_settled` graph marker (not a windowed scan) is the
+        // cursor: processed links leave the result set, so a superseded
+        // backlog larger than one batch drains across cycles instead of new
+        // corrections starving forever behind the first LIMIT-full.
+        let scan = self
+            .execute_kip_readonly(anda_kip::Request {
+                command: format!(
+                    "FIND(?link) WHERE {{ ?link (?s, ?p, ?o) FILTER(?link.metadata.superseded == true) FILTER(IS_NULL(?link.metadata.correction_settled)) }} LIMIT {SETTLEMENT_BATCH_LIMIT}"
+                ),
+                readonly: true,
+                ..Default::default()
+            })
+            .await;
+        match scan {
+            Ok(anda_kip::Response::Ok { result, .. }) => {
+                let mut hits: Vec<(String, Vec<String>)> = Vec::new();
+                crate::assess::collect_entity_objects(&result, &mut |id, object| {
+                    if !crate::assess::is_proposition_entity_id(id) {
+                        return;
+                    }
+                    let sources = match object.get("metadata").and_then(|meta| meta.get("source")) {
+                        Some(serde_json::Value::String(source)) => vec![source.clone()],
+                        Some(serde_json::Value::Array(items)) => items
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_string)
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    hits.push((id.to_string(), sources));
+                });
+                for (entity, sources) in hits {
+                    if self.ledger.record_correction(&entity, now_ms).await? {
+                        report.new_corrections += 1;
+                        if !sources.is_empty() {
+                            let _ = self.db.set_extension_from_with(
+                                "source_reliability".to_string(),
+                                |value| {
+                                    let mut map: BTreeMap<String, SourceReliability> =
+                                        value.unwrap_or_default();
+                                    for source in &sources {
+                                        let entry = map.entry(source.clone()).or_default();
+                                        entry.corrections += 1;
+                                        entry.last_corrected_at = now_ms;
+                                    }
+                                    Some(map)
+                                },
+                            );
+                        }
+                    }
+                    // Mark the link settled whether or not it was new to the
+                    // ledger, so it stops occupying the scan window. A failed
+                    // mark is retried next cycle; `record_correction` dedupes,
+                    // so re-processing never double-counts.
+                    let mark = metadata_flag_command(&entity, "correction_settled", "true");
+                    if !matches!(
+                        self.execute_kip_settlement(anda_kip::Request {
+                            command: mark,
+                            ..Default::default()
+                        })
+                        .await,
+                        Ok(anda_kip::Response::Ok { .. })
+                    ) {
+                        log::warn!(
+                            target: "brain",
+                            space_id = self.id;
+                            "marking correction settled failed for {entity}; will re-scan"
+                        );
+                    }
+                }
+            }
+            Ok(response) => {
+                log::error!(
+                    target: "brain",
+                    space_id = self.id;
+                    "correction discovery scan failed — new corrections are NOT being \
+                     recorded (graph past the full-scan engine cap?): {response:?}"
+                );
+                report.correction_scan_error = Some(format!("{response:?}"));
+            }
+            Err(err) => {
+                log::error!(
+                    target: "brain",
+                    space_id = self.id;
+                    "correction discovery scan failed — new corrections are NOT being \
+                     recorded: {err:?}"
+                );
+                report.correction_scan_error = Some(err.to_string());
+            }
+        }
+
+        // Full cycles also refresh the per-predicate schema census (plan M8).
+        if scope == MaintenanceScope::Full
+            && let Err(err) = self.audit_schema(now_ms).await
+        {
+            log::warn!(
+                target: "brain",
+                space_id = self.id;
+                "schema audit failed: {err:?}"
+            );
+        }
+
+        self.bump_metrics(|metrics| {
+            metrics.corrections += report.new_corrections;
+            metrics.decayed += report.decayed;
+            metrics.reinforced += report.reinforced;
+        });
+        self.db
+            .set_extension_from("memory_settlement_at".to_string(), now_ms);
+        self.db
+            .set_extension_from("memory_settlement".to_string(), report.clone());
+        self.db.flush_metadata(now_ms).await.ok();
+        Ok(report)
+    }
+
+    /// Metamemory probe (plan M5): a cheap, LLM-free existence check.
+    /// Answers "does the brain know anything about this?" so callers can
+    /// decide whether a full recall is worth its latency and tokens. Empty
+    /// results are remembered in the negative-knowledge cache until new
+    /// memory forms.
+    pub async fn probe_memory(
+        &self,
+        query: &str,
+        limit: Option<usize>,
+    ) -> Result<ProbeOutput, BoxError> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Err("probe query must not be empty".into());
+        }
+        let now_ms = unix_ms();
+        if self.miss_cache.is_fresh_miss(query, now_ms).await? {
+            self.bump_metrics(|metrics| metrics.negative_cache_hits += 1);
+            return Ok(ProbeOutput {
+                found: false,
+                negative_cached: true,
+                hits: Vec::new(),
+            });
+        }
+
+        let limit = limit.unwrap_or(8).clamp(1, 50);
+        // MODE omitted: the engine picks hybrid when it has semantic
+        // capability, keyword otherwise.
+        let response = self
+            .execute_kip_readonly(anda_kip::Request {
+                command: format!("SEARCH CONCEPT {} LIMIT {limit}", kip_string_literal(query)),
+                readonly: true,
+                ..Default::default()
+            })
+            .await?;
+        let hits = match &response {
+            anda_kip::Response::Ok { result, .. } => assess::citations_from_json(result),
+            anda_kip::Response::Err { .. } => {
+                return Err(format!("probe search failed: {response:?}").into());
+            }
+        };
+        if hits.is_empty() {
+            self.miss_cache.record_miss(query, now_ms).await?;
+        }
+        self.bump_metrics(|metrics| {
+            if hits.is_empty() {
+                metrics.probe_misses += 1;
+            } else {
+                metrics.probe_hits += 1;
+            }
+        });
+        Ok(ProbeOutput {
+            found: !hits.is_empty(),
+            negative_cached: false,
+            hits,
+        })
+    }
+
+    /// Pins (or unpins) a graph entity (plan M6). Pinned memories are exempt
+    /// from confidence decay. Returns the number of updated entities (0 when
+    /// the id does not exist).
+    pub async fn pin_memory(&self, entity: &str, pinned: bool) -> Result<u64, BoxError> {
+        let entity = entity.trim();
+        let command = if assess::is_proposition_entity_id(entity) {
+            format!(
+                "UPDATE ?link\nSET METADATA {{ pinned: {pinned} }}\nWHERE {{ ?link (id: {}) }}",
+                kip_string_literal(entity)
+            )
+        } else if assess::is_concept_entity_id(entity) {
+            format!(
+                "UPDATE ?c\nSET METADATA {{ pinned: {pinned} }}\nWHERE {{ ?c {{id: {}}} }}",
+                kip_string_literal(entity)
+            )
+        } else {
+            return Err(format!("`{entity}` is not a graph entity id (C:* or P:*)").into());
+        };
+        let response = self
+            .execute_kip_settlement(anda_kip::Request {
+                command,
+                ..Default::default()
+            })
+            .await?;
+        match &response {
+            anda_kip::Response::Ok { result, .. } => Ok(result
+                .get("updated")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)),
+            anda_kip::Response::Err { .. } => Err(format!("pin failed: {response:?}").into()),
+        }
+    }
+
+    /// Privacy-grade deletion (plan M6): physically removes entities from
+    /// the graph (concepts detach and take their propositions with them) and
+    /// their usage-ledger rows. Archive does not satisfy forget. Run with
+    /// `dry_run` first; per-entity errors (e.g. KIP_3004 protecting system
+    /// nodes) do not abort the batch.
+    pub async fn forget_memory(
+        &self,
+        input: MemoryForgetInput,
+    ) -> Result<MemoryForgetReport, BoxError> {
+        // A running maintenance cycle already holds graph content in its LLM
+        // context and re-UPSERTs concepts while consolidating — it could
+        // silently re-materialize what we are about to physically delete.
+        // (A formation backlog can still re-form a fact from *queued
+        // conversations*; that is new information arriving, and conversation
+        // scrubbing is tracked separately in the plan's deferred list.)
+        if !input.dry_run && self.maintenance.is_processing() {
+            return Err(
+                "a maintenance cycle is running and could re-materialize deleted memories; \
+                 retry forget when maintenance is idle"
+                    .into(),
+            );
+        }
+        let mut report = MemoryForgetReport {
+            dry_run: input.dry_run,
+            ..Default::default()
+        };
+        let mut seen = BTreeSet::new();
+        for entity in &input.entities {
+            let entity = entity.trim().to_string();
+            if !seen.insert(entity.clone()) {
+                continue;
+            }
+            let mut entry = MemoryForgetEntity {
+                entity: entity.clone(),
+                ..Default::default()
+            };
+            let (exists_command, delete_command) = if assess::is_proposition_entity_id(&entity) {
+                let id = kip_string_literal(&entity);
+                (
+                    format!("FIND(?link) WHERE {{ ?link (id: {id}) }} LIMIT 1"),
+                    format!("DELETE PROPOSITIONS ?link WHERE {{ ?link (id: {id}) }}"),
+                )
+            } else if assess::is_concept_entity_id(&entity) {
+                let id = kip_string_literal(&entity);
+                (
+                    format!("FIND(?c) WHERE {{ ?c {{id: {id}}} }} LIMIT 1"),
+                    format!("DELETE CONCEPT ?c DETACH WHERE {{ ?c {{id: {id}}} }}"),
+                )
+            } else {
+                entry.error = Some("not a graph entity id (C:* or P:*)".to_string());
+                report.entities.push(entry);
+                continue;
+            };
+
+            let response = self
+                .execute_kip_readonly(anda_kip::Request {
+                    command: exists_command,
+                    readonly: true,
+                    ..Default::default()
+                })
+                .await?;
+            entry.existed = matches!(&response, anda_kip::Response::Ok { result, .. }
+                if assess::citations_from_json(result).iter().any(|hit| hit.entity == entity));
+
+            if input.dry_run || !entry.existed {
+                report.entities.push(entry);
+                continue;
+            }
+
+            // Deleting a concept DETACH-deletes all its propositions; their
+            // ledger rows must cascade too (entity ids embed predicate names
+            // like `P:7:has_allergy` — usage traces of a forgotten memory).
+            // Enumerate them before the DELETE destroys the links.
+            let mut cascade: Vec<String> = vec![entity.clone()];
+            if assess::is_concept_entity_id(&entity) {
+                cascade.extend(self.concept_proposition_ids(&entity).await);
+            }
+
+            match self
+                .execute_kip_settlement(anda_kip::Request {
+                    command: delete_command,
+                    ..Default::default()
+                })
+                .await
+            {
+                Ok(anda_kip::Response::Ok { result, .. }) => {
+                    report.deleted_concepts += result
+                        .get("deleted_concepts")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    report.deleted_propositions += result
+                        .get("deleted_propositions")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    for gone in &cascade {
+                        let _ = self.ledger.forget_entity(gone).await;
+                    }
+                }
+                Ok(response) => {
+                    entry.error = Some(format!("{response:?}"));
+                }
+                Err(err) => {
+                    entry.error = Some(err.to_string());
+                }
+            }
+            report.entities.push(entry);
+        }
+        let removed = report.deleted_concepts + report.deleted_propositions;
+        if removed > 0 {
+            self.bump_metrics(|metrics| metrics.forgotten_entities += removed);
+            // Plan M6 cascade: cached probe-miss rows carry raw query text
+            // that may reference the forgotten content; dropping the whole
+            // (bounded) cache is the conservative fulfillment.
+            if let Err(err) = self.miss_cache.clear().await {
+                log::warn!(
+                    target: "brain",
+                    space_id = self.id;
+                    "negative-knowledge cache clear after forget failed: {err:?}"
+                );
+            }
+        }
+        Ok(report)
+    }
+
+    /// Ids of every proposition attached to a concept (either slot); used by
+    /// forget to cascade ledger rows for DETACH-deleted links. Best-effort:
+    /// an enumeration failure only leaves ledger rows behind, never blocks
+    /// the deletion itself.
+    async fn concept_proposition_ids(&self, concept_id: &str) -> Vec<String> {
+        let id = kip_string_literal(concept_id);
+        let mut ids = BTreeSet::new();
+        for command in [
+            format!("FIND(?link) WHERE {{ ?link ({{id: {id}}}, ?p, ?o) }} LIMIT 1000"),
+            format!("FIND(?link) WHERE {{ ?link (?s, ?p, {{id: {id}}}) }} LIMIT 1000"),
+        ] {
+            match self
+                .execute_kip_readonly(anda_kip::Request {
+                    command,
+                    readonly: true,
+                    ..Default::default()
+                })
+                .await
+            {
+                Ok(anda_kip::Response::Ok { result, .. }) => {
+                    assess::collect_entity_objects(&result, &mut |id, _| {
+                        if assess::is_proposition_entity_id(id) {
+                            ids.insert(id.to_string());
+                        }
+                    });
+                }
+                other => {
+                    log::warn!(
+                        target: "brain",
+                        space_id = self.id;
+                        "enumerating propositions of {concept_id} for forget cascade failed: {other:?}"
+                    );
+                }
+            }
+        }
+        ids.into_iter().collect()
+    }
+
+    /// Fires the dream self-test in the background (plan M7); called after a
+    /// maintenance cycle completes. Skipped when disabled by policy or when
+    /// a pass is already running.
+    pub fn kick_memory_self_test(self: &Arc<Self>) {
+        if self.memory_policy().self_test_queries_per_cycle == 0 {
+            return;
+        }
+        let space = self.clone();
+        tokio::spawn(async move {
+            match space.run_memory_self_test(unix_ms()).await {
+                Ok(Some(report)) => {
+                    log::info!(
+                        target: "brain",
+                        space_id = space.id,
+                        report:serde = report;
+                        "memory self-test completed"
+                    );
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    log::warn!(
+                        target: "brain",
+                        space_id = space.id;
+                        "memory self-test failed: {err:?}"
+                    );
+                }
+            }
+        });
+    }
+
+    /// The dream self-test (plan M7): sample recent, never-recalled memories,
+    /// generate one natural query each (single LLM call), and check whether
+    /// search actually surfaces them. Ungroundable memories become `review`
+    /// SleepTasks the next full maintenance re-encodes. Self-test retrievals
+    /// count only into `self_test_count` — never into usage reinforcement.
+    ///
+    /// Returns `None` when disabled, already running, or nothing qualifies.
+    pub async fn run_memory_self_test(
+        &self,
+        now_ms: u64,
+    ) -> Result<Option<SelfTestReport>, BoxError> {
+        let Ok(_guard) = self.self_test_lock.try_lock() else {
+            return Ok(None);
+        };
+        let policy = self.memory_policy();
+        let budget = policy.self_test_queries_per_cycle as usize;
+        if budget == 0 {
+            return Ok(None);
+        }
+
+        // 1) Sample candidate links: active encoded memories (< 1.0 excludes
+        // schema/system truths), skipping graph plumbing predicates. Links
+        // already self-tested (within the retest horizon) or with proven
+        // recall usage are excluded *in the query*: the engine returns
+        // untested rows in stable order, so the sample window slides across
+        // the whole graph over successive passes instead of re-reading the
+        // same fixed prefix until coverage stalls.
+        let retest_before =
+            kip_string_literal(&kip_timestamp(now_ms.saturating_sub(SELF_TEST_RETEST_MS)));
+        let response = self
+            .execute_kip_readonly(anda_kip::Request {
+                command: format!(
+                    r#"FIND(?link) WHERE {{
+  ?link (?s, ?p, ?o)
+  FILTER(?p != "belongs_to_domain")
+  FILTER(?p != "assigned_to")
+  FILTER(IS_NULL(?link.metadata.superseded) || ?link.metadata.superseded != true)
+  FILTER(IS_NULL(?link.metadata.self_tested_at) || ?link.metadata.self_tested_at < {retest_before})
+  FILTER(IS_NULL(?link.metadata.last_recalled_at))
+  FILTER(?link.metadata.confidence < 1.0)
+}} LIMIT {}"#,
+                    budget * 4
+                ),
+                readonly: true,
+                ..Default::default()
+            })
+            .await?;
+        if let anda_kip::Response::Err { .. } = &response {
+            log::error!(
+                target: "brain",
+                space_id = self.id;
+                "self-test sampling scan failed — dream self-test is NOT running \
+                 (graph past the full-scan engine cap?): {response:?}"
+            );
+            return Ok(None);
+        }
+        let mut sampled: Vec<SelfTestCandidate> = Vec::new();
+        if let anda_kip::Response::Ok { result, .. } = &response {
+            assess::collect_entity_objects(result, &mut |id, object| {
+                if !assess::is_proposition_entity_id(id) || sampled.len() >= budget * 4 {
+                    return;
+                }
+                let subject = object.get("subject").and_then(serde_json::Value::as_str);
+                let object_id = object.get("object").and_then(serde_json::Value::as_str);
+                if let (Some(subject), Some(object_id)) = (subject, object_id) {
+                    sampled.push(SelfTestCandidate {
+                        id: id.to_string(),
+                        subject: subject.to_string(),
+                        object: object_id.to_string(),
+                        predicate: id.splitn(3, ':').nth(2).unwrap_or_default().to_string(),
+                        subject_type: String::new(),
+                        subject_name: String::new(),
+                        object_name: String::new(),
+                    });
+                }
+            });
+        }
+
+        // Prefer memories with no usage evidence at all: recalled ones are
+        // proven groundable, already-tested ones had their chance.
+        let mut candidates = Vec::new();
+        for candidate in sampled {
+            let usage = self.ledger.get(&candidate.id).await?;
+            if usage
+                .as_ref()
+                .is_none_or(|row| row.recall_count == 0 && row.self_test_count == 0)
+            {
+                candidates.push(candidate);
+            }
+            if candidates.len() >= budget {
+                break;
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+
+        // 2) Resolve subject/object names for query generation.
+        let mut concept_cache: BTreeMap<String, (String, String)> = BTreeMap::new();
+        for candidate in &mut candidates {
+            let (subject_type, subject_name) = self
+                .self_test_concept(&mut concept_cache, &candidate.subject)
+                .await;
+            let (_, object_name) = self
+                .self_test_concept(&mut concept_cache, &candidate.object)
+                .await;
+            candidate.subject_type = subject_type;
+            candidate.subject_name = subject_name;
+            candidate.object_name = object_name;
+        }
+        // Unresolvable candidates (their subject concept is gone) are marked
+        // tested too, or they would occupy the sample window forever.
+        let unresolved: Vec<String> = candidates
+            .iter()
+            .filter(|candidate| candidate.subject_name.is_empty())
+            .map(|candidate| candidate.id.clone())
+            .collect();
+        candidates.retain(|candidate| !candidate.subject_name.is_empty());
+        if candidates.is_empty() {
+            self.mark_self_tested(unresolved.iter(), now_ms).await;
+            return Ok(None);
+        }
+
+        // 3) One LLM call generates all probe queries. The token budget is
+        // enforced *before* the call by shrinking the candidate batch to fit
+        // (≈3 chars per token, conservative); the knob bounds real spend
+        // instead of warning after the fact.
+        let max_prompt_chars = (policy.self_test_token_budget as usize).saturating_mul(3);
+        while candidates.len() > 1
+            && serde_json::to_string(&candidates)
+                .map(|prompt| prompt.len() > max_prompt_chars)
+                .unwrap_or(false)
+        {
+            candidates.pop();
+        }
+        let output = assess::AssessContext::complete(
+            self,
+            anda_core::CompletionRequest {
+                instructions: SELF_TEST_INSTRUCTIONS.to_string(),
+                prompt: serde_json::to_string_pretty(&candidates).unwrap_or_default(),
+                effort: Some(anda_core::ModelEffort::Low),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let queries: SelfTestQueries = assess::parse_json_payload(&output.content)?;
+        let mut report = SelfTestReport {
+            tested_at: now_ms,
+            usage: output.usage,
+            ..Default::default()
+        };
+        let budget_tokens = report
+            .usage
+            .input_tokens
+            .saturating_add(report.usage.output_tokens);
+        if budget_tokens > policy.self_test_token_budget {
+            log::warn!(
+                target: "brain",
+                space_id = self.id;
+                "memory self-test used {budget_tokens} tokens, over policy budget {}",
+                policy.self_test_token_budget
+            );
+        }
+
+        // 4) Deterministic grounding check: does search surface the memory's
+        // subject or object concept for the generated query?
+        let mut tested_entities = BTreeSet::new();
+        for candidate in &candidates {
+            let Some(query) = queries
+                .queries
+                .iter()
+                .find(|query| query.id == candidate.id)
+                .map(|query| query.query.trim())
+                .filter(|query| !query.is_empty())
+            else {
+                continue;
+            };
+            let response = self
+                .execute_kip_readonly(anda_kip::Request {
+                    command: format!("SEARCH CONCEPT {} LIMIT 8", kip_string_literal(query)),
+                    readonly: true,
+                    ..Default::default()
+                })
+                .await?;
+            let mut hit_ids = BTreeSet::new();
+            if let anda_kip::Response::Ok { result, .. } = &response {
+                assess::collect_entity_objects(result, &mut |id, _| {
+                    hit_ids.insert(id.to_string());
+                });
+            }
+            report.tested += 1;
+            tested_entities.insert(candidate.id.clone());
+            if hit_ids.contains(&candidate.subject) || hit_ids.contains(&candidate.object) {
+                report.grounded += 1;
+                continue;
+            }
+
+            // Ungroundable: enqueue a review SleepTask for the next cycle,
+            // unless one is already pending for this concept.
+            if self
+                .has_pending_review_task(&candidate.subject_name)
+                .await?
+            {
+                continue;
+            }
+            self.ensure_sleep_task_schema().await?;
+            let command = self_test_task_command(candidate, query, now_ms);
+            match self
+                .execute_kip_settlement(anda_kip::Request {
+                    command,
+                    ..Default::default()
+                })
+                .await
+            {
+                Ok(anda_kip::Response::Ok { .. }) => report.reencode_tasks += 1,
+                Ok(response) => {
+                    log::warn!(
+                        target: "brain",
+                        space_id = self.id;
+                        "self-test SleepTask creation failed: {response:?}"
+                    );
+                }
+                Err(err) => {
+                    log::warn!(
+                        target: "brain",
+                        space_id = self.id;
+                        "self-test SleepTask creation failed: {err:?}"
+                    );
+                }
+            }
+        }
+
+        self.ledger
+            .record_self_test(&tested_entities, now_ms)
+            .await?;
+        // Stamp tested (and unresolvable) links on the graph so the next
+        // sampling pass moves past them — this is what keeps self-test
+        // coverage sliding across the whole graph.
+        self.mark_self_tested(tested_entities.iter().chain(unresolved.iter()), now_ms)
+            .await;
+        self.bump_metrics(|metrics| {
+            metrics.self_test_tested += report.tested;
+            metrics.self_test_grounded += report.grounded;
+            metrics.reencode_tasks += report.reencode_tasks;
+        });
+        self.db
+            .set_extension_from("memory_self_test".to_string(), report.clone());
+        self.db.flush_metadata(now_ms).await.ok();
+        Ok(Some(report))
+    }
+
+    /// Stamps `self_tested_at` on the given links; best-effort (an unmarked
+    /// link is simply re-sampled by a later pass).
+    async fn mark_self_tested(&self, entities: impl Iterator<Item = &String>, now_ms: u64) -> u64 {
+        let stamp = kip_string_literal(&kip_timestamp(now_ms));
+        let mut marked = 0u64;
+        for entity in entities {
+            let command = metadata_flag_command(entity, "self_tested_at", &stamp);
+            match self
+                .execute_kip_settlement(anda_kip::Request {
+                    command,
+                    ..Default::default()
+                })
+                .await
+            {
+                Ok(anda_kip::Response::Ok { .. }) => marked += 1,
+                _ => {
+                    log::warn!(
+                        target: "brain",
+                        space_id = self.id;
+                        "marking self-tested failed for {entity}; will re-sample"
+                    );
+                }
+            }
+        }
+        marked
+    }
+
+    /// Resolves a concept id to `(type, name)`, memoized per pass.
+    async fn self_test_concept(
+        &self,
+        cache: &mut BTreeMap<String, (String, String)>,
+        concept_id: &str,
+    ) -> (String, String) {
+        if let Some(found) = cache.get(concept_id) {
+            return found.clone();
+        }
+        let mut resolved = (String::new(), String::new());
+        if let Ok(anda_kip::Response::Ok { result, .. }) = self
+            .execute_kip_readonly(anda_kip::Request {
+                command: format!(
+                    "FIND(?c) WHERE {{ ?c {{id: {}}} }} LIMIT 1",
+                    kip_string_literal(concept_id)
+                ),
+                readonly: true,
+                ..Default::default()
+            })
+            .await
+        {
+            assess::collect_entity_objects(&result, &mut |id, object| {
+                if id == concept_id {
+                    resolved = (
+                        object
+                            .get("type")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        object
+                            .get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    );
+                }
+            });
+        }
+        cache.insert(concept_id.to_string(), resolved.clone());
+        resolved
+    }
+
+    /// True when a pending review SleepTask already targets this concept.
+    async fn has_pending_review_task(&self, target_name: &str) -> Result<bool, BoxError> {
+        let response = self
+            .execute_kip_readonly(anda_kip::Request {
+                command: format!(
+                    "FIND(?task) WHERE {{ ?task {{type: \"SleepTask\"}} FILTER(?task.attributes.target_name == {}) FILTER(?task.attributes.status == \"pending\") }} LIMIT 1",
+                    kip_string_literal(target_name)
+                ),
+                readonly: true,
+                ..Default::default()
+            })
+            .await?;
+        Ok(match &response {
+            anda_kip::Response::Ok { result, .. } => {
+                let mut found = false;
+                assess::collect_entity_objects(result, &mut |_, _| found = true);
+                found
+            }
+            // An unknown SleepTask type (schema not yet installed) means no
+            // pending tasks either way.
+            anda_kip::Response::Err { .. } => false,
+        })
+    }
+
+    /// Installs the SleepTask type capsule (with its `assigned_to`
+    /// predicate) when the graph does not have it yet.
+    async fn ensure_sleep_task_schema(&self) -> Result<(), BoxError> {
+        if self
+            .memory
+            .nexus
+            .has_concept(&ConceptPK::Object {
+                r#type: "$ConceptType".to_string(),
+                name: "SleepTask".to_string(),
+            })
+            .await
+        {
+            return Ok(());
+        }
+        let response = self
+            .execute_kip_settlement(anda_kip::Request {
+                command: anda_kip::SLEEP_TASK_KIP.to_string(),
+                ..Default::default()
+            })
+            .await?;
+        match response {
+            anda_kip::Response::Ok { .. } => Ok(()),
+            response => Err(format!("SleepTask capsule install failed: {response:?}").into()),
+        }
     }
 
     /// WikiDigest is off by default (PRD §13): extraction writes to the
@@ -795,6 +2237,18 @@ impl Space {
                 usage.accumulate(&rt.usage);
                 Some(usage)
             });
+        // The digest writes graph memory outside the formation hook, so it
+        // must invalidate the negative-knowledge cache itself (plan M5): a
+        // probe miss cached before this digest could now be answerable.
+        if rt.digested > 0
+            && let Err(err) = self.miss_cache.clear().await
+        {
+            log::warn!(
+                target: "brain",
+                space_id = self.id;
+                "negative-knowledge cache clear after wiki digest failed: {err:?}"
+            );
+        }
         Ok(rt)
     }
 
@@ -998,6 +2452,7 @@ impl Space {
         http_client: reqwest::Client,
         models: Arc<Models>,
         pinned: bool,
+        autostart: bool,
     ) -> Result<Arc<Self>, BoxError> {
         let id = db_config.name.clone();
         let db = Arc::new(AndaDB::open(object_store.clone(), db_config).await?);
@@ -1112,6 +2567,8 @@ impl Space {
 
         // Initialize and start the server
         let engine = engine.build(RecallAgent::NAME.to_string()).await?;
+        let ledger = Arc::new(UsageLedger::connect(&db).await?);
+        let miss_cache = Arc::new(MissCache::connect(&db).await?);
         let this = Arc::new(Self {
             id,
             db: db.clone(),
@@ -1120,6 +2577,12 @@ impl Space {
             formation,
             recall,
             maintenance,
+            ledger,
+            miss_cache,
+            settlement_lock: tokio::sync::Mutex::new(()),
+            self_test_lock: tokio::sync::Mutex::new(()),
+            shadow_lock: tokio::sync::Mutex::new(()),
+            judge_model: std::sync::RwLock::new(None),
             memory,
             wiki,
             wiki_digest,
@@ -1137,35 +2600,47 @@ impl Space {
             }
         }
 
-        let this_clone = this.clone();
-        tokio::spawn(async move {
-            if let Err(err) = this_clone.maintenance.init().await {
-                log::warn!(target: "brain", space_id = this_clone.id; "maintenance history init failed: {err:?}");
-            }
-            if let Err(err) = this_clone.recall.init().await {
-                log::warn!(target: "brain", space_id = this_clone.id; "recall history init failed: {err:?}");
-            }
-            // Startup repair: reclaim wiki commit-crash leftovers before the
-            // space serves queries built on them.
-            match this_clone.wiki.orphan_sweep(unix_ms()).await {
-                Ok(report) if !report.is_empty() => {
-                    log::warn!(target: "brain", space_id = this_clone.id, report:serde = report; "wiki orphan sweep repaired state");
+        if autostart {
+            let this_clone = this.clone();
+            tokio::spawn(async move {
+                if let Err(err) = this_clone.maintenance.init().await {
+                    log::warn!(target: "brain", space_id = this_clone.id; "maintenance history init failed: {err:?}");
                 }
-                Ok(_) => {}
-                Err(err) => {
-                    log::warn!(target: "brain", space_id = this_clone.id; "wiki orphan sweep failed: {err:?}");
+                if let Err(err) = this_clone.recall.init().await {
+                    log::warn!(target: "brain", space_id = this_clone.id; "recall history init failed: {err:?}");
                 }
+                // Startup repair: reclaim wiki commit-crash leftovers before the
+                // space serves queries built on them.
+                match this_clone.wiki.orphan_sweep(unix_ms()).await {
+                    Ok(report) if !report.is_empty() => {
+                        log::warn!(target: "brain", space_id = this_clone.id, report:serde = report; "wiki orphan sweep repaired state");
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        log::warn!(target: "brain", space_id = this_clone.id; "wiki orphan sweep failed: {err:?}");
+                    }
+                }
+                // Resume any wiki digest backlog left from before the restart.
+                this_clone.kick_wiki_digest();
+                this_clone.kick_wiki_housekeeping();
+                // Resume formation if it was interrupted before. A missing marker
+                // means nothing was processed yet, so resume from the beginning.
+                let conversation = this_clone.formation.get_processed().unwrap_or_default();
+                let _ = this_clone
+                    .restart_formation(SELF_USER_ID, conversation + 1)
+                    .await;
+            });
+        } else {
+            // No-autostart open (shadow forks): the agents still need their
+            // history cursors, but the inherited formation backlog and wiki
+            // digest must stay untouched.
+            if let Err(err) = this.maintenance.init().await {
+                log::warn!(target: "brain", space_id = this.id; "maintenance history init failed: {err:?}");
             }
-            // Resume any wiki digest backlog left from before the restart.
-            this_clone.kick_wiki_digest();
-            this_clone.kick_wiki_housekeeping();
-            // Resume formation if it was interrupted before. A missing marker
-            // means nothing was processed yet, so resume from the beginning.
-            let conversation = this_clone.formation.get_processed().unwrap_or_default();
-            let _ = this_clone
-                .restart_formation(SELF_USER_ID, conversation + 1)
-                .await;
-        });
+            if let Err(err) = this.recall.init().await {
+                log::warn!(target: "brain", space_id = this.id; "recall history init failed: {err:?}");
+            }
+        }
 
         Ok(this)
     }
@@ -1212,6 +2687,20 @@ impl BrainHook for Hooks {
                         usage.accumulate(&conversation.usage);
                         Some(usage)
                     });
+                // Usage-ledger writeback (plan M1): record which memories
+                // this completed recall surfaced. Local collection writes —
+                // cheap enough to run inline, which also guarantees a
+                // maintenance cycle right after a recall sees its usage.
+                if conversation.status == ConversationStatus::Completed
+                    && let Some(space) = self.space()
+                    && let Err(err) = space.record_recall_usage(&conversation.messages).await
+                {
+                    log::warn!(
+                        target: "brain",
+                        space_id = space.id;
+                        "recall usage ledger writeback failed: {err:?}"
+                    );
+                }
             }
             "maintenance_memory" => {
                 let _ = self
@@ -1221,6 +2710,24 @@ impl BrainHook for Hooks {
                         usage.accumulate(&conversation.usage);
                         Some(usage)
                     });
+                // Dream self-test (plan M7): after the sleep cycle ends, probe
+                // whether recent memories are actually findable; failures
+                // become review SleepTasks for the next cycle.
+                if conversation.status == ConversationStatus::Completed
+                    && let Some(space) = self.space()
+                {
+                    // Maintenance re-encodes and merges graph memory, so a
+                    // probe miss cached before the cycle could now be
+                    // answerable (plan M5 invalidation).
+                    if let Err(err) = space.miss_cache.clear().await {
+                        log::warn!(
+                            target: "brain",
+                            space_id = space.id;
+                            "negative-knowledge cache clear after maintenance failed: {err:?}"
+                        );
+                    }
+                    space.kick_memory_self_test();
+                }
             }
             "formation_memory" => {
                 let _ = self
@@ -1230,6 +2737,18 @@ impl BrainHook for Hooks {
                         usage.accumulate(&conversation.usage);
                         Some(usage)
                     });
+                // New memory can answer any past miss: drop the whole
+                // negative-knowledge cache (plan M5 invalidation).
+                if conversation.status == ConversationStatus::Completed
+                    && let Some(space) = self.space()
+                    && let Err(err) = space.miss_cache.clear().await
+                {
+                    log::warn!(
+                        target: "brain",
+                        space_id = space.id;
+                        "negative-knowledge cache clear failed: {err:?}"
+                    );
+                }
             }
             _ => {}
         }
@@ -1361,6 +2880,201 @@ impl Space {
     }
 }
 
+/// Timeout for one settlement-built write KIP command.
+const SETTLEMENT_KIP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Per-command row limit for bulk settlement passes.
+const SETTLEMENT_BATCH_LIMIT: usize = 500;
+
+/// Upper bound of decay batches per settlement (500 × 20 = 10k links).
+const SETTLEMENT_MAX_BATCHES: usize = 20;
+
+/// Bulk decay is a weekly-rate process (the factor is documented per week in
+/// BrainMaintenance.md); links decayed more recently than this are skipped,
+/// so daily maintenance cannot over-decay.
+const DECAY_MIN_INTERVAL_MS: u64 = 7 * 24 * 3_600 * 1_000;
+
+/// A link self-tested longer ago than this becomes eligible for re-sampling,
+/// so re-encoded memories eventually get their grounding re-verified.
+const SELF_TEST_RETEST_MS: u64 = 30 * 24 * 3_600 * 1_000;
+
+/// Renders a KIP string literal with backslashes and quotes escaped.
+fn kip_string_literal(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+const SHADOW_JUDGE_INSTRUCTIONS: &str = r#"You compare two answers an AI memory system gave to the same user query under two different internal configurations. Pick the answer that better serves the user: correct use of remembered facts, honoring later corrections, honest uncertainty. Ignore style differences.
+
+Respond with ONLY a JSON object: {"winner": "a" | "b" | "tie", "reason": "..."}"#;
+
+#[derive(Debug, serde::Deserialize)]
+struct ShadowVerdict {
+    winner: String,
+    #[serde(default)]
+    reason: String,
+}
+
+/// Collects every JSON string leaf; used to read KQL name projections.
+fn collect_string_leaves(value: &serde_json::Value, out: &mut BTreeSet<String>) {
+    match value {
+        serde_json::Value::String(text) if !text.trim().is_empty() => {
+            out.insert(text.clone());
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_string_leaves(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values() {
+                collect_string_leaves(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Graph metadata timestamps are RFC3339 strings (lexicographically
+/// comparable in KQL filters).
+fn kip_timestamp(now_ms: u64) -> String {
+    rfc3339_datetime(now_ms).unwrap_or_else(rfc3339_datetime_now)
+}
+
+/// Settlement command: set one metadata flag on one link by id. `value` is
+/// raw KIP (pass `"true"` for booleans, a `kip_string_literal` for strings).
+fn metadata_flag_command(entity: &str, key: &str, value: &str) -> String {
+    format!(
+        "UPDATE ?link\nSET METADATA {{ {key}: {value} }}\nWHERE {{ ?link (id: {entity}) }}",
+        entity = kip_string_literal(entity),
+    )
+}
+
+/// Settlement command: flush one recalled proposition's usage counters onto
+/// its graph metadata (plan M2 step 1). Absolute values, so re-running is
+/// idempotent.
+fn reinforcement_update_command(entity: &str, last_recalled_ms: u64, recall_count: u64) -> String {
+    format!(
+        "UPDATE ?link\nSET METADATA {{ last_recalled_at: {recalled_at}, recall_count: {recall_count} }}\nWHERE {{ ?link (id: {entity}) }}",
+        recalled_at = kip_string_literal(&kip_timestamp(last_recalled_ms)),
+        entity = kip_string_literal(entity),
+    )
+}
+
+/// One memory sampled for the dream self-test (plan M7); serialized as the
+/// query-generation prompt.
+#[derive(Debug, serde::Serialize)]
+struct SelfTestCandidate {
+    id: String,
+    subject: String,
+    object: String,
+    predicate: String,
+    subject_type: String,
+    subject_name: String,
+    object_name: String,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct SelfTestQueries {
+    #[serde(default)]
+    queries: Vec<SelfTestQuery>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SelfTestQuery {
+    id: String,
+    query: String,
+}
+
+const SELF_TEST_INSTRUCTIONS: &str = r#"You test the searchability of an AI's memory graph. You will receive a JSON array of memories, each a proposition with a subject, predicate, and object.
+
+For each memory, write ONE short natural-language query a real user would plausibly ask that this memory should answer. Use the everyday words of the subject/object names — never internal ids, never the predicate name verbatim unless a user would say it.
+
+Respond with ONLY a JSON object:
+{"queries": [{"id": "<memory id>", "query": "..."}]}"#;
+
+/// Self-test command: enqueue a `review` SleepTask (capsule schema) for a
+/// memory that search could not surface, targeting its subject concept —
+/// re-encoding (aliases, richer description, domain links) happens at the
+/// concept level.
+fn self_test_task_command(candidate: &SelfTestCandidate, query: &str, now_ms: u64) -> String {
+    let date = kip_timestamp(now_ms).chars().take(10).collect::<String>();
+    let slug: String = candidate
+        .subject_name
+        .chars()
+        .map(|ch| {
+            let ch = ch.to_ascii_lowercase();
+            if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .take(40)
+        .collect();
+    let reason = format!(
+        "memory self-test: the query {} did not surface `{}` ({}) via search; re-encode the concept with aliases, a richer description, or domain links so it becomes findable",
+        query, candidate.subject_name, candidate.id
+    );
+    format!(
+        r#"UPSERT {{
+  CONCEPT ?task {{
+    {{type: "SleepTask", name: {name}}}
+    SET ATTRIBUTES {{
+      target_type: {target_type},
+      target_name: {target_name},
+      requested_action: "review",
+      reason: {reason},
+      status: "pending",
+      priority: 2
+    }}
+    SET PROPOSITIONS {{
+      ("assigned_to", {{type: "Person", name: "$system"}})
+    }}
+  }}
+}}
+WITH METADATA {{ source: "memory_self_test", author: "$system", confidence: 1.0, created_at: {created_at} }}"#,
+        name = kip_string_literal(&format!("SleepTask:{date}:review:{slug}")),
+        target_type = kip_string_literal(&candidate.subject_type),
+        target_name = kip_string_literal(&candidate.subject_name),
+        reason = kip_string_literal(&reason),
+        created_at = kip_string_literal(&kip_timestamp(now_ms)),
+    )
+}
+
+/// Settlement command: one usage-modulated bulk decay batch (plan M2 step 2).
+/// This is the Maintenance prompt's former Phase-7 command with three new
+/// exemptions the runtime can now enforce: recently recalled links (usage
+/// reinforcement), pinned links, and links decayed within the weekly window.
+fn decay_update_command(policy: &MemoryPolicy, now_ms: u64) -> String {
+    let stale_window_ms = u64::from(policy.stale_event_threshold_days) * 86_400_000;
+    let created_before = kip_string_literal(&kip_timestamp(now_ms.saturating_sub(stale_window_ms)));
+    let decay_before =
+        kip_string_literal(&kip_timestamp(now_ms.saturating_sub(DECAY_MIN_INTERVAL_MS)));
+    let now_iso = kip_string_literal(&kip_timestamp(now_ms));
+    format!(
+        r#"UPDATE ?link
+SET METADATA {{
+  confidence: CLAMP(MUL(?link.metadata.confidence, {factor}), {floor}, 1.0),
+  decay_applied_at: {now_iso}
+}}
+WHERE {{
+  ?link (?s, ?p, ?o)
+  FILTER(?p != "belongs_to_domain")
+  FILTER(IS_NULL(?link.metadata.superseded) || ?link.metadata.superseded != true)
+  FILTER(IS_NULL(?link.metadata.pinned) || ?link.metadata.pinned != true)
+  FILTER(IS_NOT_NULL(?link.metadata.created_at))
+  FILTER(?link.metadata.created_at < {created_before})
+  FILTER(IS_NULL(?link.metadata.decay_applied_at) || ?link.metadata.decay_applied_at < {decay_before})
+  FILTER(IS_NULL(?link.metadata.last_recalled_at) || ?link.metadata.last_recalled_at < {created_before})
+  FILTER(?link.metadata.confidence > {floor} && ?link.metadata.confidence < 1.0)
+}}
+LIMIT {limit}"#,
+        factor = policy.confidence_decay_factor,
+        floor = policy.decay_floor,
+        limit = SETTLEMENT_BATCH_LIMIT,
+    )
+}
+
 /// Copies every object of a space (`{space_id}/**`) from one object store to
 /// another, preserving paths. This is the eval fork primitive: AndaDB
 /// metadata embeds its own base path, so a space must keep its id and be
@@ -1421,8 +3135,9 @@ mod tests {
         agents::{BrainHook, SELF_USER_ID, TimedMemoryReadonly},
         payload::StringOr,
         types::{
-            AddSpaceTokenInput, FormationInput, InputContext, MaintenanceInput, MaintenanceScope,
-            ModelConfig, RecallInput, SpaceTier, TokenScope, UpdateSpaceInput,
+            AddSpaceTokenInput, FormationInput, InputContext, MaintenanceInput,
+            MaintenanceParameters, MaintenanceScope, MemoryPolicy, ModelConfig, RecallInput,
+            SpaceTier, TokenScope, UpdateSpaceInput,
         },
     };
     use anda_core::{
@@ -1468,6 +3183,62 @@ mod tests {
                 })
             })
         }
+    }
+
+    /// Answers the self-test query-generation call: the first candidate (by
+    /// id order) gets a query matching its subject name, the second gets
+    /// unfindable gibberish — one grounded, one not.
+    #[derive(Debug)]
+    struct SelfTestCompleter;
+
+    impl CompletionFeaturesDyn for SelfTestCompleter {
+        fn model_name(&self) -> String {
+            "self-test-model".to_string()
+        }
+
+        fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+            Box::pin(async move {
+                let candidates: Vec<serde_json::Value> =
+                    serde_json::from_str(&req.prompt).unwrap_or_default();
+                let mut ids: Vec<(String, String)> = candidates
+                    .iter()
+                    .filter_map(|candidate| {
+                        Some((
+                            candidate.get("id")?.as_str()?.to_string(),
+                            candidate.get("subject_name")?.as_str()?.to_string(),
+                        ))
+                    })
+                    .collect();
+                ids.sort();
+                let queries: Vec<serde_json::Value> = ids
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (id, subject_name))| {
+                        let query = if index == 0 {
+                            subject_name.clone()
+                        } else {
+                            "qqqzzzxxx nonsense".to_string()
+                        };
+                        serde_json::json!({"id": id, "query": query})
+                    })
+                    .collect();
+                Ok(AgentOutput {
+                    content: serde_json::json!({ "queries": queries }).to_string(),
+                    usage: Usage {
+                        input_tokens: 20,
+                        output_tokens: 10,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
+    fn test_app_state_with_self_test_model(name: &str) -> AppState {
+        let models = Models::default();
+        models.set_model(Model::with_completer(Arc::new(SelfTestCompleter)));
+        test_app_state_with_models(name, Arc::new(models))
     }
 
     #[derive(Debug)]
@@ -2114,6 +3885,984 @@ mod tests {
             .await
             .unwrap();
         assert!(space.get_byok().is_some());
+    }
+
+    #[tokio::test]
+    async fn memory_policy_round_trips_and_rejects_invalid_values() {
+        let app = test_app_state("memory_policy");
+        let space = create_loaded_space(&app, "memory_policy").await;
+
+        // Absent policy means defaults (compiled-in behavior).
+        assert_eq!(space.memory_policy(), MemoryPolicy::default());
+
+        let policy = MemoryPolicy {
+            confidence_decay_factor: 0.9,
+            orphan_max_count: 5,
+            ..Default::default()
+        };
+        space
+            .update(
+                UpdateSpaceInput {
+                    memory_policy: Some(policy.clone()),
+                    ..Default::default()
+                },
+                1000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(space.memory_policy(), policy);
+
+        // Invalid values reject the update and leave the stored policy alone.
+        let invalid = MemoryPolicy {
+            confidence_decay_factor: 0.0,
+            ..Default::default()
+        };
+        let err = space
+            .update(
+                UpdateSpaceInput {
+                    memory_policy: Some(invalid),
+                    ..Default::default()
+                },
+                1001,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("confidence_decay_factor"));
+        assert_eq!(space.memory_policy(), policy);
+
+        // Budget knobs are capped, not just floored: this object is settable
+        // over HTTP, and an unbounded self-test budget is a cost bomb.
+        let bomb = MemoryPolicy {
+            self_test_queries_per_cycle: u32::MAX,
+            ..Default::default()
+        };
+        let err = space
+            .update(
+                UpdateSpaceInput {
+                    memory_policy: Some(bomb),
+                    ..Default::default()
+                },
+                1002,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("self_test_queries_per_cycle"));
+        assert_eq!(space.memory_policy(), policy);
+    }
+
+    #[tokio::test]
+    async fn maintenance_fills_parameters_from_memory_policy() {
+        let app = test_app_state_with_slow_model("maintenance_policy_params");
+        let space = create_loaded_space(&app, "maintenance_policy_params").await;
+        space
+            .update(
+                UpdateSpaceInput {
+                    memory_policy: Some(MemoryPolicy {
+                        unsorted_max_backlog: 42,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                1000,
+            )
+            .await
+            .unwrap();
+
+        let output = space
+            .maintenance(SELF_USER_ID, MaintenanceInput::default())
+            .await
+            .unwrap();
+        let conversation = space
+            .get_conversation(
+                Some("maintenance".to_string()),
+                output.conversation.unwrap(),
+            )
+            .await
+            .unwrap();
+        let encoded = serde_json::to_string(&conversation.messages).unwrap();
+        // The prompt is the pretty-printed MaintenanceInput JSON, escaped
+        // inside the stored message text.
+        assert!(encoded.contains("\\\"unsorted_max_backlog\\\": 42"));
+        assert!(encoded.contains("\\\"confidence_decay_factor\\\": 0.95"));
+    }
+
+    #[tokio::test]
+    async fn maintenance_keeps_explicit_parameters() {
+        let app = test_app_state_with_slow_model("maintenance_explicit_params");
+        let space = create_loaded_space(&app, "maintenance_explicit_params").await;
+
+        let input = MaintenanceInput {
+            parameters: Some(MaintenanceParameters {
+                stale_event_threshold_days: Some(3),
+                confidence_decay_factor: None,
+                unsorted_max_backlog: None,
+                orphan_max_count: None,
+            }),
+            ..Default::default()
+        };
+        let output = space.maintenance(SELF_USER_ID, input).await.unwrap();
+        let conversation = space
+            .get_conversation(
+                Some("maintenance".to_string()),
+                output.conversation.unwrap(),
+            )
+            .await
+            .unwrap();
+        let encoded = serde_json::to_string(&conversation.messages).unwrap();
+        assert!(encoded.contains("\\\"stale_event_threshold_days\\\": 3"));
+        // The policy must not overwrite explicit parameters.
+        assert!(!encoded.contains("confidence_decay_factor"));
+    }
+
+    #[tokio::test]
+    async fn usage_ledger_counts_corrections_and_flush_state() {
+        let app = test_app_state("usage_ledger");
+        let space = create_loaded_space(&app, "usage_ledger").await;
+
+        let entities =
+            std::collections::BTreeSet::from(["P:1:prefers".to_string(), "C:9".to_string()]);
+        space.ledger.record_recall(&entities, 100).await.unwrap();
+        space
+            .ledger
+            .record_recall(
+                &std::collections::BTreeSet::from(["P:1:prefers".to_string()]),
+                200,
+            )
+            .await
+            .unwrap();
+
+        let row = space.ledger.get("P:1:prefers").await.unwrap().unwrap();
+        assert_eq!(row.recall_count, 2);
+        assert_eq!(row.last_recalled_at, 200);
+        assert_eq!(
+            space.ledger.get("C:9").await.unwrap().unwrap().recall_count,
+            1
+        );
+
+        let pending = space.ledger.unflushed_recalls(100).await.unwrap();
+        assert_eq!(pending.len(), 2);
+        assert!(pending.iter().all(|row| row.dirty == 1));
+
+        // Corrections record once per entity.
+        assert!(
+            space
+                .ledger
+                .record_correction("P:1:prefers", 300)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !space
+                .ledger
+                .record_correction("P:1:prefers", 400)
+                .await
+                .unwrap()
+        );
+        let row = space.ledger.get("P:1:prefers").await.unwrap().unwrap();
+        assert_eq!(row.correction_count, 1);
+        assert_eq!(row.last_corrected_at, 300);
+
+        // Flushed rows drop out of the pending scan until recalled again.
+        space
+            .ledger
+            .mark_flushed(row._id, row.recall_count, 500)
+            .await
+            .unwrap();
+        let pending = space.ledger.unflushed_recalls(100).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].entity, "C:9");
+
+        // A recall recorded after the flush re-dirties the row: the flag —
+        // not a time watermark — decides retry, so late writes are never
+        // stranded outside a scan window.
+        space
+            .ledger
+            .record_recall(
+                &std::collections::BTreeSet::from(["P:1:prefers".to_string()]),
+                50, // deliberately older than the flush timestamp
+            )
+            .await
+            .unwrap();
+        let pending = space.ledger.unflushed_recalls(100).await.unwrap();
+        assert_eq!(pending.len(), 2);
+    }
+
+    async fn seed_kip(space: &Space, command: &str) {
+        let response = space
+            .execute_kip_settlement(anda_kip::Request {
+                command: command.to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(response, anda_kip::Response::Ok { .. }),
+            "seed failed: {response:?}"
+        );
+    }
+
+    async fn link_metadata(space: &Space, id: &str) -> serde_json::Value {
+        let response = space
+            .execute_kip_readonly(anda_kip::Request {
+                command: format!("FIND(?link) WHERE {{ ?link (id: \"{id}\") }}"),
+                readonly: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut metadata = serde_json::Value::Null;
+        if let anda_kip::Response::Ok { result, .. } = &response {
+            crate::assess::collect_entity_objects(result, &mut |found, object| {
+                if found == id {
+                    metadata = object
+                        .get("metadata")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                }
+            });
+        }
+        metadata
+    }
+
+    #[tokio::test]
+    async fn settlement_decays_unused_and_spares_recalled_memories() {
+        let app = test_app_state("settlement");
+        let space = create_loaded_space(&app, "settlement").await;
+        let now_ms = unix_ms();
+        let old_iso = anda_engine::rfc3339_datetime(now_ms - 30 * 86_400_000).unwrap();
+
+        // Seed a tiny graph: one schema type, one predicate, three concepts,
+        // two month-old links at confidence 0.8.
+        seed_kip(
+            &space,
+            r#"UPSERT { CONCEPT ?t { {type: "$ConceptType", name: "Topic"} } WITH METADATA { "source": "test", "confidence": 1.0 } }"#,
+        )
+        .await;
+        seed_kip(
+            &space,
+            r#"UPSERT { CONCEPT ?p { {type: "$PropositionType", name: "linked_to"} } WITH METADATA { "source": "test", "confidence": 1.0 } }"#,
+        )
+        .await;
+        for name in ["alpha", "beta", "gamma"] {
+            seed_kip(
+                &space,
+                &format!(
+                    r#"UPSERT {{ CONCEPT ?c {{ {{type: "Topic", name: "{name}"}} }} WITH METADATA {{ "source": "test", "confidence": 1.0 }} }}"#
+                ),
+            )
+            .await;
+        }
+        for target in ["beta", "gamma"] {
+            seed_kip(
+                &space,
+                &format!(
+                    r#"UPSERT {{ CONCEPT ?c {{ {{type: "Topic", name: "alpha"}} SET PROPOSITIONS {{ ("linked_to", {{type: "Topic", name: "{target}"}}) }} }} WITH METADATA {{ "source": "test_source", "confidence": 0.8, "created_at": "{old_iso}" }} }}"#
+                ),
+            )
+            .await;
+        }
+
+        let response = space
+            .execute_kip_readonly(anda_kip::Request {
+                command: r#"FIND(?link) WHERE { ?link (?s, "linked_to", ?o) }"#.to_string(),
+                readonly: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut ids: Vec<String> = Vec::new();
+        if let anda_kip::Response::Ok { result, .. } = &response {
+            crate::assess::collect_entity_objects(result, &mut |id, _| {
+                if crate::assess::is_proposition_entity_id(id) {
+                    ids.push(id.to_string());
+                }
+            });
+        }
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 2, "expected two links: {response:?}");
+        let (recalled, unused) = (ids[0].clone(), ids[1].clone());
+
+        // One link was surfaced by a recall; the other never was.
+        space
+            .ledger
+            .record_recall(
+                &std::collections::BTreeSet::from([recalled.clone()]),
+                now_ms,
+            )
+            .await
+            .unwrap();
+
+        let report = space
+            .settle_memory_metabolism(MaintenanceScope::Full, now_ms)
+            .await
+            .unwrap();
+        assert_eq!(report.reinforced, 1, "{report:?}");
+        assert!(report.decay_ran);
+        assert_eq!(report.decayed, 1, "{report:?}");
+        assert_eq!(report.new_corrections, 0);
+
+        // The recalled link kept its confidence and gained usage metadata.
+        let metadata = link_metadata(&space, &recalled).await;
+        assert_eq!(metadata["recall_count"], 1, "{metadata}");
+        assert!(metadata["last_recalled_at"].is_string());
+        let confidence = metadata["confidence"].as_f64().unwrap();
+        assert!((confidence - 0.8).abs() < 1e-9, "{metadata}");
+
+        // The unused link decayed by the policy factor (0.8 × 0.95).
+        let metadata = link_metadata(&space, &unused).await;
+        let confidence = metadata["confidence"].as_f64().unwrap();
+        assert!((confidence - 0.76).abs() < 1e-9, "{metadata}");
+        assert!(metadata["decay_applied_at"].is_string());
+
+        // Idempotence: an immediate re-settlement neither re-decays (weekly
+        // rate limit) nor re-flushes (ledger flush marker).
+        let report = space
+            .settle_memory_metabolism(MaintenanceScope::Full, now_ms + 1)
+            .await
+            .unwrap();
+        assert_eq!(report.reinforced, 0, "{report:?}");
+        assert_eq!(report.decayed, 0, "{report:?}");
+
+        // Supersede the unused link: the next settlement records it as a
+        // correction and charges its source.
+        seed_kip(
+            &space,
+            &format!(
+                "UPDATE ?link\nSET METADATA {{ superseded: true }}\nWHERE {{ ?link (id: \"{unused}\") }}"
+            ),
+        )
+        .await;
+        let report = space
+            .settle_memory_metabolism(MaintenanceScope::Quick, now_ms + 2)
+            .await
+            .unwrap();
+        assert!(!report.decay_ran);
+        assert_eq!(report.new_corrections, 1, "{report:?}");
+        let row = space.ledger.get(&unused).await.unwrap().unwrap();
+        assert_eq!(row.correction_count, 1);
+        let reliability: std::collections::BTreeMap<String, crate::types::SourceReliability> =
+            space.db.get_extension_as("source_reliability").unwrap();
+        assert_eq!(reliability["test_source"].corrections, 1);
+
+        // The processed link is marked settled on the graph, so it leaves
+        // the discovery window (the marker, not a LIMIT window, is the scan
+        // cursor) and the next settlement finds nothing new.
+        assert_eq!(
+            link_metadata(&space, &unused).await["correction_settled"],
+            true
+        );
+        let report = space
+            .settle_memory_metabolism(MaintenanceScope::Quick, now_ms + 3)
+            .await
+            .unwrap();
+        assert_eq!(report.new_corrections, 0, "{report:?}");
+
+        // The settlement report is persisted for observability.
+        assert!(space.memory_settlement().is_some());
+    }
+
+    /// Seeds Topic concepts alpha/beta/gamma plus two month-old `linked_to`
+    /// links from alpha at confidence 0.8. Returns the sorted link ids.
+    async fn seed_topic_links(space: &Space, created_iso: &str) -> Vec<String> {
+        seed_kip(
+            space,
+            r#"UPSERT { CONCEPT ?t { {type: "$ConceptType", name: "Topic"} } WITH METADATA { "source": "test", "confidence": 1.0 } }"#,
+        )
+        .await;
+        seed_kip(
+            space,
+            r#"UPSERT { CONCEPT ?p { {type: "$PropositionType", name: "linked_to"} } WITH METADATA { "source": "test", "confidence": 1.0 } }"#,
+        )
+        .await;
+        for name in ["alpha", "beta", "gamma"] {
+            seed_kip(
+                space,
+                &format!(
+                    r#"UPSERT {{ CONCEPT ?c {{ {{type: "Topic", name: "{name}"}} }} WITH METADATA {{ "source": "test", "confidence": 1.0 }} }}"#
+                ),
+            )
+            .await;
+        }
+        for target in ["beta", "gamma"] {
+            seed_kip(
+                space,
+                &format!(
+                    r#"UPSERT {{ CONCEPT ?c {{ {{type: "Topic", name: "alpha"}} SET PROPOSITIONS {{ ("linked_to", {{type: "Topic", name: "{target}"}}) }} }} WITH METADATA {{ "source": "test_source", "confidence": 0.8, "created_at": "{created_iso}" }} }}"#
+                ),
+            )
+            .await;
+        }
+
+        let response = space
+            .execute_kip_readonly(anda_kip::Request {
+                command: r#"FIND(?link) WHERE { ?link (?s, "linked_to", ?o) }"#.to_string(),
+                readonly: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut ids: Vec<String> = Vec::new();
+        if let anda_kip::Response::Ok { result, .. } = &response {
+            crate::assess::collect_entity_objects(result, &mut |id, _| {
+                if crate::assess::is_proposition_entity_id(id) {
+                    ids.push(id.to_string());
+                }
+            });
+        }
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 2);
+        ids
+    }
+
+    #[tokio::test]
+    async fn probe_memory_uses_negative_knowledge_cache() {
+        let app = test_app_state("probe_memory");
+        let space = create_loaded_space(&app, "probe_memory").await;
+        let now_ms = unix_ms();
+        let old_iso = anda_engine::rfc3339_datetime(now_ms - 86_400_000).unwrap();
+        seed_topic_links(&space, &old_iso).await;
+
+        let hit = space.probe_memory("alpha", None).await.unwrap();
+        assert!(hit.found, "{hit:?}");
+        assert!(!hit.negative_cached);
+        assert!(
+            hit.hits
+                .iter()
+                .any(|citation| citation.name.as_deref() == Some("alpha"))
+        );
+
+        let miss = space
+            .probe_memory("qqqzzzxxx nonsense", None)
+            .await
+            .unwrap();
+        assert!(!miss.found);
+        assert!(!miss.negative_cached);
+
+        // The second identical miss is answered from the cache.
+        let cached = space
+            .probe_memory("qqqzzzxxx nonsense", None)
+            .await
+            .unwrap();
+        assert!(!cached.found);
+        assert!(cached.negative_cached);
+
+        // Formation completion clears negative knowledge (hook calls this).
+        space.miss_cache.clear().await.unwrap();
+        let fresh = space
+            .probe_memory("qqqzzzxxx nonsense", None)
+            .await
+            .unwrap();
+        assert!(!fresh.negative_cached);
+
+        // Oversized queries are never cached (unauthenticated probes on
+        // public spaces must not be a disk-write amplifier): the identical
+        // repeat still misses without a cache hit.
+        let long_query = format!("qqqzzzxxx {}", "x".repeat(600));
+        let miss = space.probe_memory(&long_query, None).await.unwrap();
+        assert!(!miss.found);
+        let repeat = space.probe_memory(&long_query, None).await.unwrap();
+        assert!(!repeat.negative_cached);
+    }
+
+    #[tokio::test]
+    async fn pin_exempts_from_decay_and_forget_removes_for_real() {
+        let app = test_app_state("pin_forget");
+        let space = create_loaded_space(&app, "pin_forget").await;
+        let now_ms = unix_ms();
+        let old_iso = anda_engine::rfc3339_datetime(now_ms - 30 * 86_400_000).unwrap();
+        let ids = seed_topic_links(&space, &old_iso).await;
+        let (pinned, doomed) = (ids[0].clone(), ids[1].clone());
+
+        // Pin one link: decay must skip it (plan M6 + M2 integration).
+        assert_eq!(space.pin_memory(&pinned, true).await.unwrap(), 1);
+        let report = space
+            .settle_memory_metabolism(MaintenanceScope::Full, now_ms)
+            .await
+            .unwrap();
+        assert_eq!(report.decayed, 1, "{report:?}");
+        let metadata = link_metadata(&space, &pinned).await;
+        assert_eq!(metadata["pinned"], true);
+        assert!((metadata["confidence"].as_f64().unwrap() - 0.8).abs() < 1e-9);
+
+        // Dry run reports without deleting.
+        let report = space
+            .forget_memory(crate::types::MemoryForgetInput {
+                entities: vec![doomed.clone()],
+                dry_run: true,
+            })
+            .await
+            .unwrap();
+        assert!(report.dry_run);
+        assert!(report.entities[0].existed);
+        assert_eq!(report.deleted_propositions, 0);
+        assert!(!link_metadata(&space, &doomed).await.is_null());
+
+        // Real forget removes the link, its ledger row, and reports bogus
+        // ids per entity without aborting the batch.
+        space
+            .ledger
+            .record_recall(&BTreeSet::from([doomed.clone()]), now_ms)
+            .await
+            .unwrap();
+        let report = space
+            .forget_memory(crate::types::MemoryForgetInput {
+                entities: vec![doomed.clone(), "bogus".to_string()],
+                dry_run: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.deleted_propositions, 1, "{report:?}");
+        assert!(
+            report
+                .entities
+                .iter()
+                .any(|entry| entry.entity == "bogus" && entry.error.is_some())
+        );
+        assert!(link_metadata(&space, &doomed).await.is_null());
+        assert!(space.ledger.get(&doomed).await.unwrap().is_none());
+
+        // Forgetting the concept detaches and removes its remaining link —
+        // and cascades the ledger rows of the DETACH-deleted propositions
+        // (their ids embed predicate names; usage traces of a forgotten
+        // memory must not survive).
+        space
+            .ledger
+            .record_recall(&BTreeSet::from([pinned.clone()]), now_ms)
+            .await
+            .unwrap();
+        let hit = space.probe_memory("alpha", None).await.unwrap();
+        let concept = hit
+            .hits
+            .iter()
+            .find(|citation| citation.name.as_deref() == Some("alpha"))
+            .unwrap()
+            .entity
+            .clone();
+        let report = space
+            .forget_memory(crate::types::MemoryForgetInput {
+                entities: vec![concept],
+                dry_run: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.deleted_concepts, 1, "{report:?}");
+        assert!(report.deleted_propositions >= 1, "{report:?}");
+        assert!(link_metadata(&space, &pinned).await.is_null());
+        assert!(
+            space.ledger.get(&pinned).await.unwrap().is_none(),
+            "cascaded proposition must lose its ledger row"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_self_test_flags_unfindable_memories() {
+        let app = test_app_state_with_self_test_model("memory_self_test");
+        let space = create_loaded_space(&app, "memory_self_test").await;
+        let now_ms = unix_ms();
+        let old_iso = anda_engine::rfc3339_datetime(now_ms - 86_400_000).unwrap();
+        let ids = seed_topic_links(&space, &old_iso).await;
+
+        let report = space
+            .run_memory_self_test(now_ms)
+            .await
+            .unwrap()
+            .expect("self-test must run");
+        assert_eq!(report.tested, 2, "{report:?}");
+        assert_eq!(report.grounded, 1, "{report:?}");
+        assert_eq!(report.reencode_tasks, 1, "{report:?}");
+        assert_eq!(report.groundability(), Some(0.5));
+
+        // The ungroundable memory produced one pending review SleepTask
+        // targeting its subject concept.
+        let response = space
+            .execute_kip_readonly(anda_kip::Request {
+                command: "FIND(?task) WHERE { ?task {type: \"SleepTask\"} FILTER(?task.attributes.status == \"pending\") } LIMIT 10".to_string(),
+                readonly: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let tasks = match &response {
+            anda_kip::Response::Ok { result, .. } => crate::assess::citations_from_json(result)
+                .into_iter()
+                .filter(|citation| citation.r#type.as_deref() == Some("SleepTask"))
+                .count(),
+            _ => 0,
+        };
+        assert_eq!(tasks, 1, "{response:?}");
+
+        // Guardrail: self-tests count only into self_test_count — never into
+        // usage reinforcement.
+        for id in &ids {
+            let row = space.ledger.get(id).await.unwrap().unwrap();
+            assert_eq!(row.self_test_count, 1);
+            assert_eq!(row.recall_count, 0);
+            assert_eq!(row.last_recalled_at, 0);
+        }
+
+        // Every candidate was already tested: the next pass has nothing to do.
+        assert!(
+            space
+                .run_memory_self_test(now_ms + 1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // The exclusion lives on the graph (`self_tested_at`), not just in
+        // the ledger: even with ledger rows gone, tested links stay out of
+        // the sample window. This is what makes coverage slide across the
+        // graph instead of re-reading the same fixed prefix forever.
+        for id in &ids {
+            assert!(
+                !link_metadata(&space, id).await["self_tested_at"].is_null(),
+                "tested link must carry the self_tested_at stamp"
+            );
+            space.ledger.forget_entity(id).await.unwrap();
+        }
+        assert!(
+            space
+                .run_memory_self_test(now_ms + 2)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // A newly formed memory enters the window on the next pass.
+        let old_iso = anda_engine::rfc3339_datetime(now_ms - 86_400_000).unwrap();
+        seed_kip(
+            &space,
+            &format!(
+                r#"UPSERT {{ CONCEPT ?c {{ {{type: "Topic", name: "beta"}} SET PROPOSITIONS {{ ("linked_to", {{type: "Topic", name: "gamma"}}) }} }} WITH METADATA {{ "source": "test_source", "confidence": 0.8, "created_at": "{old_iso}" }} }}"#
+            ),
+        )
+        .await;
+        let report = space
+            .run_memory_self_test(now_ms + 3)
+            .await
+            .unwrap()
+            .expect("new memory must be sampled");
+        assert_eq!(report.tested, 1, "{report:?}");
+
+        // The report persists and surfaces as the groundability graph stat.
+        let stored: crate::types::SelfTestReport = space
+            .db
+            .get_extension_as("memory_self_test")
+            .expect("report stored");
+        assert_eq!(stored.groundability(), Some(1.0));
+    }
+
+    #[derive(Debug)]
+    struct JudgeCompleter;
+
+    impl CompletionFeaturesDyn for JudgeCompleter {
+        fn model_name(&self) -> String {
+            "judge-test-model".to_string()
+        }
+
+        fn completion(&self, _req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+            Box::pin(async move {
+                Ok(AgentOutput {
+                    content: "judge verdict".to_string(),
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn judge_complete_routes_to_independent_model() {
+        use crate::assess::AssessContext;
+        let app = test_app_state_with_final_model("judge_route");
+        let space = create_loaded_space(&app, "judge_route").await;
+        let request = || CompletionRequest {
+            prompt: "judge this".to_string(),
+            ..Default::default()
+        };
+
+        // Without a judge model, judge completions share the space model.
+        let out = AssessContext::judge_complete(space.as_ref(), request())
+            .await
+            .unwrap();
+        assert_eq!(out.content, "done");
+
+        space.set_judge_model_for_test(Model::with_completer(Arc::new(JudgeCompleter)));
+        let out = AssessContext::judge_complete(space.as_ref(), request())
+            .await
+            .unwrap();
+        assert_eq!(out.content, "judge verdict");
+
+        // Non-judge completions (simulator, optimizer) keep the space model.
+        let out = AssessContext::complete(space.as_ref(), request())
+            .await
+            .unwrap();
+        assert_eq!(out.content, "done");
+    }
+
+    /// Answers the scenario-mining call with a fixed valid scenario that
+    /// deliberately contains PII the miner must scrub.
+    #[derive(Debug)]
+    struct MinerCompleter;
+
+    impl CompletionFeaturesDyn for MinerCompleter {
+        fn model_name(&self) -> String {
+            "miner-test-model".to_string()
+        }
+
+        fn completion(&self, _req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+            Box::pin(async move {
+                let scenario = serde_json::json!({
+                    "scenario": {
+                        "id": "pref_fix",
+                        "hidden_profile": {"contact": "work address"},
+                        "timeline": [
+                            {"turn": 1, "type": "normal",
+                             "timestamp": "2026-06-01T10:00:00Z",
+                             "user": "My email is bob@example.com and card 12345678901."},
+                            {"turn": 2, "type": "normal",
+                             "timestamp": "2026-06-05T10:00:00Z",
+                             "user": "Correction: use my work address instead."},
+                            {"turn": 3, "type": "maintenance",
+                             "maintenance": {"trigger": "on_demand", "scope": "quick"}},
+                            {"turn": 4, "type": "checkpoint_synthetic",
+                             "timestamp": "2026-06-06T10:00:00Z",
+                             "query": "Which contact should you use?",
+                             "evaluation": {
+                                 "scoring_rubric": "honor the correction",
+                                 "required_answer_terms": ["work"],
+                                 "forbidden_answer_terms": ["card"]
+                             }}
+                        ]
+                    }
+                });
+                Ok(AgentOutput {
+                    content: scenario.to_string(),
+                    usage: Usage {
+                        input_tokens: 30,
+                        output_tokens: 15,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn mine_scenarios_distills_corrections_and_scrubs_pii() {
+        let models = Models::default();
+        models.set_model(Model::with_completer(Arc::new(MinerCompleter)));
+        let app = test_app_state_with_models("mine_corrections", Arc::new(models));
+        let space = create_loaded_space(&app, "mine_corrections").await;
+        let now_ms = unix_ms();
+        let old_iso = anda_engine::rfc3339_datetime(now_ms - 86_400_000).unwrap();
+        let ids = seed_topic_links(&space, &old_iso).await;
+
+        // One corrected memory is the mining signal.
+        space
+            .ledger
+            .record_correction(&ids[0], now_ms)
+            .await
+            .unwrap();
+
+        let (mined, usage) = crate::eval::mine::mine_scenarios(
+            space.as_ref(),
+            &crate::eval::mine::MineConfig {
+                since_ms: 0,
+                max_scenarios: 4,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(mined.len(), 1);
+        assert_eq!(mined[0].signal, ids[0]);
+        let scenario = &mined[0].scenario;
+        assert_eq!(scenario.id, "mined_pref_fix");
+        assert!(
+            scenario
+                .description
+                .as_deref()
+                .unwrap()
+                .contains("review before adding")
+        );
+        // PII scrubbed from the produced scenario.
+        let encoded = serde_json::to_string(scenario).unwrap();
+        assert!(encoded.contains("[email]"), "{encoded}");
+        assert!(encoded.contains("[number]"), "{encoded}");
+        assert!(!encoded.contains("bob@example.com"));
+        assert!(!encoded.contains("12345678901"));
+        assert!(usage.input_tokens > 0);
+    }
+
+    #[tokio::test]
+    async fn memory_status_aggregates_counters_and_schema_audit() {
+        let app = test_app_state("memory_status");
+        let space = create_loaded_space(&app, "memory_status").await;
+        let now_ms = unix_ms();
+        let old_iso = anda_engine::rfc3339_datetime(now_ms - 30 * 86_400_000).unwrap();
+        let ids = seed_topic_links(&space, &old_iso).await;
+
+        // Probe activity: one hit, one miss, one negative-cache hit.
+        assert!(space.probe_memory("alpha", None).await.unwrap().found);
+        assert!(!space.probe_memory("qqqzzz", None).await.unwrap().found);
+        assert!(
+            space
+                .probe_memory("qqqzzz", None)
+                .await
+                .unwrap()
+                .negative_cached
+        );
+
+        // One completed recall surfacing one entity.
+        let message = serde_json::json!(Message {
+            role: "assistant".to_string(),
+            content: vec![
+                anda_core::ContentPart::ToolCall {
+                    name: "execute_kip_readonly".to_string(),
+                    args: serde_json::json!({"command": "FIND"}),
+                    call_id: Some("c1".to_string()),
+                },
+                anda_core::ContentPart::ToolOutput {
+                    name: "execute_kip_readonly".to_string(),
+                    output: serde_json::json!([{"id": ids[0]}]),
+                    is_error: None,
+                    call_id: Some("c1".to_string()),
+                    remote_id: None,
+                }
+            ],
+            ..Default::default()
+        });
+        space.record_recall_usage(&[message]).await.unwrap();
+
+        // One correction + a full settlement (decay + schema audit).
+        seed_kip(
+            &space,
+            &format!(
+                "UPDATE ?link\nSET METADATA {{ superseded: true }}\nWHERE {{ ?link (id: \"{}\") }}",
+                ids[1]
+            ),
+        )
+        .await;
+        space
+            .settle_memory_metabolism(MaintenanceScope::Full, now_ms)
+            .await
+            .unwrap();
+
+        let status = space.memory_status().await;
+        assert_eq!(status.metrics.probe_hits, 1);
+        assert_eq!(status.metrics.probe_misses, 1);
+        assert_eq!(status.metrics.negative_cache_hits, 1);
+        assert_eq!(status.metrics.recalls_completed, 1);
+        assert_eq!(status.metrics.entities_recalled, 1);
+        assert_eq!(status.metrics.corrections, 1);
+        assert_eq!(status.metrics.reinforced, 1);
+        assert_eq!(status.probe_hit_rate, Some(0.5));
+        assert_eq!(status.correction_rate, Some(1.0));
+        assert!(status.graph.concepts > 0);
+        assert!(status.graph.predicate_types.unwrap_or(0) >= 1);
+        assert!(status.last_settlement.is_some());
+
+        // The full settlement also refreshed the per-predicate census.
+        let audit = space.schema_audit().expect("schema audit stored");
+        assert_eq!(audit.predicates.get("linked_to"), Some(&2));
+    }
+
+    /// Shadow judge: always votes for answer B — with deterministic A/B
+    /// alternation this splits the wins 1:1, proving the swap works.
+    #[derive(Debug)]
+    struct ShadowJudgeCompleter;
+
+    impl CompletionFeaturesDyn for ShadowJudgeCompleter {
+        fn model_name(&self) -> String {
+            "shadow-judge-model".to_string()
+        }
+
+        fn completion(&self, _req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+            Box::pin(async move {
+                Ok(AgentOutput {
+                    content: serde_json::json!({"winner": "b", "reason": "richer"}).to_string(),
+                    usage: Usage {
+                        input_tokens: 5,
+                        output_tokens: 2,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn shadow_eval_compares_policies_without_touching_live_space() {
+        let app = test_app_state_with_final_model("shadow_eval");
+        let space = create_loaded_space(&app, "shadow_eval").await;
+        space.set_judge_model_for_test(Model::with_completer(Arc::new(ShadowJudgeCompleter)));
+
+        // Two completed recall conversations: one stores a serialized
+        // RecallInput, one a raw query string.
+        for (id_suffix, prompt) in [
+            (1u64, r#"{"query": "What tea do I drink?"}"#),
+            (2u64, "Where do I work?"),
+        ] {
+            let now = unix_ms() + id_suffix;
+            let conversation = Conversation {
+                user: SELF_USER_ID,
+                status: ConversationStatus::Completed,
+                messages: vec![serde_json::json!(Message {
+                    role: "user".to_string(),
+                    content: vec![prompt.to_string().into()],
+                    ..Default::default()
+                })],
+                label: Some("recall".to_string()),
+                created_at: now,
+                updated_at: now,
+                ..Default::default()
+            };
+            space
+                .recall
+                .conversations
+                .add_conversation(ConversationRef::from(&conversation))
+                .await
+                .unwrap();
+        }
+
+        let candidate = crate::types::MemoryPolicy {
+            confidence_decay_factor: 0.9,
+            ..Default::default()
+        };
+        let report = app
+            .run_shadow_eval(
+                "shadow_eval",
+                crate::types::ShadowEvalInput {
+                    policy: candidate.clone(),
+                    replay_sample: Some(2),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(report.replayed, 2, "{report:?}");
+        assert_eq!(report.judge_errors, 0, "{report:?}");
+        // The judge always votes "B"; the deterministic order alternation
+        // maps that to one win per side.
+        assert_eq!(report.candidate_wins, 1, "{report:?}");
+        assert_eq!(report.baseline_wins, 1, "{report:?}");
+        assert_eq!(report.samples.len(), 2);
+        assert_eq!(report.candidate_policy.confidence_decay_factor, 0.9);
+
+        // The report persists on the live space...
+        let stored: crate::types::ShadowReport = space
+            .db
+            .get_extension_as("shadow_report")
+            .expect("report stored");
+        assert_eq!(stored.replayed, 2);
+        // ...while the live space itself stayed untouched: no policy change,
+        // no usage recorded by the fork replays (plan guardrail 4).
+        assert_eq!(space.memory_policy(), crate::types::MemoryPolicy::default());
+        assert_eq!(space.memory_status().await.metrics.recalls_completed, 0);
     }
 
     #[tokio::test]

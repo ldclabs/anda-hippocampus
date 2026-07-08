@@ -366,6 +366,11 @@ pub struct UpdateSpaceInput {
     /// documents (replaces the whole map when present).
     #[serde(default)]
     pub wiki_acl_defaults: Option<BTreeMap<String, String>>,
+    /// Replaces the space's memory policy (validated before applying).
+    /// Absent policy means [`MemoryPolicy::default`], which reproduces the
+    /// compiled-in behavior.
+    #[serde(default)]
+    pub memory_policy: Option<MemoryPolicy>,
 }
 
 #[derive(Debug, Default, Serialize, Clone, PartialEq, Eq)]
@@ -592,6 +597,630 @@ pub struct MaintenanceParameters {
     pub orphan_max_count: Option<u32>,
 }
 
+/// Evolvable memory-policy knobs (memory evolution plan, module M-P; see
+/// `docs/memory_evolution_plan_cn.md`). Stored per space in the
+/// `"memory_policy"` extension — like the `"byok"` model config — and an
+/// absent policy means [`Default`], which reproduces the compiled-in
+/// behavior exactly, so introducing the policy is not a behavior change.
+///
+/// The policy is the L3 evolution genome: fields marked "consumed from Px"
+/// are declared ahead of their consumers so the schema stays stable across
+/// phases; setting them today validates and persists but has no effect yet.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryPolicy {
+    /// Schema version of this policy object.
+    #[serde(default = "MemoryPolicy::default_version")]
+    pub version: u32,
+
+    /// Confidence multiplier maintenance decay applies per cycle. Matches
+    /// the default documented in BrainMaintenance.md.
+    #[serde(default = "MemoryPolicy::default_confidence_decay_factor")]
+    pub confidence_decay_factor: f64,
+
+    /// Stability gain per successful recall use (consumed from P1).
+    #[serde(default = "MemoryPolicy::default_recall_reinforcement")]
+    pub recall_reinforcement: f64,
+
+    /// Confidence multiplier applied to corrected memories (consumed from P1).
+    #[serde(default = "MemoryPolicy::default_correction_penalty")]
+    pub correction_penalty: f64,
+
+    /// Lower bound decay may not push confidence below (consumed from P1).
+    #[serde(default = "MemoryPolicy::default_decay_floor")]
+    pub decay_floor: f64,
+
+    /// Events older than this are candidates for consolidation.
+    #[serde(default = "MemoryPolicy::default_stale_event_threshold_days")]
+    pub stale_event_threshold_days: u32,
+
+    /// Unsorted-inbox size that maintenance should keep the graph under.
+    #[serde(default = "MemoryPolicy::default_unsorted_max_backlog")]
+    pub unsorted_max_backlog: u32,
+
+    /// Orphan-concept count that maintenance should keep the graph under.
+    #[serde(default = "MemoryPolicy::default_orphan_max_count")]
+    pub orphan_max_count: u32,
+
+    /// Dream self-test queries per daydream cycle; 0 disables
+    /// (consumed from P2).
+    #[serde(default = "MemoryPolicy::default_self_test_queries_per_cycle")]
+    pub self_test_queries_per_cycle: u32,
+
+    /// Token budget for one self-test pass (consumed from P2).
+    #[serde(default = "MemoryPolicy::default_self_test_token_budget")]
+    pub self_test_token_budget: u64,
+
+    /// Semantic search threshold for recall-side probes (consumed from P1).
+    #[serde(default = "MemoryPolicy::default_recall_search_threshold")]
+    pub recall_search_threshold: f64,
+
+    /// Model-turn limit for one recall run (consumed from P1; until then the
+    /// compiled `RECALL_MAX_MODEL_TURNS` applies).
+    #[serde(default = "MemoryPolicy::default_recall_max_rounds")]
+    pub recall_max_rounds: u32,
+
+    /// Shadow-evolution replay sample size (consumed from P4).
+    #[serde(default = "MemoryPolicy::default_shadow_replay_sample")]
+    pub shadow_replay_sample: u32,
+}
+
+impl Default for MemoryPolicy {
+    fn default() -> Self {
+        Self {
+            version: Self::default_version(),
+            confidence_decay_factor: Self::default_confidence_decay_factor(),
+            recall_reinforcement: Self::default_recall_reinforcement(),
+            correction_penalty: Self::default_correction_penalty(),
+            decay_floor: Self::default_decay_floor(),
+            stale_event_threshold_days: Self::default_stale_event_threshold_days(),
+            unsorted_max_backlog: Self::default_unsorted_max_backlog(),
+            orphan_max_count: Self::default_orphan_max_count(),
+            self_test_queries_per_cycle: Self::default_self_test_queries_per_cycle(),
+            self_test_token_budget: Self::default_self_test_token_budget(),
+            recall_search_threshold: Self::default_recall_search_threshold(),
+            recall_max_rounds: Self::default_recall_max_rounds(),
+            shadow_replay_sample: Self::default_shadow_replay_sample(),
+        }
+    }
+}
+
+/// Process-wide policy override for optimizer runs (plan M10). Like the
+/// prompt override layer (`agents::prompts`), production never sets it: the
+/// eval CLI installs candidate policies here so run-scoped spaces (which
+/// have no stored policy) pick them up, and clears it when the run ends.
+static EVAL_POLICY_OVERRIDE: std::sync::RwLock<Option<MemoryPolicy>> = std::sync::RwLock::new(None);
+
+impl MemoryPolicy {
+    /// The space extension key the policy is stored under.
+    pub const EXTENSION_KEY: &'static str = "memory_policy";
+
+    /// The active eval policy override, when one is installed.
+    pub fn eval_override() -> Option<MemoryPolicy> {
+        EVAL_POLICY_OVERRIDE
+            .read()
+            .expect("policy override lock poisoned")
+            .clone()
+    }
+
+    /// Installs (`Some`) or clears (`None`) the process-wide eval override.
+    pub fn set_eval_override(policy: Option<MemoryPolicy>) {
+        *EVAL_POLICY_OVERRIDE
+            .write()
+            .expect("policy override lock poisoned") = policy;
+    }
+
+    fn default_version() -> u32 {
+        1
+    }
+    fn default_confidence_decay_factor() -> f64 {
+        0.95
+    }
+    fn default_recall_reinforcement() -> f64 {
+        0.1
+    }
+    fn default_correction_penalty() -> f64 {
+        0.5
+    }
+    // Matches the `confidence > 0.3` lower bound the maintenance prompt's
+    // decay pass has always used, so the default policy reproduces it.
+    fn default_decay_floor() -> f64 {
+        0.3
+    }
+    fn default_stale_event_threshold_days() -> u32 {
+        7
+    }
+    fn default_unsorted_max_backlog() -> u32 {
+        20
+    }
+    fn default_orphan_max_count() -> u32 {
+        20
+    }
+    fn default_self_test_queries_per_cycle() -> u32 {
+        4
+    }
+    fn default_self_test_token_budget() -> u64 {
+        20_000
+    }
+    fn default_recall_search_threshold() -> f64 {
+        0.35
+    }
+    fn default_recall_max_rounds() -> u32 {
+        7
+    }
+    // Matches the shadow-eval endpoint's default replay size (its hard cap
+    // is 16).
+    fn default_shadow_replay_sample() -> u32 {
+        4
+    }
+
+    /// Range checks; every f64 must be finite and every integer knob capped.
+    /// The caps matter as much as the floors: this object is settable over
+    /// HTTP by space managers, and unbounded budgets (e.g.
+    /// `self_test_queries_per_cycle`) would turn every maintenance cycle
+    /// into an unbounded LLM bill. Run before persisting so a bad policy can
+    /// never be stored, only rejected.
+    pub fn validate(&self) -> Result<(), BoxError> {
+        fn in_range(name: &str, value: f64, min_exclusive: f64, max: f64) -> Result<(), BoxError> {
+            if value.is_finite() && min_exclusive < value && value <= max {
+                Ok(())
+            } else {
+                Err(format!("memory policy `{name}` must be in ({min_exclusive}, {max}]").into())
+            }
+        }
+        fn int_range(name: &str, value: u64, min: u64, max: u64) -> Result<(), BoxError> {
+            if (min..=max).contains(&value) {
+                Ok(())
+            } else {
+                Err(format!("memory policy `{name}` must be in [{min}, {max}]").into())
+            }
+        }
+
+        in_range(
+            "confidence_decay_factor",
+            self.confidence_decay_factor,
+            0.0,
+            1.0,
+        )?;
+        in_range("correction_penalty", self.correction_penalty, 0.0, 1.0)?;
+        in_range(
+            "recall_search_threshold",
+            self.recall_search_threshold,
+            0.0,
+            1.0,
+        )?;
+        if !(self.recall_reinforcement.is_finite()
+            && (0.0..=1.0).contains(&self.recall_reinforcement))
+        {
+            return Err("memory policy `recall_reinforcement` must be in [0, 1]".into());
+        }
+        if !(self.decay_floor.is_finite() && (0.0..1.0).contains(&self.decay_floor)) {
+            return Err("memory policy `decay_floor` must be in [0, 1)".into());
+        }
+        int_range("version", u64::from(self.version), 1, u64::from(u32::MAX))?;
+        int_range(
+            "stale_event_threshold_days",
+            u64::from(self.stale_event_threshold_days),
+            1,
+            365,
+        )?;
+        int_range(
+            "unsorted_max_backlog",
+            u64::from(self.unsorted_max_backlog),
+            1,
+            10_000,
+        )?;
+        int_range(
+            "orphan_max_count",
+            u64::from(self.orphan_max_count),
+            1,
+            10_000,
+        )?;
+        // 0 disables the self-test.
+        int_range(
+            "self_test_queries_per_cycle",
+            u64::from(self.self_test_queries_per_cycle),
+            0,
+            100,
+        )?;
+        int_range(
+            "self_test_token_budget",
+            self.self_test_token_budget,
+            1_000,
+            1_000_000,
+        )?;
+        int_range(
+            "recall_max_rounds",
+            u64::from(self.recall_max_rounds),
+            1,
+            50,
+        )?;
+        int_range(
+            "shadow_replay_sample",
+            u64::from(self.shadow_replay_sample),
+            1,
+            16,
+        )?;
+        Ok(())
+    }
+
+    /// The maintenance-input view of this policy, passed to the Maintenance
+    /// agent on every cycle that does not carry explicit parameters.
+    pub fn maintenance_parameters(&self) -> MaintenanceParameters {
+        MaintenanceParameters {
+            stale_event_threshold_days: Some(self.stale_event_threshold_days),
+            confidence_decay_factor: Some(self.confidence_decay_factor),
+            unsorted_max_backlog: Some(self.unsorted_max_backlog),
+            orphan_max_count: Some(self.orphan_max_count),
+        }
+    }
+}
+
+/// One memory the recall trace shows was retrieved for an answer
+/// (memory evolution plan, module M4). Extracted deterministically from
+/// tool outputs — never from the model's own claims.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct MemoryCitation {
+    /// Graph entity id: `"C:<id>"` or `"P:<id>:<predicate>"`.
+    pub entity: String,
+
+    /// Concept type, or the predicate for propositions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+
+    /// `metadata.confidence` when the tool output carried it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+}
+
+/// Machine-readable recall result (memory evolution plan, module M4): the
+/// answer plus the provenance a business agent needs to decide whether to
+/// assert, hedge, or ask.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct RecallOutput {
+    /// The synthesized answer with the self-report footer stripped.
+    pub answer: String,
+
+    /// Whether the graph held relevant memory. From the model's self-report
+    /// when present, otherwise inferred from the retrieval trace.
+    pub found: bool,
+
+    /// Model-reported uncertainty, 0 (certain) ..= 1 (guessing).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uncertainty: Option<f64>,
+
+    /// Memories the retrieval trace shows were surfaced for this answer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memories: Vec<MemoryCitation>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<u64>,
+
+    pub usage: Usage,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_reason: Option<String>,
+}
+
+/// Per-source correction statistics (memory evolution plan, module M3),
+/// aggregated at settlement time into the `source_reliability` space
+/// extension. High correction counts mark a source whose facts deserve a
+/// lower initial confidence at encode time.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct SourceReliability {
+    pub corrections: u64,
+    pub last_corrected_at: u64,
+}
+
+/// Outcome of one deterministic memory-metabolism settlement
+/// (memory evolution plan, module M2). Stored in the `memory_settlement`
+/// space extension after every maintenance cycle.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct MemorySettlementReport {
+    pub settled_at: u64,
+
+    /// Propositions whose usage counters were flushed onto graph metadata.
+    pub reinforced: u64,
+
+    /// Propositions decayed by the bulk pass (full scope only).
+    pub decayed: u64,
+
+    /// Whether the decay pass ran this cycle.
+    pub decay_ran: bool,
+
+    /// Superseded memories newly observed and recorded as corrections.
+    pub new_corrections: u64,
+
+    /// Ledger rows whose graph flush failed and stayed dirty for the next
+    /// settlement to retry.
+    #[serde(default)]
+    pub flush_retries: u64,
+
+    /// Set when the bulk decay pass failed (e.g. the engine's full-scan
+    /// solution cap on large graphs) — decay did not complete this cycle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decay_error: Option<String>,
+
+    /// Set when the correction-discovery scan failed — new corrections were
+    /// not recorded this cycle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correction_scan_error: Option<String>,
+}
+
+/// Outcome of one dream self-test pass (memory evolution plan, module M7).
+/// Stored in the `memory_self_test` space extension.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct SelfTestReport {
+    pub tested_at: u64,
+
+    /// Memories probed this pass.
+    pub tested: u64,
+
+    /// Memories whose synthetic query surfaced them via search.
+    pub grounded: u64,
+
+    /// Review SleepTasks enqueued for ungroundable memories.
+    pub reencode_tasks: u64,
+
+    /// LLM cost of the query-generation call.
+    pub usage: Usage,
+}
+
+impl SelfTestReport {
+    /// Fraction of tested memories that search could surface; `None` when
+    /// nothing was tested.
+    pub fn groundability(&self) -> Option<f64> {
+        (self.tested > 0).then(|| self.grounded as f64 / self.tested as f64)
+    }
+}
+
+/// Input of the metamemory probe (memory evolution plan, module M5).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ProbeInput {
+    pub query: String,
+
+    /// Max hits to return (default 8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+/// Result of the metamemory probe: a cheap, LLM-free existence check that
+/// tells an agent whether a full recall is worth its latency and tokens.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ProbeOutput {
+    /// Whether the graph holds anything matching the query.
+    pub found: bool,
+
+    /// True when answered from the negative-knowledge cache without touching
+    /// the graph.
+    pub negative_cached: bool,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hits: Vec<MemoryCitation>,
+}
+
+/// Pins (or unpins) one graph entity (memory evolution plan, module M6).
+/// Pinned memories are exempt from confidence decay; entity ids come from
+/// `recall_structured` citations or probe hits.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MemoryPinInput {
+    /// `"C:<id>"` or `"P:<id>:<predicate>"`.
+    pub entity: String,
+
+    /// `true` to pin, `false` to unpin.
+    #[serde(default = "default_true")]
+    pub pinned: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Privacy-grade deletion request (memory evolution plan, module M6).
+/// Always run with `dry_run: true` first; the report shows what would go.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MemoryForgetInput {
+    /// Entity ids to delete: `"C:<id>"` (detaches and removes the concept
+    /// and all its propositions) or `"P:<id>:<predicate>"`.
+    pub entities: Vec<String>,
+
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct MemoryForgetReport {
+    pub dry_run: bool,
+    pub deleted_concepts: u64,
+    pub deleted_propositions: u64,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entities: Vec<MemoryForgetEntity>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct MemoryForgetEntity {
+    pub entity: String,
+
+    /// Whether the entity existed at request time.
+    pub existed: bool,
+
+    /// Deletion error for this entity, when one occurred (e.g. KIP_3004
+    /// protecting system nodes). Other entities still proceed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Incrementally-updated memory observability counters (memory evolution
+/// plan, module M12). Stored in the `memory_metrics` space extension; every
+/// memory-evolution module bumps its own counters at write time, so reading
+/// the status never requires heavy queries.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct MemoryMetrics {
+    /// Completed production recalls the usage ledger recorded.
+    pub recalls_completed: u64,
+
+    /// Graph entities those recalls surfaced (with repetition).
+    pub entities_recalled: u64,
+
+    /// Metamemory probes that found something.
+    pub probe_hits: u64,
+
+    /// Probes that found nothing (fresh misses).
+    pub probe_misses: u64,
+
+    /// Probes answered from the negative-knowledge cache.
+    pub negative_cache_hits: u64,
+
+    /// Memories checked by dream self-tests (cumulative).
+    pub self_test_tested: u64,
+
+    /// Of those, memories search could surface.
+    pub self_test_grounded: u64,
+
+    /// Review SleepTasks the self-test enqueued.
+    pub reencode_tasks: u64,
+
+    /// Corrections (superseded memories) settlement discovered.
+    pub corrections: u64,
+
+    /// Propositions decayed by settlement.
+    pub decayed: u64,
+
+    /// Propositions whose usage counters were flushed onto the graph.
+    pub reinforced: u64,
+
+    /// Structured recalls that carried an uncertainty self-report.
+    pub uncertainty_reports: u64,
+
+    /// Sum of reported uncertainties (mean = sum / reports).
+    pub uncertainty_sum: f64,
+
+    /// Entities physically removed by forget.
+    pub forgotten_entities: u64,
+
+    pub updated_at: u64,
+}
+
+/// The `memory_status` endpoint payload: counters plus derived rates and
+/// the latest module reports.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct MemoryStatus {
+    pub metrics: MemoryMetrics,
+
+    /// Cumulative self-test groundability (`self_test_grounded / tested`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub groundability: Option<f64>,
+
+    /// `probe_hits / (probe_hits + probe_misses)`; cache hits excluded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe_hit_rate: Option<f64>,
+
+    /// `corrections / recalls_completed` — how often remembered facts turn
+    /// out wrong relative to how often memory is used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correction_rate: Option<f64>,
+
+    /// Mean self-reported recall uncertainty; the calibration audit
+    /// (predicted vs actual corrections) builds on this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_uncertainty: Option<f64>,
+
+    /// Maintenance tokens spent per completed recall — the "memory ROI"
+    /// proxy: how much upkeep each act of remembering costs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maintenance_tokens_per_recall: Option<f64>,
+
+    pub graph: MemoryGraphCounters,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_settlement: Option<MemorySettlementReport>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_self_test: Option<SelfTestReport>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_shadow: Option<ShadowReport>,
+}
+
+/// Graph-level counters included in `memory_status`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct MemoryGraphCounters {
+    pub concepts: u64,
+    pub propositions: u64,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unsorted: Option<u64>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orphans: Option<u64>,
+
+    /// Registered `$PropositionType` count — the schema-sprawl indicator
+    /// (plan module M8).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub predicate_types: Option<u64>,
+}
+
+/// Per-predicate link census (memory evolution plan, module M8), stored in
+/// the `schema_audit` extension by full-scope settlements. Feeds both the
+/// schema-sprawl metric and the Maintenance prompt's merge guidance.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct SchemaAudit {
+    pub audited_at: u64,
+
+    /// Registered predicate → number of links using it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub predicates: BTreeMap<String, u64>,
+}
+
+/// Input of the on-demand shadow evaluation (memory evolution plan, module
+/// M11): compare a candidate memory policy against the current one on
+/// forked copies of this space, replaying recent real recall queries.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ShadowEvalInput {
+    /// The candidate policy to evaluate.
+    pub policy: MemoryPolicy,
+
+    /// Recent recall queries to replay (default 4, capped at 16 — every
+    /// query costs two recall runs plus a judge call).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_sample: Option<usize>,
+}
+
+/// Outcome of one shadow evaluation, stored in the `shadow_report`
+/// extension. Promotion stays human: read the report, then `update_space`
+/// with the candidate policy if it won.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ShadowReport {
+    pub compared_at: u64,
+    pub replayed: u64,
+    pub baseline_wins: u64,
+    pub candidate_wins: u64,
+    pub ties: u64,
+    pub judge_errors: u64,
+    pub candidate_policy: MemoryPolicy,
+
+    /// LLM cost of the whole comparison (replays + judging).
+    pub usage: Usage,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub samples: Vec<ShadowSample>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ShadowSample {
+    pub query: String,
+
+    /// `"baseline"` | `"candidate"` | `"tie"` | `"error"`.
+    pub winner: String,
+
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct CreateOrUpdateSpaceInput {
     pub user: Principal,
@@ -609,8 +1238,8 @@ pub struct GetOrInitUserInput {
 mod tests {
     use super::{
         CWToken, FormationInput, FormationInputRef, InputContext, MaintenanceInput,
-        MaintenanceScope, ModelConfig, RecallInput, RecallInputRef, SpaceTier, SpaceToken,
-        TokenScope,
+        MaintenanceScope, MemoryPolicy, ModelConfig, RecallInput, RecallInputRef, SpaceTier,
+        SpaceToken, TokenScope,
     };
     use anda_core::Principal;
     use anda_engine::model::ModelConfig as EngineModelConfig;
@@ -935,5 +1564,97 @@ mod tests {
             assert_eq!(scope.to_string(), wire);
         }
         assert!(MaintenanceScope::from_str("nightly").is_err());
+    }
+
+    #[test]
+    fn memory_policy_defaults_match_documented_maintenance_defaults() {
+        // These four values must stay in lockstep with the defaults the
+        // BrainMaintenance.md Input Format documents, so an unset policy is
+        // not a behavior change.
+        let policy = MemoryPolicy::default();
+        assert_eq!(policy.stale_event_threshold_days, 7);
+        assert_eq!(policy.confidence_decay_factor, 0.95);
+        assert_eq!(policy.unsorted_max_backlog, 20);
+        assert_eq!(policy.orphan_max_count, 20);
+        assert!(policy.validate().is_ok());
+
+        let parameters = policy.maintenance_parameters();
+        assert_eq!(parameters.stale_event_threshold_days, Some(7));
+        assert_eq!(parameters.confidence_decay_factor, Some(0.95));
+        assert_eq!(parameters.unsorted_max_backlog, Some(20));
+        assert_eq!(parameters.orphan_max_count, Some(20));
+    }
+
+    #[test]
+    fn memory_policy_validate_rejects_out_of_range_values() {
+        let cases: Vec<(MemoryPolicy, &str)> = vec![
+            (
+                MemoryPolicy {
+                    confidence_decay_factor: 0.0,
+                    ..Default::default()
+                },
+                "confidence_decay_factor",
+            ),
+            (
+                MemoryPolicy {
+                    confidence_decay_factor: f64::NAN,
+                    ..Default::default()
+                },
+                "confidence_decay_factor",
+            ),
+            (
+                MemoryPolicy {
+                    correction_penalty: 1.5,
+                    ..Default::default()
+                },
+                "correction_penalty",
+            ),
+            (
+                MemoryPolicy {
+                    recall_reinforcement: -0.1,
+                    ..Default::default()
+                },
+                "recall_reinforcement",
+            ),
+            (
+                MemoryPolicy {
+                    decay_floor: 1.0,
+                    ..Default::default()
+                },
+                "decay_floor",
+            ),
+            (
+                MemoryPolicy {
+                    stale_event_threshold_days: 0,
+                    ..Default::default()
+                },
+                "stale_event_threshold_days",
+            ),
+            (
+                MemoryPolicy {
+                    recall_max_rounds: 0,
+                    ..Default::default()
+                },
+                "recall_max_rounds",
+            ),
+        ];
+        for (policy, field) in cases {
+            let err = policy.validate().unwrap_err().to_string();
+            assert!(err.contains(field), "expected `{field}` in error: {err}");
+        }
+    }
+
+    #[test]
+    fn memory_policy_parses_partial_json_and_rejects_unknown_fields() {
+        // Partial JSON fills the rest with defaults, so stored policies stay
+        // readable when later phases add fields.
+        let policy: MemoryPolicy =
+            serde_json::from_str(r#"{"confidence_decay_factor": 0.9}"#).unwrap();
+        assert_eq!(policy.confidence_decay_factor, 0.9);
+        assert_eq!(policy.unsorted_max_backlog, 20);
+        assert_eq!(policy.version, 1);
+
+        // Typos fail loudly instead of silently configuring nothing.
+        assert!(serde_json::from_str::<MemoryPolicy>(r#"{"decay_factor": 0.9}"#).is_err());
     }
 }

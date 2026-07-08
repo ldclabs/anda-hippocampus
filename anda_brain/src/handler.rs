@@ -202,6 +202,240 @@ pub async fn post_recall(
     Ok(ct.response(RpcResponse::success(rt)))
 }
 
+/// POST /v1/{space_id}/recall_structured
+///
+/// Recall with machine-readable provenance (memory evolution plan, M4):
+/// answer + trace-derived memory citations + the model's self-reported
+/// `found`/`uncertainty`, so callers can decide to assert, hedge, or ask.
+pub async fn post_recall_structured(
+    State(app): State<AppState>,
+    Path(space_id): Path<String>,
+    Accept(ct, _): Accept,
+    HeaderVals(token, sharding): HeaderVals,
+    body: Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    ensure_sharding(&app, sharding)?;
+
+    let input: StringOr<RecallInput> = ct.parse_body(&body).map_err(AppError::bad_request)?;
+
+    let now_ms = unix_ms();
+    let t = app
+        .check_auth_if(&token, &space_id, TokenScope::Read, now_ms)
+        .map_err(|_| AppError::unauthorized())?;
+
+    let space = app
+        .load_space(&space_id, false)
+        .await
+        .map_err(AppError::bad_request)?;
+
+    if !space.is_public() && t.is_none() {
+        space
+            .verify_space_token(token, TokenScope::Read, now_ms)
+            .map_err(|_| AppError::unauthorized())?;
+    }
+
+    let rt = space
+        .query_structured(SELF_USER_ID, input)
+        .await
+        .map_err(AppError::bad_request)?;
+    Ok(ct.response(RpcResponse::success(rt)))
+}
+
+/// POST /v1/{space_id}/probe
+///
+/// Metamemory existence check (memory evolution plan, M5): LLM-free hybrid
+/// search that tells the caller whether a full recall is worth paying for.
+pub async fn post_probe(
+    State(app): State<AppState>,
+    Path(space_id): Path<String>,
+    Accept(ct, _): Accept,
+    HeaderVals(token, sharding): HeaderVals,
+    body: Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    ensure_sharding(&app, sharding)?;
+
+    let input: StringOr<ProbeInput> = ct.parse_body(&body).map_err(AppError::bad_request)?;
+    // A bare string body is the query itself.
+    let input = match input {
+        StringOr::String(query) => ProbeInput { query, limit: None },
+        StringOr::Value(input) => input,
+    };
+
+    let now_ms = unix_ms();
+    let t = app
+        .check_auth_if(&token, &space_id, TokenScope::Read, now_ms)
+        .map_err(|_| AppError::unauthorized())?;
+
+    let space = app
+        .load_space(&space_id, false)
+        .await
+        .map_err(AppError::bad_request)?;
+
+    if !space.is_public() && t.is_none() {
+        space
+            .verify_space_token(token, TokenScope::Read, now_ms)
+            .map_err(|_| AppError::unauthorized())?;
+    }
+
+    let rt = space
+        .probe_memory(&input.query, input.limit)
+        .await
+        .map_err(AppError::bad_request)?;
+    Ok(ct.response(RpcResponse::success(rt)))
+}
+
+/// POST /v1/{space_id}/memory/pin
+///
+/// Pins/unpins a graph entity (memory evolution plan, M6); pinned memories
+/// are exempt from confidence decay.
+pub async fn post_memory_pin(
+    State(app): State<AppState>,
+    Path(space_id): Path<String>,
+    Accept(ct, _): Accept,
+    HeaderVals(token, sharding): HeaderVals,
+    body: Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    ensure_sharding(&app, sharding)?;
+
+    let input: StringOr<MemoryPinInput> = ct.parse_body(&body).map_err(AppError::bad_request)?;
+    let input = input
+        .value()
+        .map_err(|_| AppError::bad_request("expected a JSON object body".to_string()))?;
+
+    let now_ms = unix_ms();
+    let t = app
+        .check_auth_if(&token, &space_id, TokenScope::Write, now_ms)
+        .map_err(|_| AppError::unauthorized())?;
+
+    let space = app
+        .load_space(&space_id, false)
+        .await
+        .map_err(AppError::bad_request)?;
+
+    if t.is_none() {
+        space
+            .verify_space_token(token, TokenScope::Write, now_ms)
+            .map_err(|_| AppError::unauthorized())?;
+    }
+
+    let updated = space
+        .pin_memory(&input.entity, input.pinned)
+        .await
+        .map_err(AppError::bad_request)?;
+    Ok(ct.response(RpcResponse::success(json!({
+        "entity": input.entity,
+        "pinned": input.pinned,
+        "updated": updated,
+    }))))
+}
+
+/// POST /v1/{space_id}/memory/forget
+///
+/// Privacy-grade deletion (memory evolution plan, M6). Run with
+/// `dry_run: true` first; the report shows what would be removed.
+pub async fn post_memory_forget(
+    State(app): State<AppState>,
+    Path(space_id): Path<String>,
+    Accept(ct, _): Accept,
+    HeaderVals(token, sharding): HeaderVals,
+    body: Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    ensure_sharding(&app, sharding)?;
+
+    let input: StringOr<MemoryForgetInput> = ct.parse_body(&body).map_err(AppError::bad_request)?;
+    let input = input
+        .value()
+        .map_err(|_| AppError::bad_request("expected a JSON object body".to_string()))?;
+
+    let now_ms = unix_ms();
+    let t = app
+        .check_auth_if(&token, &space_id, TokenScope::Write, now_ms)
+        .map_err(|_| AppError::unauthorized())?;
+
+    let space = app
+        .load_space(&space_id, false)
+        .await
+        .map_err(AppError::bad_request)?;
+
+    if t.is_none() {
+        space
+            .verify_space_token(token, TokenScope::Write, now_ms)
+            .map_err(|_| AppError::unauthorized())?;
+    }
+
+    let rt = space
+        .forget_memory(input)
+        .await
+        .map_err(AppError::bad_request)?;
+    Ok(ct.response(RpcResponse::success(rt)))
+}
+
+/// GET /v1/{space_id}/memory_status
+///
+/// Memory observability snapshot (memory evolution plan, M12):
+/// incrementally-maintained counters, derived rates, graph counts, and the
+/// latest settlement/self-test/shadow reports.
+pub async fn get_memory_status(
+    State(app): State<AppState>,
+    Path(space_id): Path<String>,
+    Accept(ct, _): Accept,
+    HeaderVals(token, sharding): HeaderVals,
+) -> Result<impl IntoResponse, AppError> {
+    ensure_sharding(&app, sharding)?;
+
+    let now_ms = unix_ms();
+    let t = app
+        .check_auth_if(&token, &space_id, TokenScope::Read, now_ms)
+        .map_err(|_| AppError::unauthorized())?;
+
+    let space = app
+        .load_space(&space_id, false)
+        .await
+        .map_err(AppError::bad_request)?;
+
+    if !space.is_public() && t.is_none() {
+        space
+            .verify_space_token(token, TokenScope::Read, now_ms)
+            .map_err(|_| AppError::unauthorized())?;
+    }
+
+    let rt = space.memory_status().await;
+    Ok(ct.response(RpcResponse::success(rt)))
+}
+
+/// POST /v1/{space_id}/management/shadow_eval
+///
+/// On-demand shadow evaluation (memory evolution plan, M11): compares a
+/// candidate memory policy against the current one on forked copies of the
+/// space, replaying recent real recall queries. Expensive (LLM replays +
+/// judging); management-scoped.
+pub async fn post_shadow_eval(
+    State(app): State<AppState>,
+    Path(space_id): Path<String>,
+    Accept(ct, _): Accept,
+    HeaderVals(token, sharding): HeaderVals,
+    body: Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    ensure_sharding(&app, sharding)?;
+
+    let now_ms = unix_ms();
+    let _ = app
+        .check_auth(&token, &space_id, TokenScope::Write, now_ms)
+        .map_err(|_| AppError::unauthorized())?;
+
+    let input: ShadowEvalInput = ct
+        .parse_body(&body)
+        .map_err(AppError::bad_request)?
+        .value()
+        .map_err(|_| AppError::bad_request("expected a JSON object body".to_string()))?;
+
+    let rt = app
+        .run_shadow_eval(&space_id, input)
+        .await
+        .map_err(AppError::bad_request)?;
+    Ok(ct.response(RpcResponse::success(rt)))
+}
+
 // ─── Wiki ─────────────────────────────────────────────────────────────────────
 
 fn wiki_error(err: WikiError) -> AppError {

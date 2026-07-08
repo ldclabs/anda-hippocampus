@@ -760,6 +760,8 @@ For each pending task: mark `in_progress` → execute `requested_action` → mar
 | `review`                  | Assess and log findings without changing                                           |
 | `resolve_contradiction`   | Reconcile conflicting facts: supersede the older, strengthen the current (Phase 9) |
 
+> **Self-test review tasks** (`metadata.source == "memory_self_test"`): the runtime's dream self-test found that a search query which *should* retrieve this memory did not surface it — the memory exists but is badly encoded for retrieval. For these `review` tasks, actively **re-encode the target concept**: add `aliases` a user would actually say, enrich the `description` with the everyday vocabulary from the task's `reason`, and link it to the right topic domain(s). Then mark the task `completed` with what you changed in `result`.
+
 ```prolog
 // State transitions
 UPSERT {
@@ -967,34 +969,23 @@ WHERE {
 
 `MERGE` repoints every incident link (preserving link IDs and higher-order references), unions `aliases` (the duplicate's `name` joins the canonical node's `aliases`, so no grounding path is lost), fills missing attributes (canonical wins on conflict), records `_merged_from`, and deletes the duplicate — one transaction, no half-merged state. If the duplicate held *better* attribute values than the canonical node, `UPSERT` those onto the canonical node **before** merging, since `MERGE` never overwrites existing target values. Log the merge to `maintenance_log`.
 
-### Phase 7: Confidence Decay
+**Schema metabolism (predicate sprawl)**: Formation may define near-synonym predicates over time (`prefers` / `likes` / `favors`), which fragments retrieval. Once per full cycle, `DESCRIBE PROPOSITION TYPES` and look for semantic duplicates among *non-core* predicates (never touch `belongs_to_domain`, `assigned_to`, or other CoreSchema definitions — KIP_3004 protects them anyway). To retire a duplicate predicate: in bounded batches (≤50 links), re-create each link under the canonical predicate copying its metadata, `DELETE PROPOSITIONS` the old links, then delete the empty `$PropositionType` definition. Log every migration to `maintenance_log` with before/after counts. When unsure whether two predicates are truly synonymous, leave them and record a `review` SleepTask instead — a wrong merge is worse than sprawl.
 
-Apply `new_confidence = old_confidence × decay_factor` (default `0.95`/week) to old unverified facts. One bulk `UPDATE` with a predicate variable covers all predicates atomically — no per-link, per-predicate iteration:
+### Phase 7: Confidence Decay (runtime-settled)
 
-```prolog
-UPDATE ?link
-SET METADATA {
-  confidence: CLAMP(MUL(?link.metadata.confidence, :decay_factor), 0.0, 1.0),
-  decay_applied_at: :timestamp
-}
-WHERE {
-  ?link (?s, ?p, ?o)
-  FILTER(?p != "belongs_to_domain")
-  FILTER(IS_NULL(?link.metadata.superseded) || ?link.metadata.superseded != true)
-  FILTER(IS_NOT_NULL(?link.metadata.created_at))
-  FILTER(?link.metadata.created_at < :decay_threshold)
-  FILTER(?link.metadata.confidence > 0.3 && ?link.metadata.confidence < 1.0)
-}
-LIMIT 500
-```
+**Do NOT run bulk decay `UPDATE`s yourself.** The runtime settles confidence decay deterministically before every full cycle, usage-modulated from real recall statistics:
 
-**Strength-aware (asymmetric) decay** — "use it or lose it": decay is not uniform. Reinforced memories resist it; neglected ones fade faster. Run **two passes with different factors and disjoint filters** instead of one uniform pass:
-- Strong (high `evidence_count`, recent `last_observed`, or high `salience_score`): decay slowly or skip (factor `0.98`+).
-- Never-reinforced, low-salience facts: decay faster (factor `0.90`) so the graph self-prunes stale clutter.
+- The runtime maintains `last_recalled_at` and `recall_count` on link metadata (flushed from its usage ledger each cycle). Recently recalled links resist decay ("use it or lose it" enforced by code, not judgment).
+- Superseded, pinned, `belongs_to_domain`, and `confidence: 1.0` system-truth links are exempt; decay stops at the policy floor and is rate-limited to its weekly cadence via `decay_applied_at`.
+- The factor and floor come from the space's MemoryPolicy (the `parameters` in your input reflect it).
 
-KIP keeps no engine-side access statistics (reads stay reads): "recently recalled" is visible only as reinforcement — re-confirmed facts get `evidence_count` / `last_observed` refreshed. Low recall frequency alone is not evidence of low importance.
+Your job in this phase is only the semantic residue the runtime cannot judge:
 
-**Do NOT decay**: `confidence: 1.0` system truths (the `< 1.0` filter above); schema definitions (`$ConceptType`/`$PropositionType`); core `belongs_to_domain` for CoreSchema (the `?p` filter above); recently-verified facts (`evidence_count` increased this cycle).
+- Re-confirmed facts: refresh `evidence_count` / `last_observed` when this cycle's consolidation re-validated a fact (reinforcement stays a semantic call).
+- Memories flagged for review (e.g. metadata `needs_review: true`): decide re-confirm vs archive.
+- `salience_score` adjustments for Events remain yours (Phase 1).
+
+Low recall frequency alone is not evidence of low importance — the runtime's decay already accounts for recency; do not additionally punish rarely-queried but valid facts.
 
 ---
 

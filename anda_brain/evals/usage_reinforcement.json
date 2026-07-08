@@ -1,0 +1,76 @@
+{
+  "id": "usage_reinforcement",
+  "description": "Verifies the usage-feedback loop (plan M1/M2): a recalled memory's usage statistics are flushed onto graph metadata by maintenance settlement, so reinforced memories resist decay.",
+  "hidden_profile": {
+    "drink": {
+      "morning_preference": "oolong tea, brewed strong"
+    }
+  },
+  "default_context": {
+    "counterparty": "user_042",
+    "agent": "eval_agent",
+    "source": "longitudinal_eval",
+    "topic": "beverage_preferences"
+  },
+  "timeline": [
+    {
+      "turn": 1,
+      "type": "normal",
+      "timestamp": "2026-05-01T08:00:00Z",
+      "user": "I drink strong oolong tea every morning, please remember that."
+    },
+    {
+      "turn": 2,
+      "type": "checkpoint_synthetic",
+      "timestamp": "2026-05-02T08:00:00Z",
+      "query": "What do I drink in the morning?",
+      "evaluation": {
+        "scoring_rubric": "The answer should recall the strong oolong tea morning preference.",
+        "required_answer_terms": ["oolong"],
+        "expected_memories": [
+          {
+            "id": "tea_preference",
+            "description": "User drinks strong oolong tea every morning.",
+            "mode": "should_exist",
+            "probe": {
+              "command": "SEARCH CONCEPT \"oolong tea morning preference\" MODE \"semantic\" THRESHOLD 0.5 LIMIT 10",
+              "readonly": true
+            },
+            "answer_terms": ["oolong"]
+          }
+        ]
+      }
+    },
+    {
+      "turn": 3,
+      "type": "maintenance",
+      "timestamp": "2026-05-02T09:00:00Z",
+      "maintenance": {
+        "trigger": "on_demand",
+        "scope": "quick",
+        "timestamp": "2026-05-02T09:00:00Z"
+      }
+    },
+    {
+      "turn": 4,
+      "type": "checkpoint_synthetic",
+      "timestamp": "2026-05-03T08:00:00Z",
+      "query": "Remind me what my morning drink is.",
+      "evaluation": {
+        "scoring_rubric": "The answer should still recall the oolong preference; the graph should now carry runtime usage metadata from the settled recall of turn 2.",
+        "required_answer_terms": ["oolong"],
+        "expected_memories": [
+          {
+            "id": "reinforced_usage_metadata",
+            "description": "Settlement flushed last_recalled_at/recall_count onto at least one recalled link (plan M2 step 1).",
+            "mode": "should_exist",
+            "probe": {
+              "command": "FIND(?link) WHERE { ?link (?s, ?p, ?o) FILTER(IS_NOT_NULL(?link.metadata.last_recalled_at)) } LIMIT 10",
+              "readonly": true
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

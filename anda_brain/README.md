@@ -98,6 +98,78 @@ Consolidates, prunes, and optimizes the knowledge graph during scheduled or on-d
 - Non-destructive principle — archives before deleting, decays confidence rather than removing.
 - Async execution — returns immediately with conversation ID; actual processing in background.
 
+**Memory policy:** each space carries an evolvable `MemoryPolicy` (stored in
+the `memory_policy` extension, set via `update_space`) that holds the numeric
+knobs of memory behavior — decay factor and floor, stale-event threshold,
+backlog targets, and (from later phases) self-test and recall parameters.
+Maintenance cycles without explicit `parameters` run under the space's
+policy; an absent policy means the compiled-in defaults, so setting nothing
+changes nothing. The policy is the evolution genome of
+`docs/memory_evolution_plan_cn.md` (module M-P).
+
+**Usage-modulated metabolism (selection pressure):** every completed recall
+records which graph entities it actually surfaced into an off-graph usage
+ledger (`memory_usage` collection). Before each maintenance cycle the runtime
+runs a deterministic settlement: recalled propositions get their
+`last_recalled_at` / `recall_count` flushed onto graph metadata; full cycles
+then run the bulk confidence decay in code (usage-modulated — recently
+recalled, pinned, and superseded links are exempt; weekly rate-limited via
+`decay_applied_at`); newly superseded links are recorded as corrections and
+aggregated per source into the `source_reliability` extension. The LLM
+maintenance agent no longer runs bulk decay itself — "use it or lose it" is
+enforced by code, and reads stay reads (recall never mutates the graph it
+queries). The last settlement report is stored in the `memory_settlement`
+extension.
+
+> **Known scale ceiling:** the bulk decay, correction discovery, and
+> self-test sampling passes use unconstrained full-scan KQL, and the engine
+> caps full-scan solutions at 65,536 (`KIP_4002`) regardless of `LIMIT`.
+> On graphs past ~65k propositions these passes stop working; the failure
+> is loud (`log::error` + `decay_error`/`correction_scan_error` in the
+> settlement report and `memory_status`), but the fix — predicate-sharded
+> scans — is not implemented yet. Watch those report fields in production.
+
+**Dream self-test (self-repair):** after each maintenance cycle completes,
+the runtime samples recent memories with no usage evidence, generates one
+natural probe query per memory (a single LLM call, budgeted by
+`MemoryPolicy.self_test_queries_per_cycle`), and checks deterministically
+whether search actually surfaces them. Unfindable memories become pending
+`review` SleepTasks (source `memory_self_test`) that the next full cycle
+re-encodes with aliases and richer descriptions. Self-test retrievals count
+only into the ledger's isolated `self_test_count` — the brain testing itself
+never reinforces its own memories. The pass report lives in the
+`memory_self_test` extension and surfaces as the `groundability` graph stat.
+
+**Metamemory:** `POST /v1/{space_id}/probe` answers "do I know anything
+about this?" with pure search — no LLM, no recall cost. Queries that find
+nothing are remembered in a negative-knowledge cache (cleared whenever
+formation completes, 1h TTL backstop), so agents stop paying to hit the same
+wall. The intended contract: probe first, and only pay for a full recall
+when `found` is true.
+
+**Memory observability:** `GET /v1/{space_id}/memory_status` returns
+incrementally-maintained counters (recalls, probe hits/misses, self-test
+groundability, corrections, decay/reinforcement, forget) plus derived rates
+(probe hit rate, correction rate, mean self-reported uncertainty,
+maintenance tokens per recall — the memory-ROI proxy), graph counts
+including the `predicate_types` schema-sprawl indicator, and the latest
+settlement / self-test / shadow reports. Writers bump counters at write
+time; reading the status never runs heavy queries. Full-scope settlements
+also refresh a per-predicate link census (`schema_audit` extension) that
+backs the Maintenance prompt's predicate-merge guidance.
+
+**Shadow evaluation (safe policy canary):**
+`POST /v1/{space_id}/management/shadow_eval` compares a candidate
+`MemoryPolicy` against the current one on the **production distribution**:
+the space is forked twice into isolated in-memory stores (baseline vs
+candidate policy), both forks are settled, recent real recall queries are
+replayed on each, and the judge blind-compares the answers with
+deterministic A/B order alternation. The live space is only read — replays
+can never pollute its conversations, usage ledger, or metrics. The report
+(wins/ties/samples/usage) persists in the `shadow_report` extension;
+promotion stays human: read the report, then `update_space` with the
+candidate policy if it won.
+
 ## Longitudinal Evaluation
 
 Anda Brain includes an eval-first harness in `anda_brain::eval`. It drives the
@@ -168,20 +240,40 @@ Beyond the basic replay loop, the harness supports:
   formation LLM variance as a confound — and the most expensive phase runs
   once instead of once per profile. Requires all user turns to precede the
   first checkpoint (validated); use the default interleaved mode otherwise.
-- **Prompt optimization** — `--optimize formation|recall|maintenance|auto`
-  runs an offline evolution loop with the eval suite as fitness: attributed
-  failures are fed to an optimizer LLM that proposes surgical find/replace
-  edits to the responsible agent prompt; the candidate suite must beat the
-  baseline beyond the sampling noise band to be kept, otherwise it is
-  reverted. Accepted prompts and the full decision log are written to
+- **Prompt & policy optimization** — `--optimize
+  formation|recall|maintenance|auto|policy` runs an offline evolution loop
+  with the eval suite as fitness. Prompt genomes get surgical find/replace
+  edits from an optimizer LLM; the `policy` genome mutates the numeric
+  `MemoryPolicy` knobs instead (1–3 bounded ±50% steps per generation,
+  range-validated — cheaper to evaluate and safer to apply). Candidates must
+  beat the baseline beyond the sampling noise band or they are reverted.
+  Accepted prompts (`Brain*.md`), the accepted policy
+  (`memory_policy.json`), and the full decision log are written to
   `--optimize-out` (default `./eval_optimize`) for human review — nothing is
-  written back to `assets/`. Two caveats to keep in mind when reading
-  optimize results: the noise band only covers Recall sampling variance
-  (`checkpoint_samples`) — each generation re-runs formation, whose LLM
-  variance is *not* in the band, so prefer more scenarios and samples over
-  trusting a single close call; and the judge runs on the same model that
-  powers the agents, so judge scores share that model's blind spots. Treat
-  accepted prompts as candidates for human review, not as ground truth.
+  written back to `assets/`. Note: the noise band only covers Recall
+  sampling variance (`checkpoint_samples`) — each generation re-runs
+  formation, whose LLM variance is *not* in the band, so prefer more
+  scenarios and samples over trusting a single close call.
+- **Holdout gate (anti-overfitting)** — `--holdout-scenario <file>` (with
+  `--optimize`) runs a held-out suite whenever train accepts a candidate: a
+  train win that drops the holdout total more than `holdout_epsilon`
+  (default 0.01) below its baseline is rejected as overfitting, and the
+  per-generation holdout totals land in the optimize report.
+- **Independent judge** — `--judge-model-name/-api-key/-api-base/-family`
+  (env `JUDGE_MODEL_*`) route all judge completions (checkpoint scoring and
+  semantic assertion probes) to a separate model, so judge scores stop
+  sharing the evaluated system's blind spots. An empty API key keeps the
+  old same-model behavior.
+- **Scenario mining** — `--mine` (with `--space-id` pointing at an existing
+  space) distills the space's correction ledger into new eval scenarios:
+  each superseded memory plus its source-conversation excerpts is handed to
+  an LLM that writes a correction-replay scenario (strictly parsed and
+  validated like hand-written fixtures, obvious PII scrubbed from both LLM
+  input and output). Results land in `--mine-out` (default
+  `anda_brain/evals/mined/`, deliberately *outside* the auto-validated
+  `evals/*.json` glob) and require human review before promotion into the
+  train or holdout suites. This is how the fitness function grows toward
+  the production failure distribution.
 - **Hermetic runs & cleanup** — every run executes in freshly created,
   run-scoped spaces named `{space_id}_{profile}_{scenario}_{run_id}`
   (lowercased to AndaDB's `[a-z0-9_]` charset and capped at 64 chars with a
@@ -325,6 +417,12 @@ Detailed API docs (with TypeScript request/response types):
 | `GET`   | `/v1/{space_id}/formation_status`                      | Get formation status (lightweight endpoint for monitoring formation progress) | `read` (CWT or space token)  |
 | `POST`  | `/v1/{space_id}/formation`                             | Submit messages for memory encoding                                           | `write` (CWT or space token) |
 | `POST`  | `/v1/{space_id}/recall`                                | Query memory with natural language                                            | `read` (CWT or space token)  |
+| `POST`  | `/v1/{space_id}/recall_structured`                     | Recall with machine-readable provenance (citations, found, uncertainty)       | `read` (CWT or space token)  |
+| `POST`  | `/v1/{space_id}/probe`                                 | LLM-free metamemory existence check with negative-knowledge caching           | `read` (CWT or space token)  |
+| `POST`  | `/v1/{space_id}/memory/pin`                            | Pin/unpin a memory (pinned memories are exempt from confidence decay)         | `write` (CWT or space token) |
+| `POST`  | `/v1/{space_id}/memory/forget`                         | Privacy-grade deletion (dry-run supported; physically removes, not archives)  | `write` (CWT or space token) |
+| `GET`   | `/v1/{space_id}/memory_status`                         | Memory observability: usage/probe/self-test counters, rates, graph counts    | `read` (CWT or space token)  |
+| `POST`  | `/v1/{space_id}/management/shadow_eval`                | Compare a candidate memory policy on forked copies (recent-recall replay)     | `write` (CWT)                |
 | `POST`  | `/v1/{space_id}/maintenance`                           | Trigger maintenance cycle                                                     | `write` (CWT or space token) |
 | `POST`  | `/v1/{space_id}/execute_kip_readonly`                  | Execute a KIP request (read-only mode, suitable for queries)                  | `read` (CWT or space token)  |
 | `GET`   | `/v1/{space_id}/conversations/{conversation_id}`       | Get one conversation detail                                                   | `read` (CWT or space token)  |
@@ -333,7 +431,7 @@ Detailed API docs (with TypeScript request/response types):
 | `GET`   | `/v1/{space_id}/management/space_tokens`               | List space tokens                                                             | `write` (CWT)                |
 | `POST`  | `/v1/{space_id}/management/add_space_token`            | Add a space token                                                             | `write` (CWT)                |
 | `POST`  | `/v1/{space_id}/management/revoke_space_token`         | Revoke a space token                                                          | `write` (CWT)                |
-| `PATCH` | `/v1/{space_id}/management/update_space`               | Update space information (name, description, public/private)                  | `write` (CWT)                |
+| `PATCH` | `/v1/{space_id}/management/update_space`               | Update space information (name, description, public/private, memory policy)   | `write` (CWT)                |
 | `PATCH` | `/v1/{space_id}/management/restart_formation`          | Restart a formation task                                                      | `write` (CWT)                |
 | `GET`   | `/v1/{space_id}/management/space_byok`                 | Get BYOK (Bring Your Own Key) configuration                                   | `write` (CWT)                |
 | `PATCH` | `/v1/{space_id}/management/space_byok`                 | Update BYOK (Bring Your Own Key) configuration                                | `write` (CWT)                |

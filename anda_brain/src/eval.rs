@@ -6,6 +6,7 @@
 //! that points back to Formation, Recall, or Maintenance behavior.
 
 pub mod judge;
+pub mod mine;
 pub mod optimize;
 
 use anda_core::{AgentOutput, BoxError, CompletionRequest, ContentPart, Json, Message, Usage};
@@ -22,10 +23,17 @@ use tokio::time::{Instant, sleep};
 
 use crate::{
     agents::SELF_USER_ID,
+    assess::{
+        self, AssessContext, DEFAULT_ASSERTION_SEARCH_LIMIT, DEFAULT_ASSERTION_SEARCH_THRESHOLD,
+        assertion_search_command, response_hit_count,
+    },
     payload::StringOr,
     space::Space,
     types::{FormationInput, InputContext, MaintenanceInput, MaintenanceScope, RecallInput},
 };
+
+// Re-exported from `assess` (their new home) for API stability.
+pub use crate::assess::{RecallTrace, ToolTrace};
 
 const DEFAULT_WAIT_TIMEOUT_MS: u64 = 180_000;
 const DEFAULT_POLL_INTERVAL_MS: u64 = 250;
@@ -423,100 +431,6 @@ impl From<AgentOutput> for EvalAgentResult {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct RecallTrace {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tools: Vec<ToolTrace>,
-}
-
-impl RecallTrace {
-    pub fn from_messages(messages: &[Message]) -> Self {
-        let mut tools: Vec<ToolTrace> = Vec::new();
-
-        for message in messages {
-            for part in &message.content {
-                match part {
-                    ContentPart::ToolCall {
-                        name,
-                        args,
-                        call_id,
-                    } => tools.push(ToolTrace {
-                        name: name.clone(),
-                        args: args.clone(),
-                        call_id: call_id.clone(),
-                        output: None,
-                        is_error: None,
-                    }),
-                    ContentPart::ToolOutput {
-                        name,
-                        output,
-                        is_error,
-                        call_id,
-                        ..
-                    } => {
-                        if let Some(existing) = tools.iter_mut().rev().find(|trace| {
-                            trace.output.is_none()
-                                && trace.name == *name
-                                && (call_id.is_none() || trace.call_id == *call_id)
-                        }) {
-                            existing.output = Some(output.clone());
-                            existing.is_error = *is_error;
-                        } else {
-                            tools.push(ToolTrace {
-                                name: name.clone(),
-                                args: Json::Null,
-                                call_id: call_id.clone(),
-                                output: Some(output.clone()),
-                                is_error: *is_error,
-                            });
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        Self { tools }
-    }
-
-    /// Checks whether any term appears in a tool *output*. Tool names and
-    /// args are deliberately excluded: recall echoes the user's query into
-    /// search args, so matching them would misread "searched for it" as
-    /// "retrieved it" and flip grounding failures into synthesis failures.
-    pub fn contains_any_term(&self, terms: &[String]) -> bool {
-        if terms.is_empty() {
-            return false;
-        }
-
-        let haystack = self
-            .tools
-            .iter()
-            .filter_map(|tool| tool.output.as_ref())
-            .map(|output| serde_json::to_string(output).unwrap_or_default())
-            .collect::<Vec<_>>()
-            .join("\n")
-            .to_lowercase();
-        terms
-            .iter()
-            .any(|term| !term.trim().is_empty() && haystack.contains(&term.to_lowercase()))
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ToolTrace {
-    pub name: String,
-    pub args: Json,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub call_id: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output: Option<Json>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub is_error: Option<bool>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct EvalReport {
     pub scenario_id: String,
 
@@ -772,6 +686,16 @@ pub struct GraphStats {
     /// Concepts without any `belongs_to_domain` proposition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orphans: Option<u64>,
+
+    /// Fraction of self-tested memories that search could surface, from the
+    /// last dream self-test pass (plan M7). Informational: not blended into
+    /// `health()` until its variance is understood.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub groundability: Option<f64>,
+
+    /// Registered `$PropositionType` count — schema sprawl (plan M8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicate_types: Option<u64>,
 }
 
 impl GraphStats {
@@ -1588,18 +1512,14 @@ pub enum EvalFindingKind {
     JudgeError,
 }
 
+/// The full deep interface a memory eval run drives. Judge completions and
+/// read-only KIP probes come from the [`AssessContext`] supertrait, which is
+/// shared with the production-side assessment instruments.
 #[async_trait::async_trait]
-pub trait EvalDriver: Send + Sync {
+pub trait EvalDriver: AssessContext {
     async fn remember(&self, input: FormationInput) -> Result<EvalAgentResult, BoxError>;
     async fn recall(&self, input: RecallInput) -> Result<EvalAgentResult, BoxError>;
     async fn maintain(&self, input: MaintenanceInput) -> Result<EvalAgentResult, BoxError>;
-    async fn execute_kip_readonly(&self, request: Request) -> Result<Response, BoxError>;
-
-    /// One-shot LLM completion used by the eval-only judge, user simulator,
-    /// and prompt optimizer. Drivers without a model can leave the default.
-    async fn complete(&self, _req: CompletionRequest) -> Result<AgentOutput, BoxError> {
-        Err("eval driver does not support LLM completions".into())
-    }
 
     /// Objective graph metabolism counters; `None` when unsupported.
     async fn graph_stats(&self) -> Result<Option<GraphStats>, BoxError> {
@@ -1649,14 +1569,6 @@ impl EvalDriver for Space {
             .map(EvalAgentResult::from)
     }
 
-    async fn execute_kip_readonly(&self, request: Request) -> Result<Response, BoxError> {
-        self.execute_kip_readonly(request).await
-    }
-
-    async fn complete(&self, req: CompletionRequest) -> Result<AgentOutput, BoxError> {
-        self.eval_complete(req).await
-    }
-
     async fn graph_stats(&self) -> Result<Option<GraphStats>, BoxError> {
         let status = self.formation_status();
         let mut stats = GraphStats {
@@ -1664,23 +1576,16 @@ impl EvalDriver for Space {
             propositions: status.propositions as u64,
             unsorted: None,
             orphans: None,
+            groundability: self
+                .db
+                .get_extension_as::<crate::types::SelfTestReport>("memory_self_test")
+                .and_then(|report| report.groundability()),
+            predicate_types: None,
         };
 
-        // The same assessment queries the Maintenance prompt prescribes
-        // (BrainMaintenance.md "Assessment"). The orphan query intentionally
-        // matches every concept type: the prompt also requires schema/meta
-        // concepts to be attached to the CoreSchema domain on creation, so a
-        // fully maintained graph reaches zero orphans.
-        stats.unsorted = kip_count(
-            self,
-            "FIND(COUNT(?n)) WHERE { (?n, \"belongs_to_domain\", {type: \"Domain\", name: \"Unsorted\"}) }",
-        )
-        .await;
-        stats.orphans = kip_count(
-            self,
-            "FIND(COUNT(?n)) WHERE { ?n {} NOT { (?n, \"belongs_to_domain\", ?d) } }",
-        )
-        .await;
+        stats.unsorted = assess::kip_count(self, assess::UNSORTED_COUNT_KQL).await;
+        stats.orphans = assess::kip_count(self, assess::ORPHAN_COUNT_KQL).await;
+        stats.predicate_types = assess::kip_count(self, assess::PREDICATE_TYPES_COUNT_KQL).await;
         Ok(Some(stats))
     }
 
@@ -2324,7 +2229,7 @@ where
                     })
                     .collect(),
                 trace_summary: trace.as_ref().map(|trace| {
-                    judge::truncate_chars(&serde_json::to_string(trace).unwrap_or_default(), 6_000)
+                    assess::truncate_chars(&serde_json::to_string(trace).unwrap_or_default(), 6_000)
                 }),
             };
             match judge::judge_checkpoint(driver, judge_input).await {
@@ -2489,19 +2394,6 @@ fn majority_findings(samples: &[EvalCheckpointSample]) -> Vec<EvalFinding> {
         .collect()
 }
 
-const DEFAULT_ASSERTION_SEARCH_THRESHOLD: f64 = 0.35;
-const DEFAULT_ASSERTION_SEARCH_LIMIT: usize = 8;
-
-/// Builds the semantic search command for an assertion probe. The search text
-/// is embedded in a KQL string literal, so backslashes must be escaped before
-/// quotes to keep the command parseable for any input.
-fn assertion_search_command(search: &str, threshold: f64, limit: usize) -> String {
-    format!(
-        "SEARCH CONCEPT \"{}\" MODE \"semantic\" THRESHOLD {threshold} LIMIT {limit}",
-        search.replace('\\', "\\\\").replace('"', "\\\"")
-    )
-}
-
 /// A transport-level probe failure degrades to an errored probe report; the
 /// scorer turns it into a `graph_probe_error` finding instead of aborting the
 /// scenario and discarding every completed turn.
@@ -2518,13 +2410,13 @@ fn errored_probe(expectation: &ExpectedMemory, err: BoxError) -> MemoryProbeRepo
     }
 }
 
-async fn run_memory_probes<D>(
-    driver: &D,
+async fn run_memory_probes<C>(
+    driver: &C,
     rubric: &EvalRubric,
     judge_kind: EvalJudgeKind,
 ) -> (Vec<MemoryProbeReport>, Usage)
 where
-    D: EvalDriver + ?Sized,
+    C: AssessContext + ?Sized,
 {
     let mut probes = Vec::new();
     let mut usage = Usage::default();
@@ -2563,7 +2455,7 @@ where
             };
 
             let (satisfied, judge_reason) =
-                match judge::judge_assertion(driver, assertion, &evidence).await {
+                match assess::judge_assertion(driver, assertion, &evidence).await {
                     Ok(call) => {
                         usage.accumulate(&call.usage);
                         let satisfied = match expectation.mode {
@@ -3104,79 +2996,6 @@ fn expectation_terms(expectation: &ExpectedMemory) -> Vec<String> {
     }
 }
 
-/// Runs a read-only KIP count query and digs out the first integer in the
-/// result. Returns `None` on error so callers degrade gracefully.
-async fn kip_count<D>(driver: &D, command: &str) -> Option<u64>
-where
-    D: EvalDriver + ?Sized,
-{
-    let request = Request {
-        command: command.to_string(),
-        readonly: true,
-        ..Default::default()
-    };
-    match driver.execute_kip_readonly(request).await {
-        Ok(Response::Ok { result, .. }) => first_integer(&result),
-        _ => None,
-    }
-}
-
-fn first_integer(value: &Json) -> Option<u64> {
-    match value {
-        Json::Number(number) => number.as_u64(),
-        Json::Array(items) => items.iter().find_map(first_integer),
-        Json::Object(map) => map.values().find_map(first_integer),
-        _ => None,
-    }
-}
-
-fn response_hit_count(response: &Response) -> usize {
-    match response {
-        Response::Ok { result, .. } => json_hit_count(result),
-        Response::Err { result, .. } => result.as_ref().map(json_hit_count).unwrap_or_default(),
-    }
-}
-
-fn json_hit_count(value: &Json) -> usize {
-    match value {
-        Json::Null => 0,
-        Json::Bool(false) => 0,
-        Json::Bool(true) => 1,
-        Json::Number(number) => {
-            if number.as_f64().unwrap_or_default() == 0.0 {
-                0
-            } else {
-                1
-            }
-        }
-        Json::String(text) => usize::from(!text.trim().is_empty()),
-        Json::Array(items) => {
-            if items.iter().all(looks_like_serialized_kip_response) {
-                items.iter().map(json_hit_count).sum()
-            } else {
-                items.len()
-            }
-        }
-        Json::Object(map) => {
-            if map.is_empty() {
-                0
-            } else if let Some(result) = map.get("result") {
-                json_hit_count(result)
-            } else if map.contains_key("error") {
-                0
-            } else {
-                1
-            }
-        }
-    }
-}
-
-fn looks_like_serialized_kip_response(value: &Json) -> bool {
-    value
-        .as_object()
-        .is_some_and(|map| map.contains_key("result") || map.contains_key("error"))
-}
-
 fn fraction_present(terms: &[String], text: &str) -> f64 {
     if terms.is_empty() {
         return 1.0;
@@ -3231,7 +3050,6 @@ fn clamp01(value: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anda_core::ToolOutput;
     use serde_json::json;
     use std::sync::Mutex;
 
@@ -3251,6 +3069,41 @@ mod tests {
         /// Simulate stuck background stages: waits return an error.
         fail_formation_wait: bool,
         fail_maintenance_wait: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl AssessContext for FakeEvalDriver {
+        async fn complete(&self, req: CompletionRequest) -> Result<AgentOutput, BoxError> {
+            let completions = self.completions.lock().unwrap();
+            for (needle, content) in completions.iter() {
+                if req.instructions.to_lowercase().contains(needle) {
+                    return Ok(AgentOutput {
+                        content: content.clone(),
+                        usage: Usage {
+                            input_tokens: 10,
+                            output_tokens: 5,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    });
+                }
+            }
+            Err("no canned completion".into())
+        }
+
+        async fn execute_kip_readonly(&self, request: Request) -> Result<Response, BoxError> {
+            if request.command.contains("probe_transport_error") {
+                return Err("kip transport failed".into());
+            }
+            let key = request.command.clone();
+            Ok(self
+                .probes
+                .lock()
+                .unwrap()
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| Response::ok(Json::Array(Vec::new()))))
+        }
     }
 
     #[async_trait::async_trait]
@@ -3289,38 +3142,6 @@ mod tests {
                 conversation: Some(3),
                 ..Default::default()
             })
-        }
-
-        async fn execute_kip_readonly(&self, request: Request) -> Result<Response, BoxError> {
-            if request.command.contains("probe_transport_error") {
-                return Err("kip transport failed".into());
-            }
-            let key = request.command.clone();
-            Ok(self
-                .probes
-                .lock()
-                .unwrap()
-                .get(&key)
-                .cloned()
-                .unwrap_or_else(|| Response::ok(Json::Array(Vec::new()))))
-        }
-
-        async fn complete(&self, req: CompletionRequest) -> Result<AgentOutput, BoxError> {
-            let completions = self.completions.lock().unwrap();
-            for (needle, content) in completions.iter() {
-                if req.instructions.to_lowercase().contains(needle) {
-                    return Ok(AgentOutput {
-                        content: content.clone(),
-                        usage: Usage {
-                            input_tokens: 10,
-                            output_tokens: 5,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    });
-                }
-            }
-            Err("no canned completion".into())
         }
 
         async fn recall_trace(&self, _conversation: u64) -> Result<Option<RecallTrace>, BoxError> {
@@ -3452,15 +3273,6 @@ mod tests {
         assert!(probe.error.as_deref().unwrap().contains("kip transport"));
         // The unknown expectation is excluded from the utility weights.
         assert!(report.turns[0].score.as_ref().unwrap().memory_utility > 0.99);
-    }
-
-    #[test]
-    fn assertion_search_command_escapes_backslashes_and_quotes() {
-        let command = assertion_search_command("say \"hi\" \\ bye", 0.5, 3);
-        assert_eq!(
-            command,
-            "SEARCH CONCEPT \"say \\\"hi\\\" \\\\ bye\" MODE \"semantic\" THRESHOLD 0.5 LIMIT 3"
-        );
     }
 
     /// Every bundled fixture must parse strictly and validate without errors,
@@ -3610,44 +3422,6 @@ mod tests {
 
         assert_eq!(report.attribution.formation_miss, 1);
         assert_eq!(report.attribution.bad_synthesis, 1);
-    }
-
-    #[test]
-    fn recall_trace_extracts_tool_calls_and_outputs() {
-        let call = ContentPart::ToolCall {
-            name: "execute_kip_readonly".to_string(),
-            args: json!({"command": "FIND(?x) WHERE { ?x {type: \"Preference\"} }"}),
-            call_id: Some("call_1".to_string()),
-        };
-        let output = ToolOutput::new(json!([{"name": "prefers concise"}]));
-        let output = ContentPart::ToolOutput {
-            name: "execute_kip_readonly".to_string(),
-            output: json!(output.output),
-            is_error: None,
-            call_id: Some("call_1".to_string()),
-            remote_id: None,
-        };
-        let messages = vec![Message {
-            role: "assistant".to_string(),
-            content: vec![call, output],
-            ..Default::default()
-        }];
-
-        let trace = RecallTrace::from_messages(&messages);
-
-        assert_eq!(trace.tools.len(), 1);
-        assert!(trace.contains_any_term(&["concise".to_string()]));
-    }
-
-    #[test]
-    fn response_hit_count_handles_batch_responses() {
-        let response = Response::ok(json!([
-            {"result": [{"name": "a"}, {"name": "b"}]},
-            {"result": []},
-            {"error": {"code": "KIP_3002"}}
-        ]));
-
-        assert_eq!(response_hit_count(&response), 2);
     }
 
     #[test]
@@ -4465,13 +4239,6 @@ mod tests {
             .find(|turn| turn.turn_type == EvalTurnTypeReport::Checkpoint)
             .unwrap();
         assert!(checkpoint.score.as_ref().unwrap().total > 0.9);
-    }
-
-    #[test]
-    fn first_integer_digs_into_kip_count_results() {
-        assert_eq!(first_integer(&json!([{"result": [{"count": 7}]}])), Some(7));
-        assert_eq!(first_integer(&json!("nope")), None);
-        assert_eq!(first_integer(&json!(3)), Some(3));
     }
 
     fn empty_turn() -> EvalTurn {
