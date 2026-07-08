@@ -16,7 +16,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
     time::Duration,
 };
 use tokio::time::{Instant, sleep};
@@ -62,6 +61,11 @@ pub struct EvalScenario {
 pub struct NoiseConfig {
     /// Number of noise turns inserted between each pair of adjacent timeline
     /// turns. Anchors keep their authoritative rubrics; noise only adds scale.
+    ///
+    /// Note: noise turns count toward a profile's `maintenance_every_n_turns`
+    /// cadence, exactly like real user turns — enabling noise therefore also
+    /// increases how often auto-maintenance fires. This is deliberate: noise
+    /// gives Maintenance real material to metabolize.
     pub between_turns: usize,
 
     /// Optional custom corpus. Defaults to a built-in chit-chat corpus.
@@ -193,6 +197,15 @@ pub struct ExpectedMemory {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search: Option<String>,
 
+    /// Similarity threshold for the semantic probe search (0..=1).
+    /// Defaults to 0.35.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_threshold: Option<f64>,
+
+    /// Result limit for the semantic probe search. Defaults to 8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_limit: Option<usize>,
+
     /// Terms expected in the final answer when this memory is relevant.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub answer_terms: Vec<String>,
@@ -217,6 +230,8 @@ impl Default for ExpectedMemory {
             probe: None,
             assertion: None,
             search: None,
+            search_threshold: None,
+            search_limit: None,
             answer_terms: Vec::new(),
             trace_terms: Vec::new(),
         }
@@ -463,13 +478,22 @@ impl RecallTrace {
         Self { tools }
     }
 
+    /// Checks whether any term appears in a tool *output*. Tool names and
+    /// args are deliberately excluded: recall echoes the user's query into
+    /// search args, so matching them would misread "searched for it" as
+    /// "retrieved it" and flip grounding failures into synthesis failures.
     pub fn contains_any_term(&self, terms: &[String]) -> bool {
         if terms.is_empty() {
             return false;
         }
 
-        let haystack = serde_json::to_string(self)
-            .unwrap_or_default()
+        let haystack = self
+            .tools
+            .iter()
+            .filter_map(|tool| tool.output.as_ref())
+            .map(|output| serde_json::to_string(output).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n")
             .to_lowercase();
         terms
             .iter()
@@ -498,6 +522,19 @@ pub struct EvalReport {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+
+    /// Provenance: the profile this report was produced under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+
+    /// Provenance: the model that answered checkpoints, from the first
+    /// checkpoint that reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
+    /// Provenance: RFC3339 wall-clock time the replay started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
 
     pub score: EvalScore,
 
@@ -664,6 +701,10 @@ pub struct EvalTurnReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answer: Option<String>,
 
+    /// Model that produced the representative sample, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
     /// Mean score across `checkpoint_samples` recall samples.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub score: Option<EvalScore>,
@@ -771,20 +812,83 @@ pub struct MemoryProbeReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judge_reason: Option<String>,
 
+    /// Transport-level probe failure (the KIP request itself errored). The
+    /// expectation is scored as *unknown* — a `graph_probe_error` finding —
+    /// rather than as a memory failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response: Option<Response>,
+}
+
+impl MemoryProbeReport {
+    /// True when the probe could not observe the graph at all: either the
+    /// request transport failed or KIP itself returned an error response.
+    pub fn errored(&self) -> bool {
+        self.error.is_some()
+            || self
+                .response
+                .as_ref()
+                .is_some_and(|response| matches!(response, Response::Err { .. }))
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct EvalScore {
     pub total: f64,
     pub memory_utility: f64,
+
+    /// At checkpoint level this is `(memory_utility + forgetting_quality)/2`
+    /// and feeds `total`. At scenario level and above it is *replaced* by the
+    /// late-half vs early-half trajectory metric (0.5 = flat), which is
+    /// informational only — the aggregated `total` remains the weighted mean
+    /// of checkpoint totals and is not recomputed from it.
     pub evolution_quality: f64,
+
     pub uncertainty_calibration: f64,
     pub forgetting_quality: f64,
     pub graph_health: f64,
     pub latency_penalty: f64,
     pub token_cost_penalty: f64,
+}
+
+impl EvalScore {
+    fn accumulate(&mut self, other: &EvalScore) {
+        self.total += other.total;
+        self.memory_utility += other.memory_utility;
+        self.evolution_quality += other.evolution_quality;
+        self.uncertainty_calibration += other.uncertainty_calibration;
+        self.forgetting_quality += other.forgetting_quality;
+        self.graph_health += other.graph_health;
+        self.latency_penalty += other.latency_penalty;
+        self.token_cost_penalty += other.token_cost_penalty;
+    }
+
+    fn scale(&mut self, factor: f64) {
+        self.total *= factor;
+        self.memory_utility *= factor;
+        self.evolution_quality *= factor;
+        self.uncertainty_calibration *= factor;
+        self.forgetting_quality *= factor;
+        self.graph_health *= factor;
+        self.latency_penalty *= factor;
+        self.token_cost_penalty *= factor;
+    }
+
+    /// Field-wise mean; all-zero when the iterator is empty.
+    fn mean<'a>(scores: impl IntoIterator<Item = &'a EvalScore>) -> EvalScore {
+        let mut sum = EvalScore::default();
+        let mut count = 0usize;
+        for score in scores {
+            sum.accumulate(score);
+            count += 1;
+        }
+        if count > 0 {
+            sum.scale(1.0 / count as f64);
+        }
+        sum
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -1116,6 +1220,14 @@ fn validate_scenario_plan(
 
     for (turn_index, turn) in scenario.timeline.iter().enumerate() {
         let path = format!("scenarios[{scenario_index}].timeline[{turn_index}]");
+        if turn.noise {
+            issues.push(EvalValidationIssue {
+                severity: EvalValidationSeverity::Error,
+                path: path.clone(),
+                message: "`noise` is reserved for harness-synthesized turns and must not be set in authored timelines"
+                    .to_string(),
+            });
+        }
         if !seen_turns.insert(turn.turn) {
             issues.push(EvalValidationIssue {
                 severity: EvalValidationSeverity::Error,
@@ -1262,6 +1374,24 @@ fn validate_checkpoint_turn(
                     message: "semantic assertion must not be empty".to_string(),
                 });
             }
+        }
+
+        if let Some(threshold) = expectation.search_threshold
+            && !(threshold.is_finite() && 0.0 < threshold && threshold <= 1.0)
+        {
+            issues.push(EvalValidationIssue {
+                severity: EvalValidationSeverity::Error,
+                path: format!("{expectation_path}.search_threshold"),
+                message: "`search_threshold` must be in (0, 1]".to_string(),
+            });
+        }
+
+        if expectation.search_limit == Some(0) {
+            issues.push(EvalValidationIssue {
+                severity: EvalValidationSeverity::Error,
+                path: format!("{expectation_path}.search_limit"),
+                message: "`search_limit` must be at least 1 when set".to_string(),
+            });
         }
 
         match &expectation.probe {
@@ -1536,7 +1666,11 @@ impl EvalDriver for Space {
             orphans: None,
         };
 
-        // The same assessment queries the Maintenance prompt prescribes.
+        // The same assessment queries the Maintenance prompt prescribes
+        // (BrainMaintenance.md "Assessment"). The orphan query intentionally
+        // matches every concept type: the prompt also requires schema/meta
+        // concepts to be attached to the CoreSchema domain on creation, so a
+        // fully maintained graph reaches zero orphans.
         stats.unsorted = kip_count(
             self,
             "FIND(COUNT(?n)) WHERE { (?n, \"belongs_to_domain\", {type: \"Domain\", name: \"Unsorted\"}) }",
@@ -1609,59 +1743,6 @@ impl EvalDriver for Space {
     }
 }
 
-#[async_trait::async_trait]
-impl EvalDriver for Arc<Space> {
-    async fn remember(&self, input: FormationInput) -> Result<EvalAgentResult, BoxError> {
-        self.as_ref().remember(input).await
-    }
-
-    async fn recall(&self, input: RecallInput) -> Result<EvalAgentResult, BoxError> {
-        self.as_ref().recall(input).await
-    }
-
-    async fn maintain(&self, input: MaintenanceInput) -> Result<EvalAgentResult, BoxError> {
-        self.as_ref().maintain(input).await
-    }
-
-    async fn execute_kip_readonly(&self, request: Request) -> Result<Response, BoxError> {
-        self.as_ref().execute_kip_readonly(request).await
-    }
-
-    async fn complete(&self, req: CompletionRequest) -> Result<AgentOutput, BoxError> {
-        EvalDriver::complete(self.as_ref(), req).await
-    }
-
-    async fn graph_stats(&self) -> Result<Option<GraphStats>, BoxError> {
-        EvalDriver::graph_stats(self.as_ref()).await
-    }
-
-    async fn wait_for_formation(
-        &self,
-        conversation: u64,
-        timeout: Duration,
-        poll_interval: Duration,
-    ) -> Result<(), BoxError> {
-        self.as_ref()
-            .wait_for_formation(conversation, timeout, poll_interval)
-            .await
-    }
-
-    async fn wait_for_maintenance(
-        &self,
-        conversation: u64,
-        timeout: Duration,
-        poll_interval: Duration,
-    ) -> Result<(), BoxError> {
-        self.as_ref()
-            .wait_for_maintenance(conversation, timeout, poll_interval)
-            .await
-    }
-
-    async fn recall_trace(&self, conversation: u64) -> Result<Option<RecallTrace>, BoxError> {
-        self.as_ref().recall_trace(conversation).await
-    }
-}
-
 /// Which part of a timeline a run executes. `Full` is the realistic
 /// interleaved replay. `FormationOnly`/`PolicyOnly` implement the
 /// shared-formation experiment: formation is replayed once, snapshotted, and
@@ -1723,6 +1804,8 @@ where
     let mut report = EvalReport {
         scenario_id: scenario.id.clone(),
         description: scenario.description.clone(),
+        profile_id: profile.id.clone(),
+        started_at: Some(rfc3339_datetime_now()),
         ..Default::default()
     };
     let timeline = effective_timeline(scenario);
@@ -1810,6 +1893,7 @@ where
     for turn in &report.turns {
         report.attribution.add_turn(turn);
     }
+    report.model = report.turns.iter().find_map(|turn| turn.model.clone());
     let (score, total_stddev) = aggregate_scores(&report.turns);
     report.score = score;
     report.total_stddev = total_stddev;
@@ -1954,7 +2038,7 @@ where
 
     let started = Instant::now();
     let output = driver.remember(input).await?;
-    let mut findings = agent_failure_finding(output.failed_reason);
+    let mut findings = agent_failure_finding(EvalFindingKind::FormationMiss, output.failed_reason);
     if let Some(conversation) = output.conversation {
         findings.extend(wait_failure_finding(
             EvalFindingKind::FormationMiss,
@@ -2046,7 +2130,7 @@ where
         timestamp: Some(turn_timestamp(turn)),
     };
     let output = driver.remember(input).await?;
-    let mut findings = agent_failure_finding(output.failed_reason);
+    let mut findings = agent_failure_finding(EvalFindingKind::FormationMiss, output.failed_reason);
     if let Some(conversation) = output.conversation {
         findings.extend(wait_failure_finding(
             EvalFindingKind::FormationMiss,
@@ -2142,7 +2226,8 @@ where
     // `conversation` is None when a cycle was already in flight (e.g. one the
     // hook auto-triggered after formation). The wait polls the processing
     // flag either way, so the next turn never overlaps a consolidation.
-    let mut findings = agent_failure_finding(output.failed_reason);
+    let mut findings =
+        agent_failure_finding(EvalFindingKind::BadConsolidation, output.failed_reason);
     findings.extend(wait_failure_finding(
         EvalFindingKind::BadConsolidation,
         driver
@@ -2191,7 +2276,7 @@ where
     ));
     // Probes read the graph before Recall answers; recall itself never writes
     // to the graph, so one probe pass covers every sample.
-    let (probes, mut total_usage) = run_memory_probes(driver, &rubric, profile.judge).await?;
+    let (probes, mut total_usage) = run_memory_probes(driver, &rubric, profile.judge).await;
     let graph_stats = driver.graph_stats().await.unwrap_or(None);
     let query = checkpoint_query(turn)?;
     let input = RecallInput {
@@ -2204,6 +2289,7 @@ where
     let mut verdicts: Vec<Option<JudgeVerdict>> = Vec::with_capacity(sample_count);
     let mut conversations: Vec<Option<u64>> = Vec::with_capacity(sample_count);
     let mut traces: Vec<Option<RecallTrace>> = Vec::with_capacity(sample_count);
+    let mut models: Vec<Option<String>> = Vec::with_capacity(sample_count);
     let mut judge_errors = 0usize;
 
     for _ in 0..sample_count {
@@ -2265,13 +2351,15 @@ where
             graph_stats: graph_stats.as_ref(),
         };
         let scored = score_checkpoint(&rubric, &observation, profile, verdict.as_ref());
-        let mut findings = agent_failure_finding(output.failed_reason.clone());
+        let mut findings =
+            agent_failure_finding(EvalFindingKind::BadSynthesis, output.failed_reason.clone());
         findings.extend(scored.findings);
 
         total_usage.accumulate(&output.usage);
         conversations.push(output.conversation);
         traces.push(trace);
         verdicts.push(verdict);
+        models.push(output.model.clone());
         samples.push(EvalCheckpointSample {
             answer: output.content,
             latency_ms,
@@ -2318,6 +2406,7 @@ where
         usage: total_usage,
         conversation: conversations[representative],
         answer: Some(samples[representative].answer.clone()),
+        model: models[representative].clone(),
         score: Some(mean_score),
         score_stddev,
         satisfaction,
@@ -2351,18 +2440,7 @@ fn median_sample_index(samples: &[EvalCheckpointSample]) -> usize {
 
 /// Field-wise mean over sample scores plus the sample stddev of totals.
 fn mean_sample_scores(samples: &[EvalCheckpointSample]) -> (EvalScore, Option<f64>) {
-    let n = samples.len().max(1) as f64;
-    let mut mean = EvalScore::default();
-    for sample in samples {
-        mean.total += sample.score.total / n;
-        mean.memory_utility += sample.score.memory_utility / n;
-        mean.evolution_quality += sample.score.evolution_quality / n;
-        mean.uncertainty_calibration += sample.score.uncertainty_calibration / n;
-        mean.forgetting_quality += sample.score.forgetting_quality / n;
-        mean.graph_health += sample.score.graph_health / n;
-        mean.latency_penalty += sample.score.latency_penalty / n;
-        mean.token_cost_penalty += sample.score.token_cost_penalty / n;
-    }
+    let mean = EvalScore::mean(samples.iter().map(|sample| &sample.score));
     let stddev = if samples.len() > 1 {
         let variance = samples
             .iter()
@@ -2380,7 +2458,10 @@ fn mean_sample_scores(samples: &[EvalCheckpointSample]) -> (EvalScore, Option<f6
 }
 
 /// A finding counts for the turn when it shows up in at least half of the
-/// samples, so one unlucky roll neither hides nor invents a problem.
+/// samples (ties round toward surfacing: with 2 samples, 1 occurrence
+/// counts). Odd sample counts give the cleanest semantics — one unlucky roll
+/// neither hides nor invents a problem; even counts are conservative and may
+/// surface a single-roll finding.
 fn majority_findings(samples: &[EvalCheckpointSample]) -> Vec<EvalFinding> {
     if samples.len() == 1 {
         return samples[0].findings.clone();
@@ -2408,11 +2489,40 @@ fn majority_findings(samples: &[EvalCheckpointSample]) -> Vec<EvalFinding> {
         .collect()
 }
 
+const DEFAULT_ASSERTION_SEARCH_THRESHOLD: f64 = 0.35;
+const DEFAULT_ASSERTION_SEARCH_LIMIT: usize = 8;
+
+/// Builds the semantic search command for an assertion probe. The search text
+/// is embedded in a KQL string literal, so backslashes must be escaped before
+/// quotes to keep the command parseable for any input.
+fn assertion_search_command(search: &str, threshold: f64, limit: usize) -> String {
+    format!(
+        "SEARCH CONCEPT \"{}\" MODE \"semantic\" THRESHOLD {threshold} LIMIT {limit}",
+        search.replace('\\', "\\\\").replace('"', "\\\"")
+    )
+}
+
+/// A transport-level probe failure degrades to an errored probe report; the
+/// scorer turns it into a `graph_probe_error` finding instead of aborting the
+/// scenario and discarding every completed turn.
+fn errored_probe(expectation: &ExpectedMemory, err: BoxError) -> MemoryProbeReport {
+    MemoryProbeReport {
+        expectation_id: expectation.id.clone(),
+        mode: expectation.mode,
+        hit_count: 0,
+        satisfied: false,
+        assertion: expectation.assertion.clone(),
+        judge_reason: None,
+        error: Some(err.to_string()),
+        response: None,
+    }
+}
+
 async fn run_memory_probes<D>(
     driver: &D,
     rubric: &EvalRubric,
     judge_kind: EvalJudgeKind,
-) -> Result<(Vec<MemoryProbeReport>, Usage), BoxError>
+) -> (Vec<MemoryProbeReport>, Usage)
 where
     D: EvalDriver + ?Sized,
 {
@@ -2423,17 +2533,29 @@ where
         // hand-written KQL, so they stay correct across valid graph encodings.
         if let (Some(assertion), EvalJudgeKind::Llm) = (&expectation.assertion, judge_kind) {
             let search = expectation.search.as_deref().unwrap_or(assertion.as_str());
-            let command = format!(
-                "SEARCH CONCEPT \"{}\" MODE \"semantic\" THRESHOLD 0.35 LIMIT 8",
-                search.replace('"', "\\\"")
+            let command = assertion_search_command(
+                search,
+                expectation
+                    .search_threshold
+                    .unwrap_or(DEFAULT_ASSERTION_SEARCH_THRESHOLD),
+                expectation
+                    .search_limit
+                    .unwrap_or(DEFAULT_ASSERTION_SEARCH_LIMIT),
             );
-            let response = driver
+            let response = match driver
                 .execute_kip_readonly(Request {
                     command,
                     readonly: true,
                     ..Default::default()
                 })
-                .await?;
+                .await
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    probes.push(errored_probe(expectation, err));
+                    continue;
+                }
+            };
             let hit_count = response_hit_count(&response);
             let evidence = match &response {
                 Response::Ok { result, .. } => result.clone(),
@@ -2468,6 +2590,7 @@ where
                 satisfied,
                 assertion: Some(assertion.clone()),
                 judge_reason,
+                error: None,
                 response: Some(response),
             });
             continue;
@@ -2476,7 +2599,13 @@ where
         let Some(request) = expectation.probe.clone() else {
             continue;
         };
-        let response = driver.execute_kip_readonly(request).await?;
+        let response = match driver.execute_kip_readonly(request).await {
+            Ok(response) => response,
+            Err(err) => {
+                probes.push(errored_probe(expectation, err));
+                continue;
+            }
+        };
         let hit_count = response_hit_count(&response);
         let satisfied = match expectation.mode {
             MemoryExpectationMode::ShouldExist => {
@@ -2493,10 +2622,11 @@ where
             satisfied,
             assertion: None,
             judge_reason: None,
+            error: None,
             response: Some(response),
         });
     }
-    Ok((probes, usage))
+    (probes, usage)
 }
 
 struct CheckpointScore {
@@ -2536,6 +2666,11 @@ fn score_checkpoint(
 
     let mut expected_present_weight = 0.0;
     let mut expected_present_score = 0.0;
+    // Coverage of expectation `answer_terms` in the answer: without it, a
+    // memory that provably exists but never reaches the answer would produce
+    // findings yet leave the lexical score untouched.
+    let mut answer_term_weight = 0.0;
+    let mut answer_term_score = 0.0;
     let mut forgetting_weight = 0.0;
     let mut forgetting_score = 0.0;
     let mut probe_errors = 0usize;
@@ -2548,21 +2683,31 @@ fn score_checkpoint(
     for expectation in &rubric.expected_memories {
         let probe = probe_by_id.get(expectation.id.as_str()).copied();
         let probe_satisfied = probe.map(|p| p.satisfied).unwrap_or(true);
-        let probe_error = probe
-            .and_then(|p| p.response.as_ref())
-            .is_some_and(|response| matches!(response, Response::Err { .. }));
-        if probe_error {
+        // An errored probe means the graph state is *unknown*: record the
+        // infrastructure failure and exclude the expectation from the
+        // memory-quality weights, so one KIP hiccup is not double-counted as
+        // a formation miss or consolidation debt.
+        if probe.is_some_and(MemoryProbeReport::errored) {
             probe_errors += 1;
             findings.push(EvalFinding {
                 kind: EvalFindingKind::GraphProbeError,
                 expectation_id: Some(expectation.id.clone()),
-                message: "read-only KIP probe returned an error".to_string(),
+                message: match probe.and_then(|p| p.error.as_deref()) {
+                    Some(err) => format!("read-only KIP probe failed: {err}"),
+                    None => "read-only KIP probe returned an error".to_string(),
+                },
             });
+            continue;
         }
 
         match expectation.mode {
             MemoryExpectationMode::ShouldExist => {
                 expected_present_weight += expectation.weight;
+                if !expectation.answer_terms.is_empty() {
+                    answer_term_weight += expectation.weight;
+                    answer_term_score +=
+                        expectation.weight * fraction_present(&expectation.answer_terms, answer);
+                }
                 if probe_satisfied {
                     expected_present_score += expectation.weight;
                 } else {
@@ -2650,10 +2795,20 @@ fn score_checkpoint(
     } else {
         expected_present_score / expected_present_weight
     };
-    let lexical_utility = if rubric.required_answer_terms.is_empty() {
-        expected_present_score
-    } else {
-        (required_answer_score + expected_present_score) / 2.0
+    // Mean over the components the rubric actually defines: probe-verified
+    // presence, required-term coverage, and expectation answer-term coverage.
+    let lexical_utility = {
+        let mut sum = expected_present_score;
+        let mut components = 1.0;
+        if !rubric.required_answer_terms.is_empty() {
+            sum += required_answer_score;
+            components += 1.0;
+        }
+        if answer_term_weight > 0.0 {
+            sum += answer_term_score / answer_term_weight;
+            components += 1.0;
+        }
+        sum / components
     };
     let probe_forgetting = if forgetting_weight == 0.0 {
         1.0
@@ -2674,12 +2829,13 @@ fn score_checkpoint(
     };
     if let Some(verdict) = verdict {
         for finding in &verdict.findings {
-            // A judge finding of a kind the harness already recorded for the
-            // same expectation (or with no expectation at all) is the same
-            // root cause; keeping both would double-count against gates.
+            // A judge finding of a kind the harness already recorded is the
+            // same root cause when either side omits the expectation id or
+            // the ids match; keeping both would double-count against gates.
             let duplicate = findings.iter().any(|existing| {
                 existing.kind == finding.kind
                     && (finding.expectation_id.is_none()
+                        || existing.expectation_id.is_none()
                         || existing.expectation_id == finding.expectation_id)
             });
             if !duplicate {
@@ -2819,71 +2975,11 @@ fn aggregate_scores(turns: &[EvalTurnReport]) -> (EvalScore, Option<f64>) {
 }
 
 fn aggregate_report_scores(reports: &[EvalReport]) -> EvalScore {
-    if reports.is_empty() {
-        return EvalScore::default();
-    }
-
-    let len = reports.len() as f64;
-    EvalScore {
-        total: reports.iter().map(|r| r.score.total).sum::<f64>() / len,
-        memory_utility: reports.iter().map(|r| r.score.memory_utility).sum::<f64>() / len,
-        evolution_quality: reports
-            .iter()
-            .map(|r| r.score.evolution_quality)
-            .sum::<f64>()
-            / len,
-        uncertainty_calibration: reports
-            .iter()
-            .map(|r| r.score.uncertainty_calibration)
-            .sum::<f64>()
-            / len,
-        forgetting_quality: reports
-            .iter()
-            .map(|r| r.score.forgetting_quality)
-            .sum::<f64>()
-            / len,
-        graph_health: reports.iter().map(|r| r.score.graph_health).sum::<f64>() / len,
-        latency_penalty: reports.iter().map(|r| r.score.latency_penalty).sum::<f64>() / len,
-        token_cost_penalty: reports
-            .iter()
-            .map(|r| r.score.token_cost_penalty)
-            .sum::<f64>()
-            / len,
-    }
+    EvalScore::mean(reports.iter().map(|report| &report.score))
 }
 
 fn aggregate_suite_scores(suites: &[EvalSuiteReport]) -> EvalScore {
-    if suites.is_empty() {
-        return EvalScore::default();
-    }
-
-    let len = suites.len() as f64;
-    EvalScore {
-        total: suites.iter().map(|s| s.score.total).sum::<f64>() / len,
-        memory_utility: suites.iter().map(|s| s.score.memory_utility).sum::<f64>() / len,
-        evolution_quality: suites
-            .iter()
-            .map(|s| s.score.evolution_quality)
-            .sum::<f64>()
-            / len,
-        uncertainty_calibration: suites
-            .iter()
-            .map(|s| s.score.uncertainty_calibration)
-            .sum::<f64>()
-            / len,
-        forgetting_quality: suites
-            .iter()
-            .map(|s| s.score.forgetting_quality)
-            .sum::<f64>()
-            / len,
-        graph_health: suites.iter().map(|s| s.score.graph_health).sum::<f64>() / len,
-        latency_penalty: suites.iter().map(|s| s.score.latency_penalty).sum::<f64>() / len,
-        token_cost_penalty: suites
-            .iter()
-            .map(|s| s.score.token_cost_penalty)
-            .sum::<f64>()
-            / len,
-    }
+    EvalScore::mean(suites.iter().map(|suite| &suite.score))
 }
 
 fn compare_suites(suites: &[EvalSuiteReport]) -> Vec<EvalSuiteComparison> {
@@ -2970,11 +3066,15 @@ fn turn_timestamp(turn: &EvalTurn) -> String {
     turn.timestamp.clone().unwrap_or_else(rfc3339_datetime_now)
 }
 
-fn agent_failure_finding(reason: Option<String>) -> Vec<EvalFinding> {
+/// Attributes an agent-level failure to the stage that ran it: a Formation
+/// failure is a formation miss, a Maintenance failure is consolidation debt,
+/// and a Recall failure is a synthesis failure. Using one fixed kind here
+/// would skew attribution and steer the prompt optimizer at the wrong prompt.
+fn agent_failure_finding(kind: EvalFindingKind, reason: Option<String>) -> Vec<EvalFinding> {
     reason
         .map(|reason| {
             vec![EvalFinding {
-                kind: EvalFindingKind::BadSynthesis,
+                kind,
                 expectation_id: None,
                 message: format!("agent execution failed: {reason}"),
             }]
@@ -3192,6 +3292,9 @@ mod tests {
         }
 
         async fn execute_kip_readonly(&self, request: Request) -> Result<Response, BoxError> {
+            if request.command.contains("probe_transport_error") {
+                return Err("kip transport failed".into());
+            }
             let key = request.command.clone();
             Ok(self
                 .probes
@@ -3303,6 +3406,97 @@ mod tests {
         assert_eq!(driver.remembered.lock().unwrap().len(), 1);
         assert_eq!(report.attribution.bad_grounding, 1);
         assert!(report.score.total < 1.0);
+        // The unused expectation answer_terms lower the lexical utility, not
+        // just the finding count.
+        assert!(report.score.memory_utility < 1.0);
+    }
+
+    #[tokio::test]
+    async fn probe_transport_errors_degrade_to_findings_instead_of_aborting() {
+        let driver = FakeEvalDriver {
+            recall_answer: "an answer".to_string(),
+            ..Default::default()
+        };
+        let scenario = EvalScenario {
+            id: "probe_error".to_string(),
+            timeline: vec![EvalTurn {
+                turn: 1,
+                turn_type: EvalTurnType::CheckpointSynthetic,
+                query: Some("What do I like?".to_string()),
+                evaluation: Some(EvalRubric {
+                    expected_memories: vec![ExpectedMemory {
+                        id: "unreachable".to_string(),
+                        probe: Some(Request {
+                            command: "probe_transport_error".to_string(),
+                            readonly: true,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..empty_turn()
+            }],
+            ..empty_scenario()
+        };
+
+        let report = run_scenario(&driver, &scenario, &EvalProfile::default())
+            .await
+            .unwrap();
+
+        // The run completed and the infra failure is attributed as a probe
+        // error — not as a formation miss, and not counted twice.
+        assert_eq!(report.attribution.graph_probe_error, 1);
+        assert_eq!(report.attribution.formation_miss, 0);
+        let probe = &report.turns[0].probes[0];
+        assert!(probe.error.as_deref().unwrap().contains("kip transport"));
+        // The unknown expectation is excluded from the utility weights.
+        assert!(report.turns[0].score.as_ref().unwrap().memory_utility > 0.99);
+    }
+
+    #[test]
+    fn assertion_search_command_escapes_backslashes_and_quotes() {
+        let command = assertion_search_command("say \"hi\" \\ bye", 0.5, 3);
+        assert_eq!(
+            command,
+            "SEARCH CONCEPT \"say \\\"hi\\\" \\\\ bye\" MODE \"semantic\" THRESHOLD 0.5 LIMIT 3"
+        );
+    }
+
+    /// Every bundled fixture must parse strictly and validate without errors,
+    /// so schema drift is caught even for files no CI command lists by name.
+    #[test]
+    fn bundled_eval_fixtures_parse_and_validate() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("evals");
+        let mut scenarios = Vec::new();
+        let mut profiles = Vec::new();
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let data = std::fs::read(&path).unwrap();
+            if name.ends_with("_profile.json") {
+                let profile: EvalProfile = serde_json::from_slice(&data)
+                    .unwrap_or_else(|err| panic!("profile fixture {name}: {err}"));
+                profiles.push(profile);
+            } else {
+                let scenario: EvalScenario = serde_json::from_slice(&data)
+                    .unwrap_or_else(|err| panic!("scenario fixture {name}: {err}"));
+                scenarios.push(scenario);
+            }
+        }
+        assert!(!scenarios.is_empty(), "no scenario fixtures found");
+        assert!(!profiles.is_empty(), "no profile fixtures found");
+
+        let report = validate_eval_plan(&scenarios, &profiles);
+        let errors: Vec<&EvalValidationIssue> = report
+            .issues
+            .iter()
+            .filter(|issue| issue.severity == EvalValidationSeverity::Error)
+            .collect();
+        assert!(errors.is_empty(), "fixture validation errors: {errors:#?}");
     }
 
     #[tokio::test]
@@ -3630,6 +3824,7 @@ mod tests {
                 EvalTurn {
                     turn: 1,
                     turn_type: EvalTurnType::Normal,
+                    noise: true,
                     ..empty_turn()
                 },
                 EvalTurn {
@@ -3647,6 +3842,8 @@ mod tests {
                                 readonly: false,
                                 ..Default::default()
                             }),
+                            search_threshold: Some(2.0),
+                            search_limit: Some(0),
                             ..Default::default()
                         }],
                         ..Default::default()
@@ -3676,6 +3873,18 @@ mod tests {
         }));
         assert!(report.issues.iter().any(|issue| {
             issue.severity == EvalValidationSeverity::Error && issue.message.contains("readonly")
+        }));
+        assert!(report.issues.iter().any(|issue| {
+            issue.severity == EvalValidationSeverity::Error
+                && issue.message.contains("harness-synthesized")
+        }));
+        assert!(report.issues.iter().any(|issue| {
+            issue.severity == EvalValidationSeverity::Error
+                && issue.message.contains("search_threshold")
+        }));
+        assert!(report.issues.iter().any(|issue| {
+            issue.severity == EvalValidationSeverity::Error
+                && issue.message.contains("search_limit")
         }));
         assert!(report.issues.iter().any(|issue| {
             issue.severity == EvalValidationSeverity::Error

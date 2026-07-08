@@ -13,17 +13,17 @@ fix:
 test:
 	@cargo test --workspace --all-features -- --nocapture
 
+# Every fixture in evals/ is picked up automatically: *_profile.json files
+# are profiles, everything else is a scenario. Adding a fixture needs no
+# Makefile change; `bundled_eval_fixtures_parse_and_validate` covers the same
+# set in `cargo test`.
+EVAL_FIXTURES := $(wildcard anda_brain/evals/*.json)
+EVAL_PROFILES := $(filter %_profile.json,$(EVAL_FIXTURES))
+EVAL_SCENARIOS := $(filter-out %_profile.json,$(EVAL_FIXTURES))
+
 eval-validate:
 	@cargo run -p anda_brain -- eval \
-		--scenario anda_brain/evals/style_preference.json \
-		--scenario anda_brain/evals/project_budget.json \
-		--scenario anda_brain/evals/preference_reversal.json \
-		--scenario anda_brain/evals/fact_correction.json \
-		--scenario anda_brain/evals/counterparty_boundary.json \
-		--scenario anda_brain/evals/travel_logistics.json \
-		--scenario anda_brain/evals/expiring_discount.json \
-		--profile anda_brain/evals/no_maintenance_profile.json \
-		--profile anda_brain/evals/default_profile.json \
-		--profile anda_brain/evals/quick_profile.json \
+		$(foreach scenario,$(EVAL_SCENARIOS),--scenario $(scenario)) \
+		$(foreach profile,$(EVAL_PROFILES),--profile $(profile)) \
 		--validate-only \
 		--summary-only

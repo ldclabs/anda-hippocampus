@@ -28,19 +28,18 @@ jobs:
       - name: Install Rust stable
         run: rustup update --no-self-update stable
       - name: Validate eval fixtures
-        run: >
-          cargo run -p anda_brain -- eval
-          --scenario anda_brain/evals/style_preference.json
-          --scenario anda_brain/evals/project_budget.json
-          --scenario anda_brain/evals/preference_reversal.json
-          --scenario anda_brain/evals/fact_correction.json
-          --scenario anda_brain/evals/counterparty_boundary.json
-          --scenario anda_brain/evals/travel_logistics.json
-          --scenario anda_brain/evals/expiring_discount.json
-          --profile anda_brain/evals/no_maintenance_profile.json
-          --profile anda_brain/evals/default_profile.json
-          --profile anda_brain/evals/quick_profile.json
-          --validate-only
+        # Globs every fixture so newly added files are validated without
+        # workflow edits; *_profile.json are profiles, the rest scenarios.
+        shell: bash
+        run: |
+          args=()
+          for fixture in anda_brain/evals/*.json; do
+            case "$fixture" in
+              *_profile.json) args+=(--profile "$fixture") ;;
+              *) args+=(--scenario "$fixture") ;;
+            esac
+          done
+          cargo run -p anda_brain -- eval "${args[@]}" --validate-only
       - name: Run clippy
         run: cargo clippy --all-targets --all-features
       - name: Run tests

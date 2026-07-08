@@ -213,11 +213,7 @@ pub enum Commands {
         )]
         summary_only: bool,
 
-        /// Create the eval space before running if needed
-        #[arg(long, env = "EVAL_AUTO_CREATE_SPACE", default_value_t = true)]
-        auto_create_space: bool,
-
-        /// Tier used when --auto-create-space creates the eval memory space
+        /// Tier used when creating the run-scoped eval memory spaces
         #[arg(long, env = "EVAL_AUTO_CREATE_TIER", default_value_t = 1)]
         auto_create_tier: u32,
 
@@ -288,9 +284,11 @@ pub enum StorageCommand {
     },
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 struct AnyHost;
 
+#[cfg(test)]
 impl PartialEq<&str> for AnyHost {
     fn eq(&self, _other: &&str) -> bool {
         true
@@ -300,28 +298,7 @@ impl PartialEq<&str> for AnyHost {
 fn build_http_client(cli: &Cli) -> Result<reqwest::Client, BoxError> {
     let mut http_client = request_client_builder()
         .https_only(false)
-        .timeout(Duration::from_secs(600))
-        // grcov-excl-start: reqwest retry classification is exercised by reqwest internals; unit tests cover client construction and proxy validation.
-        .retry(
-            reqwest::retry::for_host(AnyHost)
-                .max_retries_per_request(2)
-                .classify_fn(|req_rep| {
-                    if req_rep.error().is_some() {
-                        return req_rep.retryable();
-                    }
-
-                    match req_rep.status() {
-                        Some(
-                            http::StatusCode::REQUEST_TIMEOUT
-                            | http::StatusCode::TOO_MANY_REQUESTS
-                            | http::StatusCode::BAD_GATEWAY
-                            | http::StatusCode::SERVICE_UNAVAILABLE
-                            | http::StatusCode::GATEWAY_TIMEOUT,
-                        ) => req_rep.retryable(),
-                        _ => req_rep.success(),
-                    }
-                }),
-        );
+        .timeout(Duration::from_secs(600));
     // grcov-excl-stop
     if let Some(proxy) = &cli.https_proxy {
         http_client = http_client.proxy(Proxy::all(proxy)?);
@@ -709,7 +686,6 @@ struct EvalCommandConfig {
     gate: EvalGate,
     validate_only: bool,
     summary_only: bool,
-    auto_create_space: bool,
     auto_create_tier: u32,
     shared_formation: bool,
     checkpoint_samples: Option<usize>,
@@ -726,18 +702,23 @@ enum EvalCommandReport {
 }
 
 impl EvalCommandReport {
-    fn evaluate_gate(&self, gate: &EvalGate) -> EvalGateReport {
+    fn score_parts(
+        &self,
+    ) -> (
+        &EvalScore,
+        &anda_brain::eval::AttributionSummary,
+        Option<f64>,
+    ) {
         match self {
-            Self::Scenario(report) => {
-                gate.evaluate(&report.score, &report.attribution, report.total_stddev)
-            }
-            Self::Suite(report) => {
-                gate.evaluate(&report.score, &report.attribution, report.total_stddev)
-            }
-            Self::Experiment(report) => {
-                gate.evaluate(&report.score, &report.attribution, report.total_stddev)
-            }
+            Self::Scenario(report) => (&report.score, &report.attribution, report.total_stddev),
+            Self::Suite(report) => (&report.score, &report.attribution, report.total_stddev),
+            Self::Experiment(report) => (&report.score, &report.attribution, report.total_stddev),
         }
+    }
+
+    fn evaluate_gate(&self, gate: &EvalGate) -> EvalGateReport {
+        let (score, attribution, total_stddev) = self.score_parts();
+        gate.evaluate(score, attribution, total_stddev)
     }
 
     fn attach_gate_report(&mut self, gate_report: EvalGateReport) {
@@ -854,7 +835,6 @@ async fn run_eval_command(cli: &Cli, config: EvalCommandConfig) -> Result<(), Bo
         gate,
         validate_only,
         summary_only,
-        auto_create_space,
         auto_create_tier,
         shared_formation,
         checkpoint_samples,
@@ -931,7 +911,6 @@ async fn run_eval_command(cli: &Cli, config: EvalCommandConfig) -> Result<(), Bo
             &space_id,
             &profiles[0],
             &scenarios,
-            auto_create_space,
             auto_create_tier,
             target,
             generations,
@@ -951,47 +930,29 @@ async fn run_eval_command(cli: &Cli, config: EvalCommandConfig) -> Result<(), Bo
             &space_id,
             &profiles,
             &scenarios,
-            auto_create_space,
             auto_create_tier,
             run_id,
             keep_spaces,
         )
         .await?;
         EvalCommandReport::Experiment(experiment)
-    } else if scenarios.len() == 1 && profiles.len() == 1 {
-        // Run-scoped id, matching the suite path: reusing a space across runs
-        // would let leftover memories from a previous run leak into scores.
-        let scenario_space_id = format!(
-            "{}_{}_{}_{}",
-            space_id,
-            sanitize_space_id_part(&profiles[0].id),
-            sanitize_space_id_part(&scenarios[0].id),
-            run_id
-        );
-        let space = load_eval_space(
-            &app_state,
-            &scenario_space_id,
-            auto_create_space,
-            auto_create_tier,
-        )
-        .await?;
-        let report = run_scenario(space.as_ref(), &scenarios[0], &profiles[0].profile).await?;
-        space.db.close().await?;
-        cleanup_eval_space(&app_state, &scenario_space_id, keep_spaces).await;
-        EvalCommandReport::Scenario(report)
     } else if profiles.len() == 1 {
-        let suite = run_eval_suite(
+        let mut suite = run_eval_suite(
             &app_state,
             &space_id,
             &profiles[0],
             &scenarios,
-            auto_create_space,
             auto_create_tier,
             run_id,
             keep_spaces,
         )
         .await?;
-        EvalCommandReport::Suite(suite)
+        if scenarios.len() == 1 {
+            // One scenario, one profile: report the bare scenario shape.
+            EvalCommandReport::Scenario(suite.reports.remove(0))
+        } else {
+            EvalCommandReport::Suite(suite)
+        }
     } else {
         let mut suites = Vec::with_capacity(profiles.len());
         for profile in &profiles {
@@ -1000,7 +961,6 @@ async fn run_eval_command(cli: &Cli, config: EvalCommandConfig) -> Result<(), Bo
                 &space_id,
                 profile,
                 &scenarios,
-                auto_create_space,
                 auto_create_tier,
                 run_id,
                 keep_spaces,
@@ -1195,37 +1155,33 @@ fn append_gate_summary(out: &mut String, gate_report: &EvalGateReport) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_eval_suite(
     app_state: &AppState,
     base_space_id: &str,
     profile: &NamedEvalProfile,
     scenarios: &[EvalScenario],
-    auto_create_space: bool,
     auto_create_tier: u32,
     run_id: u64,
     keep_spaces: bool,
 ) -> Result<EvalSuiteReport, BoxError> {
     let mut reports = Vec::with_capacity(scenarios.len());
     for scenario in scenarios {
-        let scenario_space_id = format!(
-            "{}_{}_{}_{}",
+        // Run-scoped id: reusing a space across runs would let leftover
+        // memories from a previous run leak into scores.
+        let scenario_space_id = compose_space_id(&[
             base_space_id,
-            sanitize_space_id_part(&profile.id),
-            sanitize_space_id_part(&scenario.id),
-            run_id
-        );
-        let space = load_eval_space(
-            app_state,
-            &scenario_space_id,
-            auto_create_space,
-            auto_create_tier,
-        )
-        .await?;
-        let report = run_scenario(space.as_ref(), scenario, &profile.profile).await?;
-        space.db.close().await?;
+            &profile.id,
+            &scenario.id,
+            &run_id.to_string(),
+        ]);
+        let space = load_eval_space(app_state, &scenario_space_id, auto_create_tier).await?;
+        // Close and clean the run-scoped space even when the scenario fails;
+        // otherwise every aborted run leaks its objects into the store.
+        let result = run_scenario(space.as_ref(), scenario, &profile.profile).await;
+        let close_result = space.db.close().await;
         cleanup_eval_space(app_state, &scenario_space_id, keep_spaces).await;
-        reports.push(report);
+        reports.push(result?);
+        close_result?;
     }
 
     Ok(EvalSuiteReport::from_reports(profile.id.clone(), reports))
@@ -1264,13 +1220,11 @@ fn parse_optimize_target(target: &str) -> Result<Option<PromptTarget>, BoxError>
 /// Every profile is judged on the identical encoded memory, so differences
 /// between suites measure the policy — not formation's LLM variance — and
 /// the most expensive phase runs once instead of once per profile.
-#[allow(clippy::too_many_arguments)]
 async fn run_shared_formation_experiment(
     app_state: &AppState,
     base_space_id: &str,
     profiles: &[NamedEvalProfile],
     scenarios: &[EvalScenario],
-    auto_create_space: bool,
     auto_create_tier: u32,
     run_id: u64,
     keep_spaces: bool,
@@ -1279,31 +1233,49 @@ async fn run_shared_formation_experiment(
     let mut profile_reports: Vec<Vec<EvalReport>> = vec![Vec::new(); profiles.len()];
 
     for scenario in scenarios {
-        let base_id = format!(
-            "{}_form_{}_{}",
-            base_space_id,
-            sanitize_space_id_part(&scenario.id),
-            run_id
-        );
-        let space =
-            load_eval_space(app_state, &base_id, auto_create_space, auto_create_tier).await?;
-        // The formation phase only reads timeouts from the profile.
-        let report = run_formation_phase(space.as_ref(), scenario, &profiles[0].profile).await?;
-        space.db.close().await?;
+        let base_id = compose_space_id(&[base_space_id, "form", &scenario.id, &run_id.to_string()]);
+        let space = load_eval_space(app_state, &base_id, auto_create_tier).await?;
+        // The formation phase only reads timeouts from the profile. Clean the
+        // base snapshot up even when a phase fails, so aborted runs do not
+        // leak objects into the store.
+        let formation_result =
+            run_formation_phase(space.as_ref(), scenario, &profiles[0].profile).await;
+        let close_result = space.db.close().await;
+        let report = match (formation_result, close_result) {
+            (Ok(report), Ok(())) => report,
+            (result, close_result) => {
+                cleanup_eval_space(app_state, &base_id, keep_spaces).await;
+                result?;
+                close_result?;
+                unreachable!("one of the results is an error");
+            }
+        };
         shared_reports.push(report);
 
-        for (index, profile) in profiles.iter().enumerate() {
-            let fork_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-            copy_space_objects(&app_state.object_store(), &fork_store, &base_id).await?;
-            let fork_state = app_state.fork_with_store(fork_store);
-            let fork_space = fork_state.load_space(&base_id, true).await?;
-            let report = run_policy_phase(fork_space.as_ref(), scenario, &profile.profile).await?;
-            fork_space.db.close().await?;
-            profile_reports[index].push(report);
-        }
+        // Forks are fully isolated — each lives in its own in-memory store —
+        // so every profile's policy phase can replay concurrently.
+        let fork_results = futures::future::try_join_all(profiles.iter().map(|profile| {
+            let base_id = base_id.clone();
+            async move {
+                let fork_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+                copy_space_objects(&app_state.object_store(), &fork_store, &base_id).await?;
+                let fork_state = app_state.fork_with_store(fork_store);
+                let fork_space = fork_state.load_space(&base_id, true).await?;
+                let result =
+                    run_policy_phase(fork_space.as_ref(), scenario, &profile.profile).await;
+                let close_result = fork_space.db.close().await;
+                let report = result?;
+                close_result?;
+                Ok::<EvalReport, BoxError>(report)
+            }
+        }))
+        .await;
         // The base snapshot is only needed until every profile has forked it.
         // (Forks live in their own in-memory stores and vanish on drop.)
         cleanup_eval_space(app_state, &base_id, keep_spaces).await;
+        for (index, report) in fork_results?.into_iter().enumerate() {
+            profile_reports[index].push(report);
+        }
     }
 
     let suites: Vec<EvalSuiteReport> = profiles
@@ -1327,7 +1299,6 @@ async fn run_optimize_command(
     base_space_id: &str,
     profile: &NamedEvalProfile,
     scenarios: &[EvalScenario],
-    auto_create_space: bool,
     auto_create_tier: u32,
     target: Option<PromptTarget>,
     generations: usize,
@@ -1339,9 +1310,8 @@ async fn run_optimize_command(
 ) -> Result<(), BoxError> {
     let run_id = anda_engine::unix_ms();
     // Scratch space whose model powers the optimizer's proposal calls.
-    let proposer_id = format!("{base_space_id}_optimizer_{run_id}");
-    let proposer =
-        load_eval_space(app_state, &proposer_id, auto_create_space, auto_create_tier).await?;
+    let proposer_id = compose_space_id(&[base_space_id, "optimizer", &run_id.to_string()]);
+    let proposer = load_eval_space(app_state, &proposer_id, auto_create_tier).await?;
 
     let mut config = OptimizeConfig {
         generations,
@@ -1366,7 +1336,6 @@ async fn run_optimize_command(
                 &base,
                 &profile,
                 &scenarios,
-                auto_create_space,
                 auto_create_tier,
                 run_id,
                 keep_spaces,
@@ -1474,29 +1443,27 @@ fn read_eval_profiles(paths: &[String]) -> Result<Vec<NamedEvalProfile>, BoxErro
         .collect()
 }
 
+/// Eval spaces are run-scoped and therefore always freshly created; creation
+/// failures fall through to `load_space`, which is the authority on whether
+/// the run can proceed (e.g. `--keep-spaces` leftovers reloaded on purpose).
 async fn load_eval_space(
     app_state: &AppState,
     space_id: &str,
-    auto_create_space: bool,
     auto_create_tier: u32,
 ) -> Result<Arc<anda_brain::space::Space>, BoxError> {
-    if auto_create_space {
-        match app_state
-            .admin_create_space(
-                SELF_USER_ID,
-                SELF_USER_ID,
-                space_id.to_string(),
-                auto_create_tier,
-                anda_engine::unix_ms(),
-            )
-            .await
-        {
-            Ok(_) => {}
-            Err(err) => {
-                // Existing local eval spaces are valid; `load_space` below is
-                // the authority on whether this run can proceed.
-                log::debug!(target: "brain", space_id = space_id; "eval space create skipped: {err:?}");
-            }
+    match app_state
+        .admin_create_space(
+            SELF_USER_ID,
+            SELF_USER_ID,
+            space_id.to_string(),
+            auto_create_tier,
+            anda_engine::unix_ms(),
+        )
+        .await
+    {
+        Ok(_) => {}
+        Err(err) => {
+            log::debug!(target: "brain", space_id = space_id; "eval space create skipped: {err:?}");
         }
     }
 
@@ -1512,10 +1479,13 @@ fn profile_id_from_path(path: &str) -> String {
         .unwrap_or_else(|| "profile".to_string())
 }
 
+/// AndaDB space names must match `[a-z0-9_]` (max 64 chars); anything else
+/// fails at space creation. Lowercase and map every other character to `_`.
 fn sanitize_space_id_part(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+        let ch = ch.to_ascii_lowercase();
+        if ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' {
             out.push(ch);
         } else {
             out.push('_');
@@ -1524,18 +1494,48 @@ fn sanitize_space_id_part(value: &str) -> String {
 
     let out = out.trim_matches('_');
     if out.is_empty() {
-        "scenario".to_string()
+        "part".to_string()
     } else {
         out.to_string()
     }
+}
+
+/// AndaDB rejects database names longer than 64 characters.
+const MAX_SPACE_ID_LEN: usize = 64;
+
+/// Joins sanitized parts into a space id and caps it at AndaDB's name limit.
+/// Over-long ids keep a readable prefix plus a hash of the full id, so two
+/// distinct long ids can never collide after truncation.
+fn compose_space_id(parts: &[&str]) -> String {
+    let id = parts
+        .iter()
+        .map(|part| sanitize_space_id_part(part))
+        .collect::<Vec<_>>()
+        .join("_");
+    if id.len() <= MAX_SPACE_ID_LEN {
+        return id;
+    }
+    let suffix = format!("_{:016x}", fnv1a(id.as_bytes()));
+    // The sanitized id is pure ASCII, so byte slicing cannot split a char.
+    format!("{}{suffix}", &id[..MAX_SPACE_ID_LEN - suffix.len()])
+}
+
+/// FNV-1a: a tiny stable hash for id truncation; not security-sensitive.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for &byte in bytes {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn read_json_file<T>(path: &str) -> Result<T, BoxError>
 where
     T: serde::de::DeserializeOwned,
 {
-    let data = std::fs::read(path)?;
-    Ok(serde_json::from_slice(&data)?)
+    let data = std::fs::read(path).map_err(|err| format!("failed to read {path}: {err}"))?;
+    serde_json::from_slice(&data).map_err(|err| format!("failed to parse {path}: {err}").into())
 }
 
 /// ```bash
@@ -1547,15 +1547,22 @@ async fn main() -> Result<(), BoxError> {
     dotenv::dotenv().ok();
     let cli = Cli::parse();
 
-    if !matches!(
-        cli.command,
-        Some(Commands::Mcp { .. } | Commands::Eval { .. })
-    ) {
-        // Initialize structured logging with JSON format. MCP stdio keeps stdout reserved
-        // for JSON-RPC messages. Eval uses stdout for JSON reports when no output path is set.
-        Builder::with_level(&get_env_level().to_string())
-            .with_target_writer("*", new_writer(tokio::io::stdout()))
-            .init();
+    match &cli.command {
+        // MCP stdio keeps stdout reserved for JSON-RPC messages.
+        Some(Commands::Mcp { .. }) => {}
+        // Eval reserves stdout for reports; logs (judge fallbacks, space
+        // setup) go to stderr instead of being silently dropped.
+        Some(Commands::Eval { .. }) => {
+            Builder::with_level(&get_env_level().to_string())
+                .with_target_writer("*", new_writer(tokio::io::stderr()))
+                .init();
+        }
+        _ => {
+            // Structured JSON logging on stdout for the HTTP service.
+            Builder::with_level(&get_env_level().to_string())
+                .with_target_writer("*", new_writer(tokio::io::stdout()))
+                .init();
+        }
     }
 
     // Create global cancellation token for graceful shutdown
@@ -1584,7 +1591,6 @@ async fn main() -> Result<(), BoxError> {
             max_findings,
             validate_only,
             summary_only,
-            auto_create_space,
             auto_create_tier,
             shared_formation,
             checkpoint_samples,
@@ -1609,7 +1615,6 @@ async fn main() -> Result<(), BoxError> {
                     },
                     validate_only,
                     summary_only,
-                    auto_create_space,
                     auto_create_tier,
                     shared_formation,
                     checkpoint_samples,
@@ -1677,11 +1682,12 @@ async fn create_reuse_port_listener(addr: SocketAddr) -> Result<tokio::net::TcpL
 #[cfg(test)]
 mod tests {
     use super::{
-        AnyHost, Cli, Commands, EvalCommandConfig, EvalCommandReport, StorageCommand, build_cors,
-        build_http_client, build_router, build_service_runtime, create_reuse_port_listener,
-        default_db_config, mcp_http_config_from_cli, model_config_from_cli,
-        normalize_http_path_prefix, object_store_from_command, parse_ed25519_pubkeys,
-        parse_managers, read_json_file, run_eval_command, run_service, split_csv_values,
+        AnyHost, Cli, Commands, EvalCommandConfig, EvalCommandReport, MAX_SPACE_ID_LEN,
+        StorageCommand, build_cors, build_http_client, build_router, build_service_runtime,
+        compose_space_id, create_reuse_port_listener, default_db_config, mcp_http_config_from_cli,
+        model_config_from_cli, normalize_http_path_prefix, object_store_from_command,
+        parse_ed25519_pubkeys, parse_managers, read_json_file, run_eval_command, run_service,
+        sanitize_space_id_part, split_csv_values,
     };
     use anda_brain::agents::SELF_USER_ID;
     use anda_brain::eval::{AttributionSummary, EvalGate, EvalReport, EvalScenario, EvalScore};
@@ -1839,7 +1845,6 @@ mod tests {
             max_findings: None,
             validate_only: false,
             summary_only: false,
-            auto_create_space: true,
             auto_create_tier: 1,
             shared_formation: false,
             checkpoint_samples: None,
@@ -1964,7 +1969,6 @@ mod tests {
                 gate: EvalGate::default(),
                 validate_only: true,
                 summary_only: false,
-                auto_create_space: false,
                 auto_create_tier: 1,
                 shared_formation: false,
                 checkpoint_samples: None,
@@ -2023,7 +2027,6 @@ mod tests {
                 gate: EvalGate::default(),
                 validate_only: true,
                 summary_only: true,
-                auto_create_space: false,
                 auto_create_tier: 1,
                 shared_formation: false,
                 checkpoint_samples: None,
@@ -2041,6 +2044,34 @@ mod tests {
         assert!(summary.contains("planned_runs: 1"));
         assert!(summary.contains("- summary normal=0 checkpoint=1"));
         assert!(summary.contains("- default maintenance=manual"));
+    }
+
+    #[test]
+    fn sanitize_space_id_part_matches_anda_db_charset() {
+        // AndaDB names only allow [a-z0-9_]: lowercase and fold the rest.
+        assert_eq!(
+            sanitize_space_id_part("Style-Preference"),
+            "style_preference"
+        );
+        assert_eq!(sanitize_space_id_part("__mixed 42__"), "mixed_42");
+        assert_eq!(sanitize_space_id_part("汉字"), "part");
+    }
+
+    #[test]
+    fn compose_space_id_caps_length_without_collisions() {
+        let short = compose_space_id(&["eval", "Default-Profile", "scenario", "123"]);
+        assert_eq!(short, "eval_default_profile_scenario_123");
+
+        let long_a = compose_space_id(&["eval", &"a".repeat(80), "scenario", "123"]);
+        let long_b = compose_space_id(&["eval", &"a".repeat(81), "scenario", "123"]);
+        assert_eq!(long_a.len(), MAX_SPACE_ID_LEN);
+        assert_eq!(long_b.len(), MAX_SPACE_ID_LEN);
+        assert_ne!(long_a, long_b, "hash suffix must keep long ids distinct");
+        assert!(
+            long_a
+                .chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+        );
     }
 
     #[test]

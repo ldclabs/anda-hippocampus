@@ -136,10 +136,17 @@ Beyond the basic replay loop, the harness supports:
   of hand-written KQL. The harness runs a semantic graph search and asks the
   judge whether the evidence shows the statement, so probes stay correct
   across valid encoding variations. Raw `probe` KQL remains as fallback.
+  `search_threshold` (default 0.35) and `search_limit` (default 8) tune the
+  search per expectation. A probe whose KIP request itself fails degrades to
+  a `graph_probe_error` finding — the expectation is scored as unknown, not
+  as a memory failure, and the run continues.
 - **Noise pressure** — a scenario-level `noise` config deterministically
   inserts chit-chat turns between authored anchors (`between_turns`, `seed`,
   optional `corpus`), scaling a 6-turn script into a long timeline where
-  Formation must keep the needle in a haystack.
+  Formation must keep the needle in a haystack. Noise turns count toward
+  `maintenance_every_n_turns` exactly like real user turns, so enabling noise
+  also increases auto-maintenance frequency — deliberately, so Maintenance
+  has real material to metabolize.
 - **Simulated users** — `"type": "simulated"` turns carry an `intent`; an
   eval-only user simulator writes the actual message from `hidden_profile`,
   the recent transcript, and the satisfaction trail, adapting its behavior
@@ -147,10 +154,13 @@ Beyond the basic replay loop, the harness supports:
   `satisfaction_trajectory` — the survival-pressure signal.
 - **Trajectory metrics** — aggregate scores weight later checkpoints more
   (an established memory failing late costs more than an early miss), and
-  `evolution_quality` compares late-half vs early-half checkpoint scores:
-  above 0.5 means the system improved over the timeline. `graph_health` reads
-  real metabolism counters (unsorted backlog, orphans) via read-only KIP
-  instead of probe execution success.
+  the aggregate `evolution_quality` compares late-half vs early-half
+  checkpoint scores: above 0.5 means the system improved over the timeline.
+  The trajectory value is informational — the aggregated `total` stays the
+  weighted mean of checkpoint totals (each of which used its own
+  checkpoint-level evolution estimate) and is not recomputed from it.
+  `graph_health` reads real metabolism counters (unsorted backlog, orphans)
+  via read-only KIP instead of probe execution success.
 - **Shared-formation experiments** — `--shared-formation` (with multiple
   `--profile`) replays formation once per scenario, snapshots the space, and
   forks the snapshot into an isolated in-memory store per profile. Every
@@ -173,11 +183,13 @@ Beyond the basic replay loop, the harness supports:
   powers the agents, so judge scores share that model's blind spots. Treat
   accepted prompts as candidates for human review, not as ground truth.
 - **Hermetic runs & cleanup** — every run executes in freshly created,
-  run-scoped spaces named `{space_id}_{profile}_{scenario}_{run_id}`, so
-  reruns never see memory left over from a previous run. These spaces are
-  deleted from the object store once their report is collected; pass
-  `--keep-spaces` to keep them for post-mortem inspection (e.g. poking the
-  graph with read-only KIP).
+  run-scoped spaces named `{space_id}_{profile}_{scenario}_{run_id}`
+  (lowercased to AndaDB's `[a-z0-9_]` charset and capped at 64 chars with a
+  hash suffix), so reruns never see memory left over from a previous run.
+  These spaces are deleted from the object store once their report is
+  collected — including when a scenario aborts — and pass `--keep-spaces` to
+  keep them for post-mortem inspection (e.g. poking the graph with read-only
+  KIP).
 
 Scenario and profile JSON is parsed strictly: an unknown field (usually a
 typo like `forbidden_terms` for `forbidden_answer_terms`) fails the load

@@ -38,9 +38,11 @@ pub struct RetrievalFixture {
     pub cases: Vec<RetrievalCase>,
 }
 
-/// The fixture shipped with the repo (`anda_brain/evals/wiki_retrieval.json`).
+/// The fixture shipped with the repo (`anda_brain/evals/wiki/retrieval.json`).
+/// It lives in a subdirectory because the top-level `evals/*.json` files are
+/// memory-eval-harness fixtures, globbed and validated as such by CI.
 pub fn builtin_fixture() -> RetrievalFixture {
-    serde_json::from_str(include_str!("../../evals/wiki_retrieval.json"))
+    serde_json::from_str(include_str!("../../evals/wiki/retrieval.json"))
         .expect("builtin wiki retrieval fixture must parse")
 }
 

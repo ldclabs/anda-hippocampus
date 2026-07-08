@@ -2,9 +2,12 @@
 
 All notable changes to the Anda Brain project.
 
-## [Unreleased] — 2026-07-03
+## [Unreleased] — 2026-07-08
 
 ### Added
+- **Configurable semantic probe search.** Memory expectations accept `search_threshold` (default 0.35) and `search_limit` (default 8) for assertion probes; search text is now escaped for backslashes as well as quotes, and both fields are validated offline.
+- **Eval report provenance.** `EvalReport` now records `profile_id`, the checkpoint `model`, and `started_at`, so reports can be compared across runs without external bookkeeping; checkpoint turns also carry the representative sample's model.
+- **Fixture globbing in CI and `make eval-validate`.** Both now validate every `anda_brain/evals/*.json` fixture automatically (`*_profile.json` as profiles, the rest as scenarios), and a unit test (`bundled_eval_fixtures_parse_and_validate`) parses and validates the same set in `cargo test`. The wiki retrieval fixture moved to `anda_brain/evals/wiki/retrieval.json` to keep the top-level directory harness-only.
 - **Checkpoint sampling with variance-aware gates.** Eval profiles accept `checkpoint_samples: N` (or `--checkpoint-samples`) to run Recall N times per checkpoint, reporting mean scores plus a propagated `total_stddev`; findings only count with majority support across samples, and `--confidence-z` makes `--min-score` gate on the lower confidence bound instead of a single noisy roll.
 - **Shared-formation experiments.** `anda_brain eval --shared-formation` replays formation once per scenario, snapshots the space objects, and forks the snapshot into an isolated in-memory store per profile (`space::copy_space_objects` + `AppState::fork_with_store`), so maintenance policies are compared on identical encoded memory without formation LLM variance — and the most expensive phase runs once instead of once per profile.
 - **LLM-as-judge scoring.** Profiles with `"judge": "llm"` score checkpoint answers against the rubric's previously unused `scoring_rubric` and the scenario `hidden_profile`: paraphrases count fully, correct meta-references to superseded facts are no longer penalized as stale, and the judge emits attributed findings plus a per-checkpoint satisfaction signal. Lexical scoring remains the deterministic default.
@@ -21,11 +24,25 @@ All notable changes to the Anda Brain project.
 - **Strict eval fixture parsing.** Scenario and profile JSON now rejects unknown fields, turning rubric typos (e.g. `forbidden_terms` for `forbidden_answer_terms`) into load errors instead of silently weakened rubrics that still pass validation.
 
 ### Fixed
+- **Agent failures are attributed to the stage that ran them.** A Formation agent failure now counts as `formation_miss` and a Maintenance failure as `bad_consolidation` (previously both were recorded as `bad_synthesis`), keeping attribution and the prompt optimizer's target selection honest.
+- **Probe transport errors degrade instead of aborting.** A failed read-only KIP request during memory probing becomes a `graph_probe_error` finding and the run continues; previously it aborted the scenario and discarded every completed report in the suite.
+- **Errored probes are no longer double-counted as memory failures.** An expectation whose probe errored (transport or KIP `Response::Err`) is scored as unknown — excluded from presence/forgetting weights — instead of also producing a `formation_miss`/`bad_consolidation` finding.
+- **Unused expectation `answer_terms` now lower the lexical score.** Lexical utility averages probe-verified presence, required-term coverage, and expectation answer-term coverage, so a memory that exists but never reaches the answer costs points, not just findings.
+- **Symmetric judge/harness finding dedup.** A judge finding with an expectation id no longer double-counts a harness finding of the same kind recorded without one.
+- **Run-scoped space ids always satisfy AndaDB naming rules.** Composed eval space ids are lowercased to `[a-z0-9_]` and capped at 64 chars with a hash suffix, so uppercase/hyphenated scenario or profile ids and long `--space-id` values no longer fail at space creation.
+- **Aborted eval runs no longer leak spaces.** Run-scoped spaces are closed and deleted even when a scenario or phase fails, across the suite, shared-formation, and optimizer paths.
+- **Eval logs to stderr.** The eval command now initializes a stderr logger (stdout stays reserved for reports), so judge fallbacks and space setup are no longer silently dropped.
+- **Trace grounding attribution matches tool outputs only.** Term evidence is no longer searched in tool names/args, where recall echoes the user's query, misclassifying grounding failures as synthesis failures.
+- **Removed the ineffective `--auto-create-space` eval flag.** Run-scoped spaces are always freshly created; the boolean flag could not be disabled from the CLI anyway.
 - **Eval turns no longer race in-flight maintenance.** Maintenance turns wait for the processing flag even when a cycle was already running (the agent returns no conversation id in that case), and checkpoints wait for maintenance to go idle before probing, so hook-triggered auto-maintenance can no longer let probes read a graph mid-consolidation.
 - **Stuck background stages degrade to findings instead of aborting the suite.** Formation/maintenance wait timeouts are recorded as `formation_miss` / `bad_consolidation` findings and the run continues; failure attribution now also counts findings from non-checkpoint turns.
 - **Judge findings no longer double-count harness findings.** Under the LLM judge, a judge finding duplicating an already-recorded probe/term finding of the same kind (and expectation) is dropped, keeping `--max-findings` gates honest.
 - **Checkpoint token budgets no longer double-count cached tokens.** `max_checkpoint_total_tokens` now budgets input + output tokens only, since the OpenAI adapter already includes cached tokens in `input_tokens` while the Anthropic adapter reports cache reads separately.
 - **`--optimize` now rejects `--min-score`/`--max-findings`** instead of silently ignoring them, and `--confidence-z` feeds the optimizer's accept/reject noise band.
+
+### Changed
+- **Shared-formation policy phases run concurrently.** Each profile's fork lives in its own in-memory store, so the policy replays now run in parallel per scenario.
+- **JSON fixture load errors include the file path.**
 
 ## [0.9.2] — 2026-06-28
 
