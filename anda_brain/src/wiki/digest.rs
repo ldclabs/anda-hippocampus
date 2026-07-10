@@ -17,8 +17,8 @@ use anda_db::{
     query::{Filter, Fv, Query, RangeQuery},
     schema::Json,
 };
-use anda_engine::{context::AgentCtx, memory::MemoryManagement};
-use anda_kip::parse_kml;
+use anda_engine::{context::AgentCtx, memory::MemoryManagement, model::Models};
+use anda_kip::{parse_kml, parse_kql};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -30,18 +30,27 @@ use std::{
 };
 
 use super::{
-    Collection, EVENT_DIGEST_EXTRACTED, WikiChunkRecord, WikiDocRecord, WikiError, WikiService,
-    WikiVerifyInput, WikiVerifyStatus, WikiVersionRecord, chunk::chunk_checksum, citation_uri,
-    evalset::EVAL_NAMESPACE,
+    Collection, EVENT_DIGEST_EXTRACTED, EVENT_DIGEST_FAILED, WikiChunkRecord, WikiDocRecord,
+    WikiError, WikiService, WikiVerifyInput, WikiVerifyStatus, WikiVersionRecord,
+    chunk::chunk_checksum, citation_uri, evalset::EVAL_NAMESPACE,
 };
 
-/// Extractor fingerprint written into proposition metadata; bump on prompt
-/// or renderer changes so maintenance can bulk-invalidate old extractions.
+/// Extractor fingerprint prefix written into proposition metadata; bump on
+/// prompt or renderer changes so maintenance can bulk-invalidate old
+/// extractions. The full fingerprint appends the model id (PRD §7.3):
+/// `wiki_digest@v1/<model_id>`.
 pub const WIKI_DIGEST_EXTRACTOR: &str = "wiki_digest@v1";
 const DIGEST_PROMPT: &str = include_str!("../../assets/BrainWikiDigest.md");
 /// Collection-extension key holding the digest high-water mark (version id).
 const DIGEST_CURSOR_KEY: &str = "wiki_digested";
 const DIGEST_USAGE_KEY: &str = "wiki_digest_usage";
+/// Collection-extension key tracking consecutive failures of one version
+/// (the poison-version fuse).
+const DIGEST_FAILURE_KEY: &str = "wiki_digest_failure";
+/// After this many consecutive failures a version is skipped (with a
+/// `DigestFailed` event) instead of wedging the pipeline and re-burning
+/// tokens every run.
+const MAX_VERSION_FAILURES: u64 = 3;
 const MAX_FACTS_PER_VERSION: usize = 64;
 const MAX_EXTRA_CONCEPTS: usize = 64;
 const MAX_BATCH_BYTES: usize = 24 * 1024;
@@ -62,8 +71,23 @@ impl Drop for RunningGuard {
 pub struct WikiDigest {
     wiki: Arc<WikiService>,
     memory: Arc<MemoryManagement>,
+    /// For the extractor fingerprint: `wiki_digest@v1/<model_id>`.
+    models: Arc<Models>,
     /// 0 = idle; otherwise the version id currently being digested.
     running: Arc<AtomicU64>,
+}
+
+/// Outcome of one version's digest attempt.
+enum DigestOutcome {
+    Digested,
+    /// Permanently not digestible (superseded, archived, labeled, eval
+    /// corpus, reclaimed): the cursor advances past it.
+    Skipped,
+    /// The version row exists but its document has not flipped to it yet
+    /// (commit in flight, or a crash leftover awaiting the orphan sweep):
+    /// the cursor must NOT advance, or the version would silently never be
+    /// digested.
+    NotReady,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -131,8 +155,11 @@ pub struct DigestedFact {
     pub checksum: String,
 }
 
+/// (subject_type, subject_name, predicate, object_type, object_name)
+type TripleKey = (String, String, String, String, String);
+
 impl DigestedFact {
-    fn triple_key(&self) -> (String, String, String, String, String) {
+    fn triple_key(&self) -> TripleKey {
         (
             self.subject_type.clone(),
             self.subject_name.clone(),
@@ -144,16 +171,26 @@ impl DigestedFact {
 }
 
 impl WikiDigest {
-    pub fn new(wiki: Arc<WikiService>, memory: Arc<MemoryManagement>) -> Self {
+    pub fn new(wiki: Arc<WikiService>, memory: Arc<MemoryManagement>, models: Arc<Models>) -> Self {
         Self {
             wiki,
             memory,
+            models,
             running: Arc::new(AtomicU64::new(0)),
         }
     }
 
     pub fn is_processing(&self) -> bool {
         self.running.load(Ordering::SeqCst) != 0
+    }
+
+    /// The extractor fingerprint, model id included, so §13's
+    /// "bulk-invalidate by fingerprint" can target one model's extractions.
+    fn extractor(&self) -> String {
+        match self.models.get_model() {
+            Some(model) => format!("{WIKI_DIGEST_EXTRACTOR}/{}", model.model_name()),
+            None => WIKI_DIGEST_EXTRACTOR.to_string(),
+        }
     }
 
     /// High-water mark: the largest version id already digested (or skipped).
@@ -215,18 +252,56 @@ impl WikiDigest {
                     .digest_version(&ctx, &version, now_ms, &mut report)
                     .await
                 {
-                    Ok(()) => {
+                    Ok(DigestOutcome::NotReady) => {
+                        // Commit in flight: retry from here next run (the
+                        // orphan sweep reclaims it if the commit crashed).
+                        break 'run;
+                    }
+                    Ok(_) => {
                         cursor = version._id;
                         self.save_cursor(cursor).await;
+                        self.clear_failure();
                     }
                     Err(err) => {
+                        let failures = self.bump_failure(version._id);
+                        if failures >= MAX_VERSION_FAILURES {
+                            // Poison-version fuse: skip it after repeated
+                            // failures so one bad document cannot wedge the
+                            // pipeline and re-burn tokens forever.
+                            log::error!(
+                                target: "brain",
+                                version_id = version._id,
+                                doc_id = version.doc_id;
+                                "wiki digest failed {failures} times, skipping version: {err:?}"
+                            );
+                            let _ = self
+                                .wiki
+                                .write_event(
+                                    EVENT_DIGEST_FAILED,
+                                    Some(version.doc_id),
+                                    Some(version._id),
+                                    "wiki_digest".to_string(),
+                                    BTreeMap::from([
+                                        ("error".to_string(), Json::from(err.to_string())),
+                                        ("attempts".to_string(), Json::from(failures)),
+                                        ("extractor".to_string(), Json::from(self.extractor())),
+                                    ]),
+                                    now_ms,
+                                )
+                                .await;
+                            cursor = version._id;
+                            self.save_cursor(cursor).await;
+                            self.clear_failure();
+                            report.skipped += 1;
+                            continue;
+                        }
                         // Leave the cursor before the failed version: the
                         // next run retries it instead of silently skipping.
                         log::error!(
                             target: "brain",
                             version_id = version._id,
                             doc_id = version.doc_id;
-                            "wiki digest failed: {err:?}"
+                            "wiki digest failed (attempt {failures}/{MAX_VERSION_FAILURES}): {err:?}"
                         );
                         self.save_usage(&report.usage).await;
                         return Err(err);
@@ -248,31 +323,50 @@ impl WikiDigest {
         version: &WikiVersionRecord,
         now_ms: u64,
         report: &mut WikiDigestReport,
-    ) -> Result<(), BoxError> {
+    ) -> Result<DigestOutcome, BoxError> {
         let doc = match self.wiki.doc_record(version.doc_id).await {
             Ok(doc) => doc,
             // Orphan or reclaimed document: nothing to digest.
             Err(WikiError::NotFound(_)) => {
                 report.skipped += 1;
-                return Ok(());
+                return Ok(DigestOutcome::Skipped);
             }
             Err(err) => return Err(err.into()),
         };
+        if version._id > doc.current_version {
+            // Written but not flipped: a concurrent commit is between step 1
+            // and its activation point. Advancing past it here would leave
+            // the graph stale until the document's next commit.
+            return Ok(DigestOutcome::NotReady);
+        }
         if doc.current_version != version._id
             || doc.status != super::DOC_STATUS_ACTIVE
             || doc.namespace == EVAL_NAMESPACE
+            // The Cognitive Nexus has no ACL: distilling a labeled document
+            // would let any Read principal recall its facts (and citation
+            // URIs) through the graph.
+            || !doc.acl_label.is_empty()
         {
             report.skipped += 1;
-            return Ok(());
+            return Ok(DigestOutcome::Skipped);
         }
 
         let chunks = self.current_chunks(&doc, version._id).await?;
         let extraction = self.extract(ctx, &doc, version, &chunks, report).await?;
-        let facts = normalize_facts(&self.wiki.space_id, &doc, version, &chunks, &extraction);
+        let extractor = self.extractor();
+        let (facts, alive) =
+            normalize_facts(&self.wiki.space_id, &doc, version, &chunks, &extraction);
 
         let mut proposition_ids: Vec<String> = Vec::new();
         if !facts.is_empty() {
-            let kml = render_digest_kml(&self.wiki.space_id, &doc, version, &extraction, &facts);
+            let kml = render_digest_kml(
+                &self.wiki.space_id,
+                &doc,
+                version,
+                &extraction,
+                &facts,
+                &extractor,
+            );
             let response = self
                 .memory
                 .nexus
@@ -289,7 +383,7 @@ impl WikiDigest {
                 .unwrap_or_default();
         }
 
-        let superseded = self.supersede_stale(&doc, version, &facts, now_ms).await?;
+        let superseded = self.supersede_stale(&doc, version, &alive, now_ms).await?;
 
         self.wiki
             .write_event(
@@ -307,10 +401,7 @@ impl WikiDigest {
                         Json::from(proposition_ids.clone()),
                     ),
                     ("superseded".to_string(), Json::from(superseded as u64)),
-                    (
-                        "extractor".to_string(),
-                        Json::from(WIKI_DIGEST_EXTRACTOR.to_string()),
-                    ),
+                    ("extractor".to_string(), Json::from(extractor)),
                 ]),
                 now_ms,
             )
@@ -319,7 +410,7 @@ impl WikiDigest {
         report.digested += 1;
         report.facts += facts.len();
         report.superseded += superseded;
-        Ok(())
+        Ok(DigestOutcome::Digested)
     }
 
     async fn current_chunks(
@@ -436,25 +527,32 @@ impl WikiDigest {
     /// Marks propositions asserted by this document's previous digest but
     /// absent from the new one as superseded. Per-fact capsules keep one
     /// missing endpoint (e.g. merged away by maintenance) from aborting the
-    /// rest.
+    /// rest. `alive` covers every valid extracted triple (not just the
+    /// persisted, capped prefix) so a large document never mis-supersedes
+    /// facts that were merely truncated away.
     async fn supersede_stale(
         &self,
         doc: &WikiDocRecord,
         version: &WikiVersionRecord,
-        new_facts: &[DigestedFact],
+        alive: &BTreeSet<TripleKey>,
         _now_ms: u64,
     ) -> Result<usize, BoxError> {
         let previous = self.previous_digest_facts(doc._id, version._id).await?;
         if previous.is_empty() {
             return Ok(0);
         }
-        let alive: BTreeSet<_> = new_facts.iter().map(DigestedFact::triple_key).collect();
         let superseded_by =
             citation_uri(&self.wiki.space_id, doc._id, version._id, 0, version.size);
 
         let mut superseded = 0usize;
         for fact in previous {
             if alive.contains(&fact.triple_key()) {
+                continue;
+            }
+            // Graph maintenance may have metabolized the proposition away; a
+            // supersede UPSERT would then resurrect it as a tombstone. Only
+            // touch propositions that still exist.
+            if !self.proposition_exists(&fact).await {
                 continue;
             }
             let kml = render_supersede_kml(&fact, &superseded_by);
@@ -476,6 +574,32 @@ impl WikiDigest {
             }
         }
         Ok(superseded)
+    }
+
+    /// Existence probe for one (subject, predicate, object) proposition.
+    /// Fails toward `true`: a redundant superseded marker is cheaper than a
+    /// stale fact staying active because the probe errored.
+    async fn proposition_exists(&self, fact: &DigestedFact) -> bool {
+        let kql = format!(
+            "FIND(?link) WHERE {{ ?link ({}, {}, {}) }} LIMIT 1",
+            concept_literal(&fact.subject_type, &fact.subject_name),
+            serde_json::to_string(&fact.predicate).unwrap_or_default(),
+            concept_literal(&fact.object_type, &fact.object_name),
+        );
+        let query = match parse_kql(&kql) {
+            Ok(query) => query,
+            Err(err) => {
+                log::warn!(target: "brain", "proposition existence kql parse failed: {err:?}");
+                return true;
+            }
+        };
+        match self.memory.nexus.execute_kql(query).await {
+            Ok((result, _)) => kql_has_rows(&result),
+            Err(err) => {
+                log::warn!(target: "brain", "proposition existence probe failed: {err:?}");
+                true
+            }
+        }
     }
 
     /// Facts recorded by the most recent digest of this document before the
@@ -502,14 +626,25 @@ impl WikiDigest {
         let Some(event) = latest else {
             return Ok(Vec::new());
         };
-        let facts = event
+        let facts = match event
             .detail
             .get("facts")
             .cloned()
             .map(serde_json::from_value::<Vec<DigestedFact>>)
-            .transpose()
-            .unwrap_or_default()
-            .unwrap_or_default();
+        {
+            Some(Ok(facts)) => facts,
+            Some(Err(err)) => {
+                // Schema drift would otherwise disable superseding silently.
+                log::warn!(
+                    target: "brain",
+                    doc_id = doc_id,
+                    event_id = event.id;
+                    "digest ledger facts unreadable, superseding skipped for this pass: {err}"
+                );
+                Vec::new()
+            }
+            None => Vec::new(),
+        };
         Ok(facts)
     }
 
@@ -559,17 +694,28 @@ impl WikiDigest {
     }
 
     async fn save_cursor(&self, cursor: u64) {
-        let _ = self
+        if let Err(err) = self
             .wiki
             .docs
             .save_extension(DIGEST_CURSOR_KEY.to_string(), cursor.into())
-            .await;
+            .await
+        {
+            // Non-fatal: the next run re-digests from the stale cursor
+            // (idempotent for the graph, but re-billed), so be loud.
+            log::warn!(
+                target: "brain",
+                cursor = cursor;
+                "wiki digest cursor save failed (next run will re-digest): {err:?}"
+            );
+        }
     }
 
     async fn save_usage(&self, usage: &Usage) {
         if usage.requests == 0 {
             return;
         }
+        // In-memory metadata update, flushed with the collection; the return
+        // value is the previous entry (None on first write), not an error.
         let _ =
             self.wiki
                 .docs
@@ -578,6 +724,43 @@ impl WikiDigest {
                     total.accumulate(usage);
                     Some(total)
                 });
+    }
+
+    /// Consecutive-failure counter for the poison fuse; resets whenever a
+    /// different version fails or any version succeeds.
+    fn bump_failure(&self, version_id: u64) -> u64 {
+        let mut count = 1u64;
+        let _ = self.wiki.docs.set_extension_from_with::<_, (u64, u64)>(
+            DIGEST_FAILURE_KEY.to_string(),
+            |v| {
+                if let Some((prev, prev_count)) = v
+                    && prev == version_id
+                {
+                    count = prev_count + 1;
+                }
+                Some((version_id, count))
+            },
+        );
+        count
+    }
+
+    fn clear_failure(&self) {
+        let _ = self
+            .wiki
+            .docs
+            .set_extension_from_with::<_, (u64, u64)>(DIGEST_FAILURE_KEY.to_string(), |_| {
+                Some((0, 0))
+            });
+    }
+}
+
+/// Whether a KQL FIND result contains any row.
+fn kql_has_rows(result: &Json) -> bool {
+    match result {
+        Json::Array(rows) => !rows.is_empty(),
+        Json::Object(map) => map.values().any(kql_has_rows),
+        Json::Null => false,
+        _ => true,
     }
 }
 
@@ -610,13 +793,16 @@ fn clean_ident(value: &str) -> Option<String> {
 
 /// Validates extracted facts and resolves each anchor to its chunk's byte
 /// range and checksum; facts with unknown anchors cite the whole version.
+/// Returns the persisted facts (capped at [`MAX_FACTS_PER_VERSION`]) plus
+/// the alive-set of ALL valid triples: superseding compares against the
+/// uncapped set, so truncation never marks a still-asserted fact stale.
 fn normalize_facts(
     space_id: &str,
     doc: &WikiDocRecord,
     version: &WikiVersionRecord,
     chunks: &[WikiChunkRecord],
     extraction: &Extraction,
-) -> Vec<DigestedFact> {
+) -> (Vec<DigestedFact>, BTreeSet<TripleKey>) {
     let by_anchor: BTreeMap<&str, &WikiChunkRecord> = chunks
         .iter()
         .map(|chunk| (chunk.anchor.as_str(), chunk))
@@ -631,12 +817,9 @@ fn normalize_facts(
         ),
     );
 
-    let mut seen = BTreeSet::new();
+    let mut alive = BTreeSet::new();
     let mut facts = Vec::new();
     for fact in &extraction.facts {
-        if facts.len() >= MAX_FACTS_PER_VERSION {
-            break;
-        }
         let (Some(s_type), Some(s_name), Some(predicate), Some(o_type), Some(o_name)) = (
             clean_ident(&fact.subject.r#type),
             clean_ident(&fact.subject.name),
@@ -673,11 +856,11 @@ fn normalize_facts(
             citation,
             checksum,
         };
-        if seen.insert(normalized.triple_key()) {
+        if alive.insert(normalized.triple_key()) && facts.len() < MAX_FACTS_PER_VERSION {
             facts.push(normalized);
         }
     }
-    facts
+    (facts, alive)
 }
 
 /// Renders a KIP object literal with unquoted identifier keys (the concept
@@ -712,6 +895,7 @@ fn render_digest_kml(
     version: &WikiVersionRecord,
     extraction: &Extraction,
     facts: &[DigestedFact],
+    extractor: &str,
 ) -> String {
     let mut concept_types = BTreeSet::new();
     let mut predicates = BTreeSet::new();
@@ -780,6 +964,12 @@ fn render_digest_kml(
                 ("confidence", json!(fact.confidence)),
                 ("citation", json!(fact.citation)),
                 ("checksum", json!(fact.checksum)),
+                // A fact can vanish in one revision (marked superseded) and
+                // return in a later one; nexus metadata merges are shallow
+                // and keep stale keys, so the re-assertion must explicitly
+                // clear the tombstone.
+                ("status", json!("active")),
+                ("superseded_by", Json::Null),
             ])
         ));
     }
@@ -789,7 +979,7 @@ fn render_digest_kml(
         kip_object(&[
             ("source", json!("wiki")),
             ("author", json!("$self")),
-            ("extractor", json!(WIKI_DIGEST_EXTRACTOR)),
+            ("extractor", json!(extractor)),
             ("doc_id", json!(doc._id)),
             ("version_id", json!(version._id)),
             (
@@ -896,7 +1086,14 @@ mod tests {
             "publishes",
             ("Policy", "安全政策"),
         )];
-        let kml = render_digest_kml("sp", &doc, &version, &Extraction::default(), &facts);
+        let kml = render_digest_kml(
+            "sp",
+            &doc,
+            &version,
+            &Extraction::default(),
+            &facts,
+            "wiki_digest@v1/test-model",
+        );
 
         assert!(kml.contains(r#"{type: "$ConceptType", name: "Organization"}"#));
         assert!(kml.contains(r#"{type: "$ConceptType", name: "Policy"}"#));
@@ -904,8 +1101,11 @@ mod tests {
         assert!(kml.contains(r#"{type: "Organization", name: "Acme \"quoted\""}"#));
         assert!(kml.contains(r#"(?c0, "publishes", ?c1)"#));
         assert!(kml.contains(r#"citation: "wiki://sp/1@2#0-10""#));
-        assert!(kml.contains(r#"extractor: "wiki_digest@v1""#));
+        assert!(kml.contains(r#"extractor: "wiki_digest@v1/test-model""#));
         assert!(kml.contains(r#"source: "wiki""#));
+        // A re-asserted fact must clear a stale superseded tombstone.
+        assert!(kml.contains(r#"status: "active""#));
+        assert!(kml.contains("superseded_by: null"));
         // Renderer output must parse as valid KML.
         assert!(parse_kml(&kml).is_ok());
 
@@ -1023,11 +1223,84 @@ mod tests {
             ],
         };
 
-        let facts = normalize_facts("sp", &doc, &version, &[chunk], &extraction);
+        let (facts, alive) = normalize_facts("sp", &doc, &version, &[chunk], &extraction);
         assert_eq!(facts.len(), 2);
+        assert_eq!(alive.len(), 2);
         assert_eq!(facts[0].confidence, 1.0);
         assert_eq!(facts[0].citation, "wiki://sp/1@2#0-5");
         assert_eq!(facts[0].checksum, "sha3-256:chunk");
         assert_eq!(facts[1].citation, "wiki://sp/1@2#0-10");
+    }
+
+    #[test]
+    fn alive_set_is_not_capped_by_fact_truncation() {
+        let doc = WikiDocRecord {
+            _id: 1,
+            namespace: "kb".to_string(),
+            slug: "d".to_string(),
+            title: "t".to_string(),
+            status: super::super::DOC_STATUS_ACTIVE.to_string(),
+            current_version: 2,
+            current_checksum: String::new(),
+            tags: vec![],
+            acl_label: String::new(),
+            source_uri: None,
+            metadata: BTreeMap::new(),
+            created_by: String::new(),
+            updated_by: String::new(),
+            created_at: 0,
+            updated_at: 0,
+        };
+        let version = WikiVersionRecord {
+            _id: 2,
+            doc_id: 1,
+            parent_version: None,
+            checksum: "sha3-256:v".to_string(),
+            content: "x".to_string(),
+            size: 1,
+            author: String::new(),
+            message: None,
+            created_at: 0,
+        };
+        let extraction = Extraction {
+            concepts: vec![],
+            facts: (0..MAX_FACTS_PER_VERSION + 10)
+                .map(|i| ExtractedFact {
+                    subject: ConceptRef {
+                        r#type: "A".into(),
+                        name: format!("a{i}"),
+                    },
+                    predicate: "p".into(),
+                    object: ConceptRef {
+                        r#type: "B".into(),
+                        name: "b".into(),
+                    },
+                    confidence: None,
+                    anchor: None,
+                })
+                .collect(),
+        };
+        let (facts, alive) = normalize_facts("sp", &doc, &version, &[], &extraction);
+        // Persisted facts are capped, but the alive set keeps every valid
+        // triple so superseding never treats truncated facts as stale.
+        assert_eq!(facts.len(), MAX_FACTS_PER_VERSION);
+        assert_eq!(alive.len(), MAX_FACTS_PER_VERSION + 10);
+        let truncated = &extraction.facts[MAX_FACTS_PER_VERSION + 5];
+        let key = (
+            "A".to_string(),
+            truncated.subject.name.clone(),
+            "p".to_string(),
+            "B".to_string(),
+            "b".to_string(),
+        );
+        assert!(alive.contains(&key));
+    }
+
+    #[test]
+    fn kql_has_rows_detects_emptiness() {
+        assert!(!kql_has_rows(&json!({"?link": []})));
+        assert!(!kql_has_rows(&json!(null)));
+        assert!(kql_has_rows(&json!({"?link": [{"id": "P1"}]})));
+        assert!(kql_has_rows(&json!([{"id": "P1"}])));
     }
 }

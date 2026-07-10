@@ -17,6 +17,9 @@ pub enum WikiError {
     /// merge, and retry with the returned `current_version`.
     Conflict {
         current_version: u64,
+        /// Checksum of the current content (PRD §13): lets the caller detect
+        /// "same content, different version" without an extra read.
+        current_checksum: String,
         updated_by: String,
         updated_at: u64,
     },
@@ -36,11 +39,12 @@ impl std::fmt::Display for WikiError {
         match self {
             Self::Conflict {
                 current_version,
+                current_checksum,
                 updated_by,
                 updated_at,
             } => write!(
                 f,
-                "commit conflict: document is at version {current_version} (updated by {updated_by} at {updated_at}); re-read, merge, and retry with parent_version={current_version}"
+                "commit conflict: document is at version {current_version} (checksum {current_checksum}, updated by {updated_by} at {updated_at}); re-read, merge, and retry with parent_version={current_version}"
             ),
             Self::TooLarge { size, max } => write!(
                 f,
@@ -255,13 +259,14 @@ pub struct WikiCitation {
     pub quote: String,
 }
 
+/// One retrieval hit. PRD §5.1 sketches a `score` field; AndaDB's search
+/// API returns relevance-ordered ids without exposing BM25 scores, so hits
+/// carry rank order only.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct WikiHit {
     pub text: String,
     pub doc_title: String,
     pub heading_path: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub score: Option<f32>,
     pub citation: WikiCitation,
 }
 
@@ -544,20 +549,11 @@ pub fn parse_citation_uri(uri: &str) -> Option<(String, u64, u64, u64, u64)> {
     ))
 }
 
+/// Title derivation from the first ATX heading. Fence-aware: a `# comment`
+/// inside a code block never becomes the title (the v1 regression PRD §4.2
+/// calls out), matching the chunker's fence rules exactly.
 pub(crate) fn markdown_title(content: &str) -> Option<String> {
-    content.lines().find_map(|line| {
-        let trimmed = line.trim_start();
-        let level = trimmed.chars().take_while(|ch| *ch == '#').count();
-        if !(1..=6).contains(&level) {
-            return None;
-        }
-        let title = trimmed.get(level..)?.trim().trim_end_matches('#').trim();
-        if title.is_empty() {
-            None
-        } else {
-            Some(title.to_string())
-        }
-    })
+    super::chunk::first_heading_title(content)
 }
 
 fn normalize_opt(value: &mut Option<String>) {

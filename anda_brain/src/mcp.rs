@@ -35,8 +35,8 @@ use crate::{
         RecallInput, TokenScope,
     },
     wiki::{
-        WikiAccess, WikiCommitInput, WikiError, WikiReadInput, WikiSearchInput, WikiSearchMode,
-        WikiSelector, WikiVerifyInput,
+        WikiCommitInput, WikiError, WikiReadInput, WikiSearchInput, WikiSearchMode, WikiSelector,
+        WikiVerifyInput,
     },
 };
 
@@ -444,12 +444,24 @@ impl AndaBrainMcpServer {
     }
 
     /// Like [`Self::load_authorized_space`] but also returns the verified
-    /// space token so wiki tools can honor its ACL labels (PRD §8.2).
+    /// CWT and space token so wiki tools can resolve the caller's ACL view
+    /// and audit actor (PRD §8.2): CWT holders are unrestricted, space
+    /// tokens carry their labels, and an anonymous public-space reader is
+    /// neither — the caller must map that to the unlabeled-only view. A
+    /// supplied space token is verified even on public spaces so a labeled
+    /// token keeps its granted labels instead of degrading to anonymous.
     async fn load_authorized_space_with_token(
         &self,
         scope: TokenScope,
         access: &McpAccess,
-    ) -> Result<(Arc<Space>, Option<crate::types::SpaceToken>), ErrorData> {
+    ) -> Result<
+        (
+            Arc<Space>,
+            Option<crate::types::CWToken>,
+            Option<crate::types::SpaceToken>,
+        ),
+        ErrorData,
+    > {
         if let Some(sharding) = access.sharding
             && sharding != self.app.sharding
         {
@@ -490,14 +502,16 @@ impl AndaBrainMcpServer {
             Err(err) => return Err(err),
         };
         let mut space_token = None;
-        if cwt.is_none() && !(scope == TokenScope::Read && space.is_public()) {
-            space_token = Some(
-                space
-                    .verify_space_token(access.auth_token.clone(), scope, now_ms)
-                    .map_err(|_| unauthorized(scope))?,
-            );
+        if cwt.is_none() {
+            match space.verify_space_token(access.auth_token.clone(), scope, now_ms) {
+                Ok(st) => space_token = Some(st),
+                // Public-space reads fall back to the anonymous view only
+                // when no valid credential was presented.
+                Err(_) if scope == TokenScope::Read && space.is_public() => {}
+                Err(_) => return Err(unauthorized(scope)),
+            }
         }
-        Ok((space, space_token))
+        Ok((space, cwt, space_token))
     }
 
     pub async fn ensure_space_available(&self) -> Result<(), ErrorData> {
@@ -544,7 +558,17 @@ impl AndaBrainMcpServer {
         input: RecallMemoryInput,
     ) -> Result<CallToolResult, ErrorData> {
         let input = RecallInput::from(input);
-        let space = self.load_authorized_space(TokenScope::Read, access).await?;
+        let (space, _cwt, st) = self
+            .load_authorized_space_with_token(TokenScope::Read, access)
+            .await?;
+        if st.as_ref().is_some_and(|st| st.labels.is_some()) {
+            // RecallAgent's wiki tools span all labels; a label-restricted
+            // token cannot use agentic recall (same guard as HTTP /recall).
+            return Err(ErrorData::invalid_request(
+                "recall requires an unrestricted token",
+                None,
+            ));
+        }
         let output = space
             .query(SELF_USER_ID, StringOr::Value(input))
             .await
@@ -646,12 +670,15 @@ impl AndaBrainMcpServer {
         access: &McpAccess,
         input: WikiCommitToolInput,
     ) -> Result<CallToolResult, ErrorData> {
-        let space = self
-            .load_authorized_space(TokenScope::Write, access)
+        let (space, cwt, st) = self
+            .load_authorized_space_with_token(TokenScope::Write, access)
             .await?;
+        // Real audit subject (PRD §8.1 hard requirement), same derivation as
+        // the HTTP channel.
+        let actor = crate::handler::wiki_actor(&cwt, st.as_ref());
         let output = space
             .wiki
-            .commit(SELF_USER_ID.to_string(), input.into(), unix_ms())
+            .commit(actor, input.into(), unix_ms())
             .await
             .map_err(wiki_tool_error)?;
         structured_result(output)
@@ -662,10 +689,10 @@ impl AndaBrainMcpServer {
         access: &McpAccess,
         input: WikiSearchToolInput,
     ) -> Result<CallToolResult, ErrorData> {
-        let (space, st) = self
+        let (space, cwt, st) = self
             .load_authorized_space_with_token(TokenScope::Read, access)
             .await?;
-        let scope = mcp_wiki_access(st.as_ref());
+        let scope = crate::handler::wiki_read_access(&cwt, st.as_ref());
         let output = space
             .wiki
             .search_scoped(&scope, input.into(), unix_ms())
@@ -679,10 +706,10 @@ impl AndaBrainMcpServer {
         access: &McpAccess,
         input: WikiReadToolInput,
     ) -> Result<CallToolResult, ErrorData> {
-        let (space, st) = self
+        let (space, cwt, st) = self
             .load_authorized_space_with_token(TokenScope::Read, access)
             .await?;
-        let scope = mcp_wiki_access(st.as_ref());
+        let scope = crate::handler::wiki_read_access(&cwt, st.as_ref());
         let output = space
             .wiki
             .read_scoped(&scope, input.try_into()?, unix_ms())
@@ -696,10 +723,10 @@ impl AndaBrainMcpServer {
         access: &McpAccess,
         input: WikiVerifyToolInput,
     ) -> Result<CallToolResult, ErrorData> {
-        let (space, st) = self
+        let (space, cwt, st) = self
             .load_authorized_space_with_token(TokenScope::Read, access)
             .await?;
-        let scope = mcp_wiki_access(st.as_ref());
+        let scope = crate::handler::wiki_read_access(&cwt, st.as_ref());
         let output = space
             .wiki
             .verify_scoped(
@@ -714,17 +741,6 @@ impl AndaBrainMcpServer {
             .await
             .map_err(wiki_tool_error)?;
         structured_result(output)
-    }
-}
-
-/// MCP wiki read scope: labeled space tokens are restricted; CWT holders
-/// and label-less tokens are unrestricted.
-fn mcp_wiki_access(st: Option<&crate::types::SpaceToken>) -> WikiAccess {
-    WikiAccess {
-        actor: st
-            .map(|st| format!("st:{}", st.name.trim()))
-            .unwrap_or_else(|| SELF_USER_ID.to_string()),
-        labels: st.and_then(|st| st.labels.clone()),
     }
 }
 
@@ -1632,6 +1648,189 @@ mod tests {
         assert!(result.content[0].as_text().is_some());
         let value = result.structured_content.as_ref().unwrap();
         assert!(value["conversation"].is_number());
+    }
+
+    #[tokio::test]
+    async fn wiki_tools_scope_anonymous_and_labeled_callers() {
+        use crate::types::{AddSpaceTokenInput, UpdateSpaceInput};
+        use crate::wiki::WikiCommitInput;
+
+        // Auth enabled: an empty bearer is an anonymous caller, not the
+        // synthetic dev CWT.
+        let signing_key = test_signing_key();
+        let app = test_app_state("mcp_wiki_acl", vec![signing_key.verifying_key()]);
+        let space_id = "mcp_wiki_acl_space";
+        app.admin_create_space(
+            SELF_USER_ID,
+            SELF_USER_ID,
+            space_id.to_string(),
+            1,
+            unix_ms(),
+        )
+        .await
+        .unwrap();
+        let space = app.load_space(space_id, false).await.unwrap();
+        space
+            .update(
+                UpdateSpaceInput {
+                    public: Some(true),
+                    ..Default::default()
+                },
+                unix_ms(),
+            )
+            .await
+            .unwrap();
+        space
+            .wiki
+            .commit(
+                "owner".to_string(),
+                WikiCommitInput {
+                    title: "公开文档".to_string(),
+                    content: "# 公开文档\n\n公开探针：风铃海岸。\n".to_string(),
+                    ..Default::default()
+                },
+                unix_ms(),
+            )
+            .await
+            .unwrap();
+        space
+            .wiki
+            .commit(
+                "owner".to_string(),
+                WikiCommitInput {
+                    title: "机密文档".to_string(),
+                    content: "# 机密文档\n\n机密探针:曙光矩阵。\n".to_string(),
+                    acl_label: Some("secret".to_string()),
+                    ..Default::default()
+                },
+                unix_ms(),
+            )
+            .await
+            .unwrap();
+        space
+            .add_space_token(
+                "STsecret-reader".to_string(),
+                AddSpaceTokenInput {
+                    scope: TokenScope::Read,
+                    name: "sec".to_string(),
+                    expires_at: None,
+                    labels: Some(vec!["secret".to_string()]),
+                },
+                unix_ms(),
+            )
+            .await
+            .unwrap();
+        space
+            .add_space_token(
+                "STwiki-writer".to_string(),
+                AddSpaceTokenInput {
+                    scope: TokenScope::Write,
+                    name: "writer".to_string(),
+                    expires_at: None,
+                    labels: None,
+                },
+                unix_ms(),
+            )
+            .await
+            .unwrap();
+
+        let server = AndaBrainMcpServer::new(
+            app,
+            McpServerConfig {
+                space_id: space_id.to_string(),
+                auth_token: None,
+                auto_create_space: false,
+                auto_create_tier: 1,
+                dynamic_space_from_path: false,
+                remote_path_prefix: "/mcp".to_string(),
+            },
+        );
+        let hits_of = |result: CallToolResult| {
+            result.structured_content.unwrap()["hits"]
+                .as_array()
+                .unwrap()
+                .len()
+        };
+
+        // Launch review P0-1: an anonymous reader of a public space gets the
+        // unlabeled-only view, never the unrestricted one.
+        let anon = test_access(space_id);
+        let secret_probe = server
+            .wiki_search_for(
+                &anon,
+                WikiSearchToolInput {
+                    query: "曙光矩阵".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits_of(secret_probe), 0);
+        let open_probe = server
+            .wiki_search_for(
+                &anon,
+                WikiSearchToolInput {
+                    query: "风铃海岸".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits_of(open_probe), 1);
+
+        // A labeled token keeps its granted labels on the public space
+        // instead of degrading to anonymous.
+        let labeled = McpAccess {
+            space_id: space_id.to_string(),
+            auth_token: "STsecret-reader".to_string(),
+            sharding: None,
+        };
+        let granted = server
+            .wiki_search_for(
+                &labeled,
+                WikiSearchToolInput {
+                    query: "曙光矩阵".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits_of(granted), 1);
+
+        // Launch review P1-3: label-restricted tokens cannot use agentic
+        // recall (its wiki tools span all labels).
+        let err = server
+            .recall_memory_for(
+                &labeled,
+                RecallMemoryInput {
+                    query: "机密内容是什么?".to_string(),
+                    context: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("unrestricted"), "{}", err.message);
+
+        // Launch review P1-2: MCP commits record the real token subject.
+        let writer = McpAccess {
+            space_id: space_id.to_string(),
+            auth_token: "STwiki-writer".to_string(),
+            sharding: None,
+        };
+        let committed = server
+            .wiki_commit_for(
+                &writer,
+                WikiCommitToolInput {
+                    title: "白皮书".to_string(),
+                    content: "# 白皮书\n\n提交自 MCP。\n".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let value = committed.structured_content.unwrap();
+        assert_eq!(value["doc"]["created_by"].as_str(), Some("st:writer"));
+        assert_eq!(value["version"]["author"].as_str(), Some("st:writer"));
     }
 
     #[tokio::test]

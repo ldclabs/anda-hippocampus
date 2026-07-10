@@ -187,11 +187,16 @@ pub async fn post_recall(
         .await
         .map_err(AppError::bad_request)?;
 
-    if !space.is_public() && t.is_none() {
-        // 如果空间不是公开的，且没有验证 CWToken，则验证 SpaceToken
-        space
-            .verify_space_token(token, TokenScope::Read, now_ms)
-            .map_err(|_| AppError::unauthorized())?;
+    // A supplied token is verified even on public spaces so its ACL
+    // restriction is honored rather than silently widened.
+    let st = wiki_read_token(&space, &t, token, now_ms)?;
+    if st.as_ref().is_some_and(|st| st.labels.is_some()) {
+        // RecallAgent's wiki tools span all labels; a label-restricted token
+        // cannot use agentic recall (mirrors the /wiki/events guard).
+        return Err(AppError::with_status(
+            StatusCode::FORBIDDEN,
+            "recall requires an unrestricted token",
+        ));
     }
 
     // 使用固定的 caller 进行 ingestions 和 queries
@@ -228,10 +233,13 @@ pub async fn post_recall_structured(
         .await
         .map_err(AppError::bad_request)?;
 
-    if !space.is_public() && t.is_none() {
-        space
-            .verify_space_token(token, TokenScope::Read, now_ms)
-            .map_err(|_| AppError::unauthorized())?;
+    let st = wiki_read_token(&space, &t, token, now_ms)?;
+    if st.as_ref().is_some_and(|st| st.labels.is_some()) {
+        // Same guard as /recall: the agent's wiki tools span all labels.
+        return Err(AppError::with_status(
+            StatusCode::FORBIDDEN,
+            "recall requires an unrestricted token",
+        ));
     }
 
     let rt = space
@@ -442,6 +450,7 @@ fn wiki_error(err: WikiError) -> AppError {
     match &err {
         WikiError::Conflict {
             current_version,
+            current_checksum,
             updated_by,
             updated_at,
         } => AppError {
@@ -449,6 +458,7 @@ fn wiki_error(err: WikiError) -> AppError {
             message: err.to_string(),
             data: Some(json!({
                 "current_version": current_version,
+                "current_checksum": current_checksum,
                 "updated_by": updated_by,
                 "updated_at": updated_at,
             })),
@@ -465,8 +475,9 @@ fn wiki_error(err: WikiError) -> AppError {
 }
 
 /// Resolves the audit actor: the authenticated CWT user, else a stable
-/// space-token identity, else the local dev identity.
-fn wiki_actor(t: &Option<CWToken>, st: Option<&SpaceToken>) -> String {
+/// space-token identity, else the local dev identity. Shared with the MCP
+/// channel so both audit trails name identical subjects.
+pub(crate) fn wiki_actor(t: &Option<CWToken>, st: Option<&SpaceToken>) -> String {
     if let Some(t) = t {
         return t.user.to_string();
     }
@@ -478,26 +489,31 @@ fn wiki_actor(t: &Option<CWToken>, st: Option<&SpaceToken>) -> String {
 }
 
 /// Verifies read access and returns the space token (for its ACL labels).
-/// CWT holders and public-space anonymous readers carry no space token.
+/// A supplied token is verified even on public spaces so a labeled token
+/// keeps its granted labels instead of degrading to the anonymous view;
+/// only absent/invalid credentials fall back to anonymous there.
 fn wiki_read_token(
     space: &Space,
     t: &Option<CWToken>,
     token: String,
     now_ms: u64,
 ) -> Result<Option<SpaceToken>, AppError> {
-    if t.is_some() || space.is_public() {
+    if t.is_some() {
         return Ok(None);
     }
-    space
-        .verify_space_token(token, TokenScope::Read, now_ms)
-        .map(Some)
-        .map_err(|_| AppError::unauthorized())
+    match space.verify_space_token(token, TokenScope::Read, now_ms) {
+        Ok(st) => Ok(Some(st)),
+        Err(_) if space.is_public() => Ok(None),
+        Err(_) => Err(AppError::unauthorized()),
+    }
 }
 
 /// Read scope resolution (PRD §8.2): CWT holders and label-less space
 /// tokens are unrestricted; labeled tokens see unlabeled content plus their
 /// labels; anonymous public-space readers see unlabeled content only.
-fn wiki_read_access(t: &Option<CWToken>, st: Option<&SpaceToken>) -> WikiAccess {
+/// Shared with the MCP channel so the two never diverge (the launch review's
+/// P0-1 was exactly such a divergence).
+pub(crate) fn wiki_read_access(t: &Option<CWToken>, st: Option<&SpaceToken>) -> WikiAccess {
     let labels = if t.is_some() {
         None
     } else if let Some(st) = st {
@@ -1575,6 +1591,7 @@ mod tests {
         post_memory_forget, post_memory_pin, post_probe, post_recall, post_recall_structured,
         post_shadow_eval, post_wiki_commit, post_wiki_import, post_wiki_search, post_wiki_verify,
         restart_formation, revoke_space_token, update_byok, update_space, update_space_tier,
+        wiki_read_access,
     };
     use crate::{
         agents::SELF_USER_ID,
@@ -1795,6 +1812,42 @@ mod tests {
                 response_json(response).await
             }
         }
+    }
+
+    #[test]
+    fn wiki_read_access_resolves_the_three_caller_states() {
+        use crate::types::{CWToken, SpaceToken};
+
+        // CWT holder: unrestricted, actor is the user principal.
+        let cwt = Some(CWToken {
+            user: SELF_USER_ID,
+            audience: "sp".to_string(),
+            scope: TokenScope::Read,
+        });
+        let access = wiki_read_access(&cwt, None);
+        assert!(access.labels.is_none());
+        assert_eq!(access.actor, SELF_USER_ID.to_string());
+
+        // Labeled space token: restricted to unlabeled + granted labels.
+        let st = SpaceToken {
+            name: "auditor".to_string(),
+            labels: Some(vec!["hr".to_string()]),
+            ..Default::default()
+        };
+        let access = wiki_read_access(&None, Some(&st));
+        assert_eq!(access.labels, Some(vec!["hr".to_string()]));
+        assert_eq!(access.actor, "st:auditor");
+
+        // Label-less space token: unrestricted, stable audit identity even
+        // without a name.
+        let unnamed = SpaceToken::default();
+        let access = wiki_read_access(&None, Some(&unnamed));
+        assert!(access.labels.is_none());
+        assert_eq!(access.actor, "st:unnamed");
+
+        // Anonymous public-space reader: unlabeled content only (P0-1).
+        let access = wiki_read_access(&None, None);
+        assert_eq!(access.labels, Some(Vec::new()));
     }
 
     #[tokio::test]

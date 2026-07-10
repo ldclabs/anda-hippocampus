@@ -20,6 +20,7 @@ pub const EVENT_CITATION_VERIFY_FAILED: &str = "CitationVerifyFailed";
 pub const EVENT_IMPORT_COMPLETED: &str = "ImportCompleted";
 pub const EVENT_EXPORT_COMPLETED: &str = "ExportCompleted";
 pub const EVENT_DIGEST_EXTRACTED: &str = "DigestExtracted";
+pub const EVENT_DIGEST_FAILED: &str = "DigestFailed";
 pub const EVENT_WIKI_QUERIED: &str = "WikiQueried";
 pub const EVENT_WIKI_READ: &str = "WikiRead";
 pub const EVENT_STALE_REPORT: &str = "StaleReport";

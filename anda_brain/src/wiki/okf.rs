@@ -23,7 +23,9 @@ pub const OKF_VERSION: &str = "0.1";
 pub const FRONTMATTER_KEY: &str = "x_okf_frontmatter";
 /// Metadata key holding the OKF `type` value.
 pub const OKF_TYPE_KEY: &str = "okf_type";
-const MAX_IMPORT_ENTRIES: usize = 4096;
+/// Sized so a full export of a large namespace replays in one call (M4
+/// acceptance); bundles beyond this must be split by the external toolchain.
+const MAX_IMPORT_ENTRIES: usize = 65_536;
 const IMPORT_CAS_RETRIES: usize = 3;
 
 impl WikiService {
@@ -55,7 +57,24 @@ impl WikiService {
             .to_string();
 
         let mut output = WikiImportOutput::default();
+        // Distinct bundle paths can slugify to the same document ("A.md" vs
+        // "a.md", "a b.md" vs "a-b.md"): silently last-write-wins would merge
+        // them into one two-version document, so later collisions are skipped
+        // loudly instead.
+        let mut seen_slugs = std::collections::BTreeSet::new();
         for entry in &input.entries {
+            if let Some(concept) = concept_path(&entry.path) {
+                let slug = slugify_path(&concept);
+                if !seen_slugs.insert(slug.clone()) {
+                    output.skipped.push(WikiImportSkip {
+                        path: entry.path.clone(),
+                        reason: format!(
+                            "path slugifies to {slug:?}, already used by an earlier bundle entry"
+                        ),
+                    });
+                    continue;
+                }
+            }
             match self.import_entry(&actor, &namespace, entry, now_ms).await {
                 Ok(Some(doc)) => {
                     match doc.status {
@@ -129,14 +148,33 @@ impl WikiService {
         // our commit; re-reading the moved-to version converges because
         // import is last-write-wins by design.
         for _ in 0..IMPORT_CAS_RETRIES {
-            let existing = self.find_doc_id_by_slug(namespace, &slug).await?;
-            let (doc_id, parent_version) = match existing {
-                Some(id) => {
-                    let doc = self.doc_record(id).await?;
-                    (Some(id), Some(doc.current_version))
-                }
+            let existing = match self.find_doc_id_by_slug(namespace, &slug).await? {
+                Some(id) => Some(self.doc_record(id).await?),
+                None => None,
+            };
+            let (doc_id, parent_version) = match &existing {
+                Some(doc) => (Some(doc._id), Some(doc.current_version)),
                 None => (None, None),
             };
+            // A bundle exported from a commit-origin document carries
+            // synthesized frontmatter; storing it verbatim would mutate
+            // metadata and grow the version chain by one on the first
+            // replay. A block matching what export synthesizes for the
+            // current document state is therefore not persisted.
+            let mut commit_metadata = metadata.clone();
+            if let (Some(doc), Some(raw)) = (&existing, &frontmatter)
+                && !doc.metadata.contains_key(FRONTMATTER_KEY)
+                && *raw
+                    == synthesized_frontmatter(
+                        doc.metadata.get(OKF_TYPE_KEY).and_then(|v| v.as_str()),
+                        &doc.title,
+                        &doc.tags,
+                        doc.source_uri.as_deref(),
+                    )
+            {
+                commit_metadata.remove(FRONTMATTER_KEY);
+                commit_metadata.remove(OKF_TYPE_KEY);
+            }
             let commit = WikiCommitInput {
                 doc_id,
                 parent_version,
@@ -150,10 +188,10 @@ impl WikiService {
                 acl_label: None,
                 source_uri: parsed.as_ref().and_then(|fm| fm.resource.clone()),
                 message: Some(format!("okf import: {}", entry.path)),
-                metadata: if metadata.is_empty() {
+                metadata: if commit_metadata.is_empty() {
                     None
                 } else {
-                    Some(metadata.clone())
+                    Some(commit_metadata)
                 },
             };
             match self.commit(actor.to_string(), commit, now_ms).await {
@@ -338,10 +376,13 @@ fn skip_reason(path: &str) -> String {
 /// content without delimiters (LF-normalized, `x_anda_*` lines stripped)
 /// and the body. Permissive: malformed frontmatter is treated as body.
 pub(super) fn split_frontmatter(content: &str) -> (Option<String>, &str) {
+    // The BOM is stripped in every branch so it never reaches the body (and
+    // through it the checksum). `normalize_content` strips it again for
+    // non-import commits.
     let stripped = content.strip_prefix('\u{feff}').unwrap_or(content);
     let rest = match stripped.strip_prefix("---") {
         Some(rest) if rest.starts_with('\n') || rest.starts_with("\r\n") => rest,
-        _ => return (None, content),
+        _ => return (None, stripped),
     };
     let block_start = if let Some(r) = rest.strip_prefix("\r\n") {
         r
@@ -365,7 +406,7 @@ pub(super) fn split_frontmatter(content: &str) -> (Option<String>, &str) {
         }
         offset += line.len();
     }
-    (None, content)
+    (None, stripped)
 }
 
 fn is_x_anda_line(line: &str) -> bool {
@@ -399,6 +440,12 @@ pub(super) fn parse_frontmatter(raw: &str) -> ParsedFrontmatter {
         let value = value.trim();
 
         let scalar = |v: &str| -> Option<String> {
+            // Folded/block scalars (`title: >` / `title: |`) are beyond the
+            // line-level parser: fall back to the other title sources rather
+            // than storing the indicator character as the value.
+            if v.starts_with(['|', '>']) {
+                return None;
+            }
             let v = unquote(v);
             if v.is_empty() { None } else { Some(v) }
         };
@@ -463,8 +510,129 @@ fn yaml_scalar(value: &str) -> String {
     }
 }
 
-/// Assembles the exported frontmatter: the stored verbatim block (or a
-/// minimal synthesized one), plus fresh `x_anda_*` provenance keys.
+fn tags_line(tags: &[String]) -> String {
+    format!(
+        "tags: [{}]",
+        tags.iter()
+            .map(|t| yaml_scalar(t))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// The frontmatter block (no delimiters) synthesized for documents that
+/// never carried one. Import compares against this to keep replays of
+/// commit-origin documents version-stable.
+fn synthesized_frontmatter(
+    okf_type: Option<&str>,
+    title: &str,
+    tags: &[String],
+    source_uri: Option<&str>,
+) -> String {
+    let mut lines = vec![
+        format!("type: {}", yaml_scalar(okf_type.unwrap_or("Document"))),
+        format!("title: {}", yaml_scalar(title)),
+    ];
+    if !tags.is_empty() {
+        lines.push(tags_line(tags));
+    }
+    if let Some(resource) = source_uri {
+        lines.push(format!("resource: {}", yaml_scalar(resource)));
+    }
+    lines.join("\n")
+}
+
+/// Documents edited through `wiki_commit` after an OKF import drift from
+/// their stored frontmatter block. Exporting the stale block would make the
+/// bundle disagree with its own manifest and silently revert title/tags on
+/// replay, so the known keys are patched to the document's current state —
+/// every other line (unknown keys, comments, ordering) stays verbatim.
+fn sync_frontmatter(raw: &str, doc: &WikiDocInfo) -> String {
+    let parsed = parse_frontmatter(raw);
+    let title_stale = parsed.title.as_deref() != Some(doc.title.as_str());
+    let tags_stale = parsed.tags.clone().unwrap_or_default() != doc.tags;
+    let resource_stale = parsed.resource.as_deref() != doc.source_uri.as_deref();
+    if !title_stale && !tags_stale && !resource_stale {
+        return raw.to_string();
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let (mut saw_title, mut saw_tags, mut saw_resource) = (false, false, false);
+    let mut lines = raw.lines().peekable();
+    while let Some(line) = lines.next() {
+        let key = (!line.starts_with(char::is_whitespace))
+            .then(|| line.split_once(':').map(|(k, _)| k.trim()))
+            .flatten();
+        match key {
+            Some("title") => {
+                saw_title = true;
+                if title_stale {
+                    out.push(format!("title: {}", yaml_scalar(&doc.title)));
+                } else {
+                    out.push(line.to_string());
+                }
+            }
+            Some("tags") => {
+                saw_tags = true;
+                let block_form = line
+                    .split_once(':')
+                    .is_some_and(|(_, v)| v.trim().is_empty());
+                if tags_stale {
+                    if !doc.tags.is_empty() {
+                        out.push(tags_line(&doc.tags));
+                    }
+                    if block_form {
+                        while lines
+                            .peek()
+                            .is_some_and(|l| l.trim_start().starts_with("- "))
+                        {
+                            lines.next();
+                        }
+                    }
+                } else {
+                    out.push(line.to_string());
+                    if block_form {
+                        while lines
+                            .peek()
+                            .is_some_and(|l| l.trim_start().starts_with("- "))
+                        {
+                            out.push(lines.next().unwrap().to_string());
+                        }
+                    }
+                }
+            }
+            Some("resource") => {
+                saw_resource = true;
+                match (&resource_stale, &doc.source_uri) {
+                    (true, Some(resource)) => {
+                        out.push(format!("resource: {}", yaml_scalar(resource)));
+                    }
+                    (true, None) => {}
+                    (false, _) => out.push(line.to_string()),
+                }
+            }
+            _ => out.push(line.to_string()),
+        }
+    }
+    if title_stale && !saw_title {
+        out.push(format!("title: {}", yaml_scalar(&doc.title)));
+    }
+    if tags_stale && !saw_tags && !doc.tags.is_empty() {
+        out.push(tags_line(&doc.tags));
+    }
+    if resource_stale
+        && !saw_resource
+        && let Some(resource) = &doc.source_uri
+    {
+        out.push(format!("resource: {}", yaml_scalar(resource)));
+    }
+    out.join("\n")
+}
+
+/// Assembles the exported frontmatter: the stored verbatim block (drifted
+/// known keys synced, everything else untouched, including trailing blank
+/// lines) or a minimal synthesized one, plus fresh `x_anda_*` provenance
+/// keys.
 fn render_frontmatter(
     raw: Option<&str>,
     okf_type: Option<&str>,
@@ -472,35 +640,16 @@ fn render_frontmatter(
     version: &super::WikiVersionRecord,
 ) -> String {
     let mut lines: Vec<String> = match raw {
-        Some(raw) => raw
+        Some(raw) => sync_frontmatter(raw, doc)
             .lines()
             .filter(|l| !is_x_anda_line(l))
             .map(str::to_string)
             .collect(),
-        None => {
-            let mut lines = vec![
-                format!("type: {}", yaml_scalar(okf_type.unwrap_or("Document"))),
-                format!("title: {}", yaml_scalar(&doc.title)),
-            ];
-            if !doc.tags.is_empty() {
-                lines.push(format!(
-                    "tags: [{}]",
-                    doc.tags
-                        .iter()
-                        .map(|t| yaml_scalar(t))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
-            if let Some(resource) = &doc.source_uri {
-                lines.push(format!("resource: {}", yaml_scalar(resource)));
-            }
-            lines
-        }
+        None => synthesized_frontmatter(okf_type, &doc.title, &doc.tags, doc.source_uri.as_deref())
+            .lines()
+            .map(str::to_string)
+            .collect(),
     };
-    while lines.last().is_some_and(|l| l.trim().is_empty()) {
-        lines.pop();
-    }
     lines.push(format!("x_anda_doc_id: {}", doc.id));
     lines.push(format!("x_anda_version_id: {}", doc.current_version));
     lines.push(format!("x_anda_checksum: {}", version.checksum));
@@ -540,6 +689,66 @@ mod tests {
         let block = parse_frontmatter("tags:\n  - a\n  - 'b c'\ntitle: t");
         assert_eq!(block.tags, Some(vec!["a".to_string(), "b c".to_string()]));
         assert_eq!(block.title.as_deref(), Some("t"));
+
+        // Folded/block scalars are unsupported: fall back instead of storing
+        // the indicator character.
+        let folded = parse_frontmatter("title: >\n  folded text\ntype: Doc");
+        assert_eq!(folded.title, None);
+        assert_eq!(folded.r#type.as_deref(), Some("Doc"));
+    }
+
+    fn doc_info(title: &str, tags: &[&str], source_uri: Option<&str>) -> WikiDocInfo {
+        WikiDocInfo {
+            id: 1,
+            namespace: "kb".to_string(),
+            slug: "d".to_string(),
+            title: title.to_string(),
+            status: "active".to_string(),
+            current_version: 2,
+            current_checksum: String::new(),
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            acl_label: String::new(),
+            source_uri: source_uri.map(str::to_string),
+            metadata: BTreeMap::new(),
+            created_by: String::new(),
+            updated_by: String::new(),
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn sync_frontmatter_patches_only_drifted_keys() {
+        let raw = "type: Guide\n# keep this comment\ntitle: 旧标题\ntags: [old]\nunknown: kept";
+
+        // No drift: byte-identical.
+        let same = sync_frontmatter(raw, &doc_info("旧标题", &["old"], None));
+        assert_eq!(same, raw);
+
+        // Title/tags drifted via wiki_commit: patched, everything else verbatim.
+        let synced = sync_frontmatter(raw, &doc_info("新标题", &["new"], None));
+        assert!(synced.contains("title: 新标题"));
+        assert!(synced.contains("tags: [new]"));
+        assert!(synced.contains("# keep this comment"));
+        assert!(synced.contains("unknown: kept"));
+        assert!(!synced.contains("旧标题"));
+
+        // Missing keys are appended; emptied tags are removed.
+        let bare = sync_frontmatter("unknown: kept", &doc_info("补标题", &["t1"], None));
+        assert!(bare.contains("title: 补标题"));
+        assert!(bare.contains("tags: [t1]"));
+        let cleared = sync_frontmatter("tags:\n  - a\n  - b\ntitle: t", &doc_info("t", &[], None));
+        assert!(!cleared.contains("- a"));
+        assert!(!cleared.contains("tags"));
+    }
+
+    #[test]
+    fn synthesized_frontmatter_matches_export_shape() {
+        let block = synthesized_frontmatter(None, "标题", &["a".to_string()], Some("anda://x"));
+        assert_eq!(
+            block,
+            "type: Document\ntitle: 标题\ntags: [a]\nresource: \"anda://x\""
+        );
     }
 
     #[test]

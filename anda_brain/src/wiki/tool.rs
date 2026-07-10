@@ -14,16 +14,24 @@ use super::{
     WikiSearchOutput, WikiService,
 };
 
+/// Label view for agent wiki reads, evaluated per call: `None` =
+/// unrestricted (private space, where every recall caller holds an
+/// unrestricted credential), `Some(vec![])` = unlabeled content only
+/// (public space, where the recall endpoint is world-reachable and its
+/// tools must not surface labeled documents — PRD §8.2).
+pub type WikiToolScope = Arc<dyn Fn() -> Option<Vec<String>> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct WikiSearchTool {
     wiki: Arc<WikiService>,
+    scope: WikiToolScope,
 }
 
 impl WikiSearchTool {
     pub const NAME: &'static str = "wiki_search";
 
-    pub fn new(wiki: Arc<WikiService>) -> Self {
-        Self { wiki }
+    pub fn new(wiki: Arc<WikiService>, scope: WikiToolScope) -> Self {
+        Self { wiki, scope }
     }
 }
 
@@ -98,7 +106,8 @@ impl Tool<BaseCtx> for WikiSearchTool {
         args: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
-        let output = self.wiki.search(args).await?;
+        let view = (self.scope)();
+        let output = self.wiki.search_view(args, view.as_deref()).await?;
         Ok(ToolOutput::new(output))
     }
 }
@@ -106,13 +115,14 @@ impl Tool<BaseCtx> for WikiSearchTool {
 #[derive(Clone)]
 pub struct WikiReadTool {
     wiki: Arc<WikiService>,
+    scope: WikiToolScope,
 }
 
 impl WikiReadTool {
     pub const NAME: &'static str = "wiki_read";
 
-    pub fn new(wiki: Arc<WikiService>) -> Self {
-        Self { wiki }
+    pub fn new(wiki: Arc<WikiService>, scope: WikiToolScope) -> Self {
+        Self { wiki, scope }
     }
 }
 
@@ -170,7 +180,8 @@ impl Tool<BaseCtx> for WikiReadTool {
         args: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
-        let output = self.wiki.read(args).await?;
+        let view = (self.scope)();
+        let output = self.wiki.read_view(args, view.as_deref()).await?;
         Ok(ToolOutput::new(output))
     }
 }

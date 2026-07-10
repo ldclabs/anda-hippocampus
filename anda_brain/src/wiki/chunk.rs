@@ -4,6 +4,9 @@
 //! gaps and no overlap, so `content[start..end]` is always the authoritative
 //! chunk text and citations can be re-verified from the immutable version
 //! content alone.
+//!
+//! Only ATX (`#`) headings are recognized as section boundaries; setext
+//! (underline) headings are treated as plain text.
 
 use sha3::{Digest, Sha3_256};
 use unicode_normalization::UnicodeNormalization;
@@ -46,9 +49,10 @@ pub struct ChunkPlan {
     pub capped: bool,
 }
 
-/// Normalizes Markdown for storage: CRLF/CR → LF, Unicode NFC, trailing
-/// whitespace stripped per line, exactly one trailing newline.
+/// Normalizes Markdown for storage: BOM stripped, CRLF/CR → LF, Unicode
+/// NFC, trailing whitespace stripped per line, exactly one trailing newline.
 pub fn normalize_content(content: &str) -> String {
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
     let content = content.replace("\r\n", "\n").replace('\r', "\n");
     let content: String = content.nfc().collect();
     let mut out = String::with_capacity(content.len() + 1);
@@ -157,6 +161,7 @@ pub fn chunk_markdown(content: &str) -> ChunkPlan {
         pack_section(content, section, &mut drafts, &mut forced_splits);
     }
     merge_small_siblings(&mut drafts);
+    merge_blank_chunks(content, &mut drafts);
 
     let mut capped = false;
     while drafts.len() > MAX_CHUNKS_PER_VERSION {
@@ -191,37 +196,75 @@ struct LineInfo {
     boundary: Option<(usize, String)>,
 }
 
+/// Code-fence state machine shared by the chunker and title derivation
+/// (CommonMark subset): a fence opens on a run of ≥3 backticks/tildes
+/// indented less than four columns whose info string contains no backtick
+/// (for backtick fences), and closes on a run of at least the opening
+/// length followed only by whitespace. Anything indented four columns or
+/// more is indented code, never a delimiter.
+#[derive(Default)]
+pub(super) struct FenceTracker {
+    fence: Option<(char, usize)>,
+}
+
+impl FenceTracker {
+    /// Feeds one line (without its newline) and reports whether it is inside
+    /// a code fence, delimiter lines included.
+    pub(super) fn feed(&mut self, line: &str) -> bool {
+        let trimmed = line.trim_start();
+        match self.fence {
+            Some((ch, len)) => {
+                let run = trimmed.chars().take_while(|c| *c == ch).count();
+                if run >= len
+                    && indent_columns(line) < 4
+                    && trimmed.chars().skip(run).all(char::is_whitespace)
+                {
+                    self.fence = None; // closing delimiter; the line stays in-fence
+                }
+                true
+            }
+            None => {
+                if indent_columns(line) >= 4 {
+                    return false;
+                }
+                for ch in ['`', '~'] {
+                    let run = trimmed.chars().take_while(|c| *c == ch).count();
+                    // ASCII delimiters: `run` chars == `run` bytes.
+                    if run >= 3 && !(ch == '`' && trimmed[run..].contains('`')) {
+                        self.fence = Some((ch, run));
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+}
+
+/// Leading indentation in columns, tabs expanding to the next 4-column stop.
+fn indent_columns(line: &str) -> usize {
+    let mut cols = 0usize;
+    for ch in line.chars() {
+        match ch {
+            ' ' => cols += 1,
+            '\t' => cols += 4 - cols % 4,
+            _ => break,
+        }
+    }
+    cols
+}
+
 fn scan_lines(content: &str) -> Vec<LineInfo> {
     let mut lines = Vec::new();
     let mut offset = 0usize;
-    let mut fence: Option<(char, usize)> = None;
+    let mut fences = FenceTracker::default();
 
     for raw in content.split_inclusive('\n') {
         let start = offset;
         offset += raw.len();
         let line = raw.strip_suffix('\n').unwrap_or(raw);
         let trimmed = line.trim_start();
-
-        let mut in_fence = fence.is_some();
-        match fence {
-            Some((ch, len)) => {
-                let run = trimmed.chars().take_while(|c| *c == ch).count();
-                if run >= len && trimmed.chars().all(|c| c == ch || c.is_whitespace()) {
-                    fence = None; // closing delimiter; this line stays in_fence
-                }
-            }
-            None => {
-                for ch in ['`', '~'] {
-                    let run = trimmed.chars().take_while(|c| *c == ch).count();
-                    if run >= 3 {
-                        fence = Some((ch, run));
-                        in_fence = true;
-                        break;
-                    }
-                }
-            }
-        }
-
+        let in_fence = fences.feed(line);
         let blank = trimmed.is_empty();
         let boundary = if in_fence {
             None
@@ -241,21 +284,46 @@ fn scan_lines(content: &str) -> Vec<LineInfo> {
     lines
 }
 
-fn parse_heading(trimmed: &str) -> Option<(usize, String)> {
+pub(super) fn parse_heading(trimmed: &str) -> Option<(usize, String)> {
     let level = trimmed.chars().take_while(|ch| *ch == '#').count();
     if !(1..=6).contains(&level) {
         return None;
     }
     let rest = trimmed.get(level..)?;
-    if !rest.starts_with(' ') && !rest.is_empty() {
+    if !rest.starts_with([' ', '\t']) && !rest.is_empty() {
         return None;
     }
-    let title = rest.trim().trim_end_matches('#').trim();
+    let text = rest.trim();
+    // An ATX closing sequence (`## title ##`) must be separated from the
+    // text by whitespace, so `# C#` keeps its trailing hash.
+    let stripped = text.trim_end_matches('#');
+    let title = if stripped.len() < text.len()
+        && (stripped.is_empty() || stripped.ends_with([' ', '\t']))
+    {
+        stripped.trim_end()
+    } else {
+        text
+    };
     if title.is_empty() {
         None
     } else {
         Some((level, title.to_string()))
     }
+}
+
+/// First ATX heading (h1–h6) outside code fences: the fence-aware title
+/// derivation (the v1 prototype took `# comments` inside fences as titles).
+pub(super) fn first_heading_title(content: &str) -> Option<String> {
+    let mut fences = FenceTracker::default();
+    for line in content.split('\n') {
+        if fences.feed(line) {
+            continue;
+        }
+        if let Some((_, title)) = parse_heading(line.trim_start()) {
+            return Some(title);
+        }
+    }
+    None
 }
 
 /// A maximal run of lines with no blank-line break (blank lines attach to
@@ -397,30 +465,37 @@ fn force_split(
     heading_path: &[String],
     drafts: &mut Vec<ChunkDraft>,
 ) {
+    let push = |piece_start: usize, piece_end: usize, drafts: &mut Vec<ChunkDraft>| {
+        drafts.push(ChunkDraft {
+            heading_path: heading_path.to_vec(),
+            anchor: String::new(),
+            byte_start: piece_start,
+            byte_end: piece_end,
+            forced: true,
+        });
+    };
     let mut piece_start = start;
     let mut cursor = start;
     for raw in content[start..end].split_inclusive('\n') {
         let line_end = cursor + raw.len();
         if line_end - piece_start > CHUNK_HARD_MAX && cursor > piece_start {
-            drafts.push(ChunkDraft {
-                heading_path: heading_path.to_vec(),
-                anchor: String::new(),
-                byte_start: piece_start,
-                byte_end: cursor,
-                forced: true,
-            });
+            push(piece_start, cursor, drafts);
             piece_start = cursor;
+        }
+        // A single line longer than the hard cap cannot break on a line
+        // boundary: split it on char boundaries so the cap actually holds.
+        while line_end - piece_start > CHUNK_HARD_MAX {
+            let cut = floor_char_boundary(content, piece_start + CHUNK_HARD_MAX);
+            if cut <= piece_start {
+                break;
+            }
+            push(piece_start, cut, drafts);
+            piece_start = cut;
         }
         cursor = line_end;
     }
     if piece_start < end {
-        drafts.push(ChunkDraft {
-            heading_path: heading_path.to_vec(),
-            anchor: String::new(),
-            byte_start: piece_start,
-            byte_end: end,
-            forced: true,
-        });
+        push(piece_start, end, drafts);
     }
 }
 
@@ -464,6 +539,28 @@ fn merge_small_siblings(drafts: &mut Vec<ChunkDraft>) {
         drafts[i].byte_end = drafts[i + 1].byte_end;
         drafts.remove(i + 1);
         // stay on i: it may still be under CHUNK_TARGET_MIN
+    }
+}
+
+/// Whitespace-only chunks (e.g. blank lines before the first heading) carry
+/// no retrievable text: fold them into the following chunk (or the previous
+/// one at the tail) so tiling holds without indexing empty strings.
+fn merge_blank_chunks(content: &str, drafts: &mut Vec<ChunkDraft>) {
+    let mut i = 0usize;
+    while i < drafts.len() {
+        let blank = content[drafts[i].byte_start..drafts[i].byte_end]
+            .trim()
+            .is_empty();
+        if !blank || drafts.len() == 1 {
+            i += 1;
+            continue;
+        }
+        if i + 1 < drafts.len() {
+            drafts[i + 1].byte_start = drafts[i].byte_start;
+        } else {
+            drafts[i - 1].byte_end = drafts[i].byte_end;
+        }
+        drafts.remove(i);
     }
 }
 
@@ -700,6 +797,94 @@ mod tests {
         assert!(c1.starts_with("sha3-256:"));
         let c3 = chunk_checksum(&version_checksum, d.byte_start, d.byte_end + 1, text);
         assert_ne!(c1, c3);
+    }
+
+    #[test]
+    fn oversized_single_line_is_split_at_char_boundaries() {
+        // One 9 KiB line of Chinese text without any newline: the hard cap
+        // must still hold and every boundary must be a char boundary.
+        let line = "汉".repeat(3000);
+        let content = normalize_content(&format!("# 单行\n{line}\n"));
+        let plan = chunk_markdown(&content);
+        assert_tiling(&content, &plan);
+        assert!(plan.drafts.len() > 1);
+        for draft in &plan.drafts {
+            assert!(draft.byte_end - draft.byte_start <= CHUNK_HARD_MAX);
+        }
+    }
+
+    #[test]
+    fn indented_and_backtick_info_fences_are_not_fences() {
+        // A ``` indented ≥4 columns is an indented code block, not a fence:
+        // it must not swallow the following headings.
+        let content = normalize_content("# A\n\n    ```\n\n# B\nreal section\n");
+        let plan = chunk_markdown(&content);
+        assert_tiling(&content, &plan);
+        let paths: Vec<_> = plan.drafts.iter().map(|d| d.heading_path.clone()).collect();
+        assert!(paths.contains(&vec!["B".to_string()]));
+
+        // An info string containing a backtick cannot open a backtick fence.
+        let content = normalize_content("# A\n``` foo`bar\n\n# B\nreal section\n");
+        let plan = chunk_markdown(&content);
+        assert_tiling(&content, &plan);
+        let paths: Vec<_> = plan.drafts.iter().map(|d| d.heading_path.clone()).collect();
+        assert!(paths.contains(&vec!["B".to_string()]));
+    }
+
+    #[test]
+    fn spaced_backtick_runs_do_not_close_a_fence() {
+        // "``` ```" inside a fence is content, not a closing delimiter: the
+        // heading after it is still inside the fence.
+        let content = normalize_content("# A\n```\n``` ```\n# swallowed\n```\n\n# B\ntail\n");
+        let plan = chunk_markdown(&content);
+        assert_tiling(&content, &plan);
+        let paths: Vec<_> = plan.drafts.iter().map(|d| d.heading_path.clone()).collect();
+        assert!(!paths.iter().any(|p| p.contains(&"swallowed".to_string())));
+        assert!(paths.contains(&vec!["B".to_string()]));
+    }
+
+    #[test]
+    fn leading_blank_lines_do_not_produce_blank_chunks() {
+        let content = "\n\n# 标题\n\n正文内容。\n";
+        let plan = chunk_markdown(content);
+        assert_tiling(content, &plan);
+        for draft in &plan.drafts {
+            assert!(
+                !content[draft.byte_start..draft.byte_end].trim().is_empty(),
+                "blank chunk {draft:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn heading_edge_cases() {
+        // A trailing `#` without separating whitespace is part of the title.
+        assert_eq!(parse_heading("# C#"), Some((1, "C#".to_string())));
+        assert_eq!(
+            parse_heading("## 部署指南 ##"),
+            Some((2, "部署指南".to_string()))
+        );
+        // Tab after the marker run is a valid separator.
+        assert_eq!(parse_heading("#\tTitle"), Some((1, "Title".to_string())));
+        // No separator: not a heading (shebang regression).
+        assert_eq!(parse_heading("#!/bin/bash"), None);
+    }
+
+    #[test]
+    fn first_heading_title_skips_code_fences() {
+        let content = "```bash\n# install foo\n```\n\n# 真实标题\nbody\n";
+        assert_eq!(first_heading_title(content).as_deref(), Some("真实标题"));
+        assert_eq!(first_heading_title("#!/bin/bash\necho hi\n"), None);
+        assert_eq!(
+            first_heading_title("```\n# swallowed\n").as_deref(),
+            None,
+            "unclosed fence swallows the rest"
+        );
+    }
+
+    #[test]
+    fn normalize_strips_bom() {
+        assert_eq!(normalize_content("\u{feff}# T\n"), "# T\n");
     }
 
     #[test]

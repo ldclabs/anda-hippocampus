@@ -18,7 +18,7 @@ pub use chunk::{CHUNKER_VERSION, chunk_markdown, normalize_content, slugify, slu
 pub use digest::{DigestedFact, WIKI_DIGEST_EXTRACTOR, WikiDigest, WikiDigestReport};
 pub use model::*;
 pub use okf::OKF_VERSION;
-pub use tool::{WikiCommitTool, WikiReadTool, WikiSearchTool};
+pub use tool::{WikiCommitTool, WikiReadTool, WikiSearchTool, WikiToolScope};
 pub use types::*;
 
 use anda_db::{
@@ -182,6 +182,7 @@ impl WikiService {
                 if parent != doc.current_version {
                     return Err(WikiError::Conflict {
                         current_version: doc.current_version,
+                        current_checksum: doc.current_checksum.clone(),
                         updated_by: doc.updated_by.clone(),
                         updated_at: doc.updated_at,
                     });
@@ -204,7 +205,12 @@ impl WikiService {
                 .namespace
                 .as_ref()
                 .is_none_or(|ns| *ns == doc.namespace)
-            && input.slug.as_ref().is_none_or(|s| *s == doc.slug)
+            // Compare in slug space: replaying a commit whose raw slug is
+            // non-canonical ("Setup Steps" vs "setup-steps") stays a no-op.
+            && input
+                .slug
+                .as_ref()
+                .is_none_or(|s| slugify_path(s) == doc.slug)
             && input
                 .source_uri
                 .as_ref()
@@ -349,7 +355,11 @@ impl WikiService {
         }
         self.docs.update(doc_id, fields).await?;
 
-        // 4) Activate the new chunk set.
+        // 4) Activate the new chunk set. Between here and step 5 both chunk
+        //    sets are briefly current (PRD §4.1 inherent window): searches
+        //    may see old and new chunks of this document side by side, all
+        //    verifiable, never privileged; a crash in the window is repaired
+        //    by the startup sweep.
         for id in &chunk_ids {
             self.chunks
                 .update(*id, BTreeMap::from([("current".to_string(), Fv::U64(1))]))
@@ -497,9 +507,45 @@ impl WikiService {
         self.search_inner(input, None).await
     }
 
+    /// Retrieval for engine tools (RecallAgent): like [`WikiService::search`]
+    /// but honoring an optional label view. Public spaces pass
+    /// `Some(&[])` because their recall endpoint is world-reachable and must
+    /// not surface labeled content (PRD §8.2); private spaces pass `None`.
+    /// Agent reads are not evented — the recall conversation log covers them
+    /// (PRD §3.4).
+    pub async fn search_view(
+        &self,
+        input: WikiSearchInput,
+        view: Option<&[String]>,
+    ) -> Result<WikiSearchOutput, WikiError> {
+        self.bump_query_count();
+        self.search_inner(input, view).await
+    }
+
+    /// Read counterpart of [`WikiService::search_view`]: denials read as
+    /// NotFound, exactly like the scoped HTTP path.
+    pub async fn read_view(
+        &self,
+        input: WikiReadInput,
+        view: Option<&[String]>,
+    ) -> Result<WikiReadOutput, WikiError> {
+        if let Some(labels) = view {
+            let doc = self.doc_record(input.doc_id).await?;
+            let access = WikiAccess {
+                actor: String::new(),
+                labels: Some(labels.to_vec()),
+            };
+            self.guard_doc(&doc, &access)?;
+        }
+        self.read(input).await
+    }
+
     /// Label-scoped retrieval for external (HTTP/MCP) callers: the ACL
     /// prefilter is part of the same AndaDB query, and the read is evented
-    /// when `audit_reads` is enabled.
+    /// when `audit_reads` is enabled. Note the prefilter operates on the
+    /// BM25 candidate pool (top_k×10, capped at 4096 by AndaDB), so a
+    /// heavily restricted caller querying a hot term can see fewer than
+    /// `top_k` hits even when deeper matches exist — never more.
     pub async fn search_scoped(
         &self,
         access: &WikiAccess,
@@ -541,11 +587,34 @@ impl WikiService {
         if input.query.is_empty() {
             return Err(WikiError::Invalid("query cannot be empty".into()));
         }
+        if input.namespaces.len() > MAX_INCLUDE_KEYS {
+            return Err(WikiError::Invalid(format!(
+                "too many namespaces: {} exceeds the {MAX_INCLUDE_KEYS} filter limit",
+                input.namespaces.len()
+            )));
+        }
+        if input.doc_ids.len() > MAX_INCLUDE_KEYS {
+            return Err(WikiError::Invalid(format!(
+                "too many doc_ids: {} exceeds the {MAX_INCLUDE_KEYS} filter limit",
+                input.doc_ids.len()
+            )));
+        }
         let top_k = input.top_k.unwrap_or(8).clamp(1, 50);
 
         let mut doc_ids = input.doc_ids.clone();
         if !input.tags.is_empty() {
-            let tagged = self.doc_ids_by_tags(&input.tags).await?;
+            let mut tagged = self.doc_ids_by_tags(&input.tags).await?;
+            if tagged.len() > MAX_INCLUDE_KEYS {
+                // Fail-closed: results narrow, never widen. Loud so a space
+                // with >4096 same-tag documents shows up in the logs.
+                log::warn!(
+                    target: "brain",
+                    space_id = self.space_id,
+                    tagged = tagged.len();
+                    "wiki tag filter truncated to {MAX_INCLUDE_KEYS} documents"
+                );
+                tagged.truncate(MAX_INCLUDE_KEYS);
+            }
             doc_ids = if doc_ids.is_empty() {
                 tagged
             } else {
@@ -564,28 +633,20 @@ impl WikiService {
         if !input.namespaces.is_empty() {
             filters.push(Box::new(Filter::Field((
                 "namespace".to_string(),
-                RangeQuery::Include(
-                    input
-                        .namespaces
-                        .iter()
-                        .take(MAX_INCLUDE_KEYS)
-                        .cloned()
-                        .map(Fv::Text)
-                        .collect(),
-                ),
+                RangeQuery::Include(input.namespaces.iter().cloned().map(Fv::Text).collect()),
             ))));
+        } else {
+            // The retrieval-eval corpus lives in the wiki but is not user
+            // content: keep it out of searches unless asked for by name.
+            filters.push(Box::new(Filter::Not(Box::new(Filter::Field((
+                "namespace".to_string(),
+                RangeQuery::Eq(Fv::Text(evalset::EVAL_NAMESPACE.to_string())),
+            ))))));
         }
         if !doc_ids.is_empty() {
             filters.push(Box::new(Filter::Field((
                 "doc_id".to_string(),
-                RangeQuery::Include(
-                    doc_ids
-                        .iter()
-                        .take(MAX_INCLUDE_KEYS)
-                        .copied()
-                        .map(Fv::U64)
-                        .collect(),
-                ),
+                RangeQuery::Include(doc_ids.iter().copied().map(Fv::U64).collect()),
             ))));
         }
         if let Some(labels) = labels {
@@ -766,7 +827,6 @@ impl WikiService {
                 text,
                 doc_title: row.title.clone(),
                 heading_path: row.heading_path.clone(),
-                score: None,
                 citation: WikiCitation {
                     uri: citation_uri(&self.space_id, row.doc_id, row.version_id, start, end),
                     doc_id: row.doc_id,
@@ -856,7 +916,13 @@ impl WikiService {
                     return Err(WikiError::Invalid("range start exceeds end".into()));
                 }
                 let start = floor_char_boundary(content, start as usize);
-                let end = floor_char_boundary(content, end as usize);
+                let mut end = floor_char_boundary(content, end as usize);
+                // Bounded like Full: Range{0, u64::MAX} must not bypass the
+                // read cap.
+                if end - start > MAX_READ_BYTES {
+                    end = floor_char_boundary(content, start + MAX_READ_BYTES);
+                    output.truncated = true;
+                }
                 output.content = Some(content[start..end].to_string());
                 output.byte_range = Some((start as u64, end as u64));
             }
@@ -931,20 +997,30 @@ impl WikiService {
         if let Some(expected) = &input.checksum
             && *expected != computed
         {
-            self.write_event(
-                EVENT_CITATION_VERIFY_FAILED,
-                Some(doc_id),
-                Some(version_id),
-                actor,
-                BTreeMap::from([
-                    ("expected".to_string(), Json::from(expected.clone())),
-                    ("computed".to_string(), Json::from(computed.clone())),
-                    ("byte_start".to_string(), Json::from(start)),
-                    ("byte_end".to_string(), Json::from(end)),
-                ]),
-                now_ms,
-            )
-            .await?;
+            // Audit-write failures never fail the read (PRD §3.4).
+            if let Err(err) = self
+                .write_event(
+                    EVENT_CITATION_VERIFY_FAILED,
+                    Some(doc_id),
+                    Some(version_id),
+                    actor,
+                    BTreeMap::from([
+                        ("expected".to_string(), Json::from(expected.clone())),
+                        ("computed".to_string(), Json::from(computed.clone())),
+                        ("byte_start".to_string(), Json::from(start)),
+                        ("byte_end".to_string(), Json::from(end)),
+                    ]),
+                    now_ms,
+                )
+                .await
+            {
+                log::warn!(
+                    target: "brain",
+                    space_id = self.space_id,
+                    doc_id = doc_id;
+                    "CitationVerifyFailed event write failed: {err:?}"
+                );
+            }
             return Ok(WikiVerifyOutput {
                 status: WikiVerifyStatus::Invalid,
                 current_version: Some(doc.current_version),
@@ -1204,17 +1280,27 @@ impl WikiService {
         now_ms: u64,
     ) -> Result<WikiVerifyOutput, WikiError> {
         // Resolve the doc first so labeled content cannot be probed through
-        // verification quotes.
+        // verification quotes. Denials return the same `not_found` verdict a
+        // nonexistent citation gets — a restricted caller cannot use the
+        // response shape to enumerate hidden doc ids.
+        let denied = WikiVerifyOutput {
+            status: WikiVerifyStatus::NotFound,
+            current_version: None,
+            checksum: None,
+            quote: None,
+        };
         if let Some(uri) = &input.uri
             && let Some((_, doc_id, _, _, _)) = parse_citation_uri(uri)
             && let Ok(doc) = self.doc_record(doc_id).await
+            && self.guard_doc(&doc, access).is_err()
         {
-            self.guard_doc(&doc, access)?;
+            return Ok(denied);
         }
         if let Some(doc_id) = input.doc_id
             && let Ok(doc) = self.doc_record(doc_id).await
+            && self.guard_doc(&doc, access).is_err()
         {
-            self.guard_doc(&doc, access)?;
+            return Ok(denied);
         }
         self.verify(access.actor.clone(), input, now_ms).await
     }
@@ -1281,23 +1367,29 @@ impl WikiService {
     }
 
     /// Trims the audit log to the retention cap, oldest first. The prune
-    /// itself is evented so the gap is explained in the remaining log.
+    /// itself is evented so the gap is explained in the remaining log. The
+    /// newest `DigestExtracted` event per document is exempt: it is the
+    /// digest ledger superseding depends on (PRD §7.3) and must survive
+    /// retention in long-lived spaces with rarely-updated documents.
     pub async fn prune_events(&self, max_keep: usize, now_ms: u64) -> Result<usize, WikiError> {
         let mut removed = 0usize;
+        let mut kept_ledger = 0usize;
+        let mut cursor = 0u64;
         loop {
             let total = self.events.metadata().stats.num_documents as usize;
-            if total <= max_keep {
+            if total <= max_keep + kept_ledger {
                 break;
             }
-            let excess = (total - max_keep).min(Collection::MAX_SEARCH_LIMIT);
-            // Gt(0) + no Lt: ascending ids, i.e. the oldest entries first.
+            let excess = (total - max_keep - kept_ledger).min(Collection::MAX_SEARCH_LIMIT);
+            // Gt(cursor) + no Lt: ascending ids, i.e. the oldest entries
+            // first, skipping ledger rows already visited.
             let ids = self
                 .events
                 .search_ids(Query {
                     search: None,
                     filter: Some(Filter::Field((
                         "_id".to_string(),
-                        RangeQuery::Gt(Fv::U64(0)),
+                        RangeQuery::Gt(Fv::U64(cursor)),
                     ))),
                     limit: Some(excess),
                 })
@@ -1306,6 +1398,11 @@ impl WikiService {
                 break;
             }
             for id in ids {
+                cursor = cursor.max(id);
+                if self.is_digest_ledger_head(id).await? {
+                    kept_ledger += 1;
+                    continue;
+                }
                 self.events.remove(id).await?;
                 removed += 1;
             }
@@ -1322,6 +1419,43 @@ impl WikiService {
             .await?;
         }
         Ok(removed)
+    }
+
+    /// True when the event is the newest `DigestExtracted` row for its
+    /// document — the ledger entry [`WikiDigest`] reads to supersede stale
+    /// facts; retention pruning must not delete it.
+    async fn is_digest_ledger_head(&self, event_id: u64) -> Result<bool, WikiError> {
+        let Ok(event) = self.events.get_as::<WikiEventRecord>(event_id).await else {
+            return Ok(false);
+        };
+        if event.kind != EVENT_DIGEST_EXTRACTED {
+            return Ok(false);
+        }
+        let Some(doc_id) = event.doc_id else {
+            return Ok(false);
+        };
+        let newer = self
+            .events
+            .search_ids(Query {
+                search: None,
+                filter: Some(Filter::And(vec![
+                    Box::new(Filter::Field((
+                        "kind".to_string(),
+                        RangeQuery::Eq(Fv::Text(EVENT_DIGEST_EXTRACTED.to_string())),
+                    ))),
+                    Box::new(Filter::Field((
+                        "doc_id".to_string(),
+                        RangeQuery::Eq(Fv::U64(doc_id)),
+                    ))),
+                    Box::new(Filter::Field((
+                        "_id".to_string(),
+                        RangeQuery::Gt(Fv::U64(event_id)),
+                    ))),
+                ])),
+                limit: Some(1),
+            })
+            .await?;
+        Ok(newer.is_empty())
     }
 
     /// Counts active documents whose current version is older than the
@@ -1578,7 +1712,6 @@ impl WikiService {
             text: row.text.clone(),
             doc_title: row.title.clone(),
             heading_path: row.heading_path.clone(),
-            score: None,
             citation: WikiCitation {
                 uri: citation_uri(
                     &self.space_id,
@@ -1600,7 +1733,11 @@ impl WikiService {
     }
 
     /// Section layout of a version: stored chunk rows for the current
-    /// version, an in-memory re-chunk for historical ones.
+    /// version, an in-memory re-chunk for historical ones. Caveat: after a
+    /// `CHUNKER_VERSION` bump, anchors recorded in old citations may not
+    /// match the re-chunked layout of historical versions — byte ranges and
+    /// `verify` are unaffected (they bind to immutable content, not to the
+    /// chunker).
     async fn layout_of(
         &self,
         doc: &WikiDocRecord,
@@ -1687,12 +1824,23 @@ impl WikiService {
         // Path form preserves `/` hierarchy (OKF concept ids); titles are
         // already flat after slugify, so plain slugs pass through unchanged.
         let base = slugify_path(base);
+        // "index"/"log" are reserved OKF bundle files (PRD §9): a slug ending
+        // in either would collide with generated files on export and be
+        // silently skipped on replay.
+        let reserved = |slug: &str| {
+            slug.rsplit('/')
+                .next()
+                .is_some_and(|last| last == "index" || last == "log")
+        };
         for attempt in 0..100u32 {
             let candidate = if attempt == 0 {
                 base.clone()
             } else {
                 format!("{base}-{}", attempt + 1)
             };
+            if reserved(&candidate) {
+                continue;
+            }
             match self.find_doc_id_by_slug(namespace, &candidate).await? {
                 None => return Ok(candidate),
                 Some(id) if Some(id) == exclude => return Ok(candidate),
@@ -1702,25 +1850,58 @@ impl WikiService {
         Ok(format!("{base}-{now_ms}"))
     }
 
+    /// All ids matching `base`, paginated past the single-query cap so sets
+    /// larger than 1000 (same-tag documents, thousand-version documents) are
+    /// still fully enumerated.
+    async fn scan_ids(
+        &self,
+        collection: &Arc<Collection>,
+        base: Filter,
+    ) -> Result<Vec<u64>, WikiError> {
+        let mut out = Vec::new();
+        let mut cursor = collection.max_document_id() + 1;
+        loop {
+            let ids = collection
+                .search_ids(Query {
+                    search: None,
+                    filter: Some(Filter::And(vec![
+                        Box::new(base.clone()),
+                        Box::new(Filter::Field((
+                            "_id".to_string(),
+                            RangeQuery::Lt(Fv::U64(cursor)),
+                        ))),
+                    ])),
+                    limit: Some(Collection::MAX_SEARCH_LIMIT),
+                })
+                .await?;
+            let Some(min_id) = ids.iter().copied().min() else {
+                break;
+            };
+            let page_len = ids.len();
+            out.extend(ids);
+            cursor = min_id;
+            if page_len < Collection::MAX_SEARCH_LIMIT {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     async fn doc_ids_by_tags(&self, tags: &[String]) -> Result<Vec<u64>, WikiError> {
-        let ids = self
-            .docs
-            .search_ids(Query {
-                search: None,
-                filter: Some(Filter::Field((
-                    "tags".to_string(),
-                    RangeQuery::Include(
-                        tags.iter()
-                            .take(MAX_INCLUDE_KEYS)
-                            .cloned()
-                            .map(Fv::Text)
-                            .collect(),
-                    ),
-                ))),
-                limit: Some(Collection::MAX_SEARCH_LIMIT),
-            })
-            .await?;
-        Ok(ids)
+        self.scan_ids(
+            &self.docs,
+            Filter::Field((
+                "tags".to_string(),
+                RangeQuery::Include(
+                    tags.iter()
+                        .take(MAX_INCLUDE_KEYS)
+                        .cloned()
+                        .map(Fv::Text)
+                        .collect(),
+                ),
+            )),
+        )
+        .await
     }
 
     async fn chunk_ids_of(&self, doc_id: u64, version_id: u64) -> Result<Vec<u64>, WikiError> {
@@ -1744,31 +1925,19 @@ impl WikiService {
     }
 
     async fn all_chunk_ids_of(&self, doc_id: u64) -> Result<Vec<u64>, WikiError> {
-        Ok(self
-            .chunks
-            .search_ids(Query {
-                search: None,
-                filter: Some(Filter::Field((
-                    "doc_id".to_string(),
-                    RangeQuery::Eq(Fv::U64(doc_id)),
-                ))),
-                limit: Some(Collection::MAX_SEARCH_LIMIT),
-            })
-            .await?)
+        self.scan_ids(
+            &self.chunks,
+            Filter::Field(("doc_id".to_string(), RangeQuery::Eq(Fv::U64(doc_id)))),
+        )
+        .await
     }
 
     async fn version_ids_of(&self, doc_id: u64) -> Result<Vec<u64>, WikiError> {
-        Ok(self
-            .versions
-            .search_ids(Query {
-                search: None,
-                filter: Some(Filter::Field((
-                    "doc_id".to_string(),
-                    RangeQuery::Eq(Fv::U64(doc_id)),
-                ))),
-                limit: Some(Collection::MAX_SEARCH_LIMIT),
-            })
-            .await?)
+        self.scan_ids(
+            &self.versions,
+            Filter::Field(("doc_id".to_string(), RangeQuery::Eq(Fv::U64(doc_id)))),
+        )
+        .await
     }
 
     async fn set_chunks_current(
@@ -2463,6 +2632,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn range_read_is_bounded_and_conflict_carries_checksum() {
+        let wiki = test_wiki("wiki_range_bound").await;
+        let out = wiki
+            .commit(
+                "a".to_string(),
+                commit_input("边界文档", "# 边界文档\n\n正文内容若干。\n"),
+                1000,
+            )
+            .await
+            .unwrap();
+
+        // Range{0, u64::MAX} is clamped to MAX_READ_BYTES semantics (here the
+        // doc is small, so it reads fully but must not error).
+        let read = wiki
+            .read(WikiReadInput {
+                doc_id: out.doc.id,
+                version: None,
+                selector: WikiSelector::Range {
+                    start: 0,
+                    end: u64::MAX,
+                },
+            })
+            .await
+            .unwrap();
+        assert!(!read.truncated);
+        assert_eq!(read.content.unwrap().len() as u64, out.version.size);
+
+        // Conflict reports the current checksum for read-merge-retry.
+        let mut stale = commit_input("边界文档", "# 边界文档\n\n改动。\n");
+        stale.doc_id = Some(out.doc.id);
+        stale.parent_version = Some(out.version.id + 999);
+        match wiki.commit("b".to_string(), stale, 2000).await {
+            Err(WikiError::Conflict {
+                current_version,
+                current_checksum,
+                ..
+            }) => {
+                assert_eq!(current_version, out.version.id);
+                assert_eq!(current_checksum, out.doc.current_checksum);
+            }
+            other => panic!("expected conflict, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reserved_okf_slugs_are_suffixed() {
+        let wiki = test_wiki("wiki_reserved_slug").await;
+        let a = wiki
+            .commit(
+                "a".to_string(),
+                commit_input("Index", "# Index\n\n首页文档。\n"),
+                1000,
+            )
+            .await
+            .unwrap();
+        assert_ne!(a.doc.slug, "index");
+        let mut b = commit_input("日志", "# 日志\n\n记录。\n");
+        b.slug = Some("notes/log".to_string());
+        let b = wiki.commit("a".to_string(), b, 1100).await.unwrap();
+        assert_ne!(b.doc.slug, "notes/log");
+        assert!(b.doc.slug.starts_with("notes/log-"));
+    }
+
+    #[tokio::test]
+    async fn eval_namespace_is_excluded_from_default_search() {
+        let wiki = test_wiki("wiki_eval_excluded").await;
+        let mut eval_doc = commit_input("评测文档", "# 评测文档\n\n评测探针：孤峰栈道。\n");
+        eval_doc.namespace = Some(evalset::EVAL_NAMESPACE.to_string());
+        wiki.commit("eval".to_string(), eval_doc, 1000)
+            .await
+            .unwrap();
+
+        let default = wiki
+            .search(WikiSearchInput::from_query("孤峰栈道".to_string()))
+            .await
+            .unwrap();
+        assert!(default.hits.is_empty());
+
+        let mut explicit = WikiSearchInput::from_query("孤峰栈道".to_string());
+        explicit.namespaces = vec![evalset::EVAL_NAMESPACE.to_string()];
+        let explicit = wiki.search(explicit).await.unwrap();
+        assert_eq!(explicit.hits.len(), 1);
+    }
+
+    #[tokio::test]
     async fn list_docs_paginates_without_gaps_or_dups() {
         let wiki = test_wiki("wiki_paging").await;
         for i in 0..5 {
@@ -2671,6 +2925,148 @@ mod m2_tests {
     }
 
     #[tokio::test]
+    async fn okf_export_syncs_title_tags_drifted_by_commits() {
+        let wiki = test_wiki("wiki_okf_drift").await;
+        let imported = wiki
+            .import_bundle(
+                "i".to_string(),
+                WikiImportInput {
+                    entries: vec![bundle_entry(
+                        "policy.md",
+                        "---\ntitle: 旧政策\ntags: [old]\ncustom: 保留\n---\n\n# 旧政策\n\n条款。\n",
+                    )],
+                    namespace: None,
+                },
+                1000,
+            )
+            .await
+            .unwrap();
+        let doc_id = imported.docs[0].doc_id;
+        let version_id = imported.docs[0].version_id;
+
+        // Retitle via wiki_commit: the stored frontmatter block goes stale.
+        let mut update = commit_input("新政策", "# 旧政策\n\n条款。\n");
+        update.doc_id = Some(doc_id);
+        update.parent_version = Some(version_id);
+        update.tags = Some(vec!["new".to_string()]);
+        wiki.commit("editor".to_string(), update, 2000)
+            .await
+            .unwrap();
+
+        // Export reflects the current state; unknown keys survive.
+        let export = wiki
+            .export_bundle("e".to_string(), None, 3000)
+            .await
+            .unwrap();
+        let entry = export
+            .entries
+            .iter()
+            .find(|e| e.path == "policy.md")
+            .unwrap();
+        assert!(entry.content.contains("title: 新政策"), "{}", entry.content);
+        assert!(entry.content.contains("tags: [new]"));
+        assert!(entry.content.contains("custom: 保留"));
+        assert!(
+            !entry.content.contains("旧政策\ntags"),
+            "stale title line survived"
+        );
+
+        // Replay does not revert the document.
+        let reimport = wiki
+            .import_bundle(
+                "i".to_string(),
+                WikiImportInput {
+                    entries: export.entries,
+                    namespace: None,
+                },
+                4000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(reimport.created, 0);
+        let doc = wiki.get_doc(doc_id).await.unwrap();
+        assert_eq!(doc.title, "新政策");
+        assert_eq!(doc.tags, vec!["new".to_string()]);
+
+        // The cycle converges: a second export/import round is a no-op.
+        let export2 = wiki
+            .export_bundle("e".to_string(), None, 5000)
+            .await
+            .unwrap();
+        let reimport2 = wiki
+            .import_bundle(
+                "i".to_string(),
+                WikiImportInput {
+                    entries: export2.entries,
+                    namespace: None,
+                },
+                6000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(reimport2.unchanged, 1);
+        assert_eq!(reimport2.created + reimport2.updated, 0);
+    }
+
+    #[tokio::test]
+    async fn okf_commit_origin_docs_replay_with_zero_growth() {
+        let wiki = test_wiki("wiki_okf_origin").await;
+        let mut input = commit_input("原生文档", "# 原生文档\n\n直接提交的内容。\n");
+        input.tags = Some(vec!["native".to_string()]);
+        let out = wiki
+            .commit("author".to_string(), input, 1000)
+            .await
+            .unwrap();
+
+        let export = wiki
+            .export_bundle("e".to_string(), None, 2000)
+            .await
+            .unwrap();
+        // First replay of a commit-origin doc must already be version-stable:
+        // the synthesized frontmatter is recognized and not persisted.
+        let reimport = wiki
+            .import_bundle(
+                "i".to_string(),
+                WikiImportInput {
+                    entries: export.entries,
+                    namespace: None,
+                },
+                3000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(reimport.unchanged, 1);
+        assert_eq!(reimport.created + reimport.updated, 0);
+        let versions = wiki
+            .list_versions(out.doc.id, None, Some(10))
+            .await
+            .unwrap();
+        assert_eq!(versions.versions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn okf_import_skips_colliding_slugified_paths() {
+        let wiki = test_wiki("wiki_okf_collide").await;
+        let out = wiki
+            .import_bundle(
+                "i".to_string(),
+                WikiImportInput {
+                    entries: vec![
+                        bundle_entry("A B.md", "# 第一份\n\n甲。\n"),
+                        bundle_entry("a-b.md", "# 第二份\n\n乙。\n"),
+                    ],
+                    namespace: None,
+                },
+                1000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.created, 1);
+        assert_eq!(out.skipped.len(), 1);
+        assert!(out.skipped[0].reason.contains("slugifies"));
+    }
+
+    #[tokio::test]
     async fn okf_import_updates_changed_docs_in_place() {
         let wiki = test_wiki("wiki_okf_update").await;
         let v1 = WikiImportInput {
@@ -2861,8 +3257,10 @@ mod m4_tests {
             .await
             .unwrap();
         assert!(listed.docs.iter().all(|d| d.acl_label.is_empty()));
-        assert!(matches!(
-            wiki.verify_scoped(
+        // verify: denial is indistinguishable from a nonexistent citation
+        // (same 200 + not_found verdict) so it cannot enumerate hidden ids.
+        let denied = wiki
+            .verify_scoped(
                 &outsider,
                 WikiVerifyInput {
                     uri: Some(citation_uri(
@@ -2870,11 +3268,82 @@ mod m4_tests {
                         secret.doc.id,
                         secret.version.id,
                         0,
-                        4
+                        4,
                     )),
                     ..Default::default()
                 },
                 2004,
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status, WikiVerifyStatus::NotFound);
+        assert!(denied.current_version.is_none());
+        assert!(denied.quote.is_none());
+        let missing = wiki
+            .verify_scoped(
+                &outsider,
+                WikiVerifyInput {
+                    uri: Some(citation_uri("test_space", 99999, 99999, 0, 4)),
+                    ..Default::default()
+                },
+                2005,
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status, WikiVerifyStatus::NotFound);
+    }
+
+    #[tokio::test]
+    async fn agent_view_restricts_labeled_content_on_public_floor() {
+        let wiki = test_wiki("wiki_agent_view").await;
+        wiki.commit(
+            "admin".to_string(),
+            commit_input("公开文档", "# 公开文档\n\n公开探针：银杏大道。\n"),
+            1000,
+        )
+        .await
+        .unwrap();
+        let mut secret = commit_input("受限文档", "# 受限文档\n\n受限探针：琥珀回廊。\n");
+        secret.acl_label = Some("secret".to_string());
+        let secret = wiki
+            .commit("admin".to_string(), secret, 1100)
+            .await
+            .unwrap();
+
+        // Private-space view (None): unrestricted.
+        let all = wiki
+            .search_view(WikiSearchInput::from_query("琥珀回廊".to_string()), None)
+            .await
+            .unwrap();
+        assert_eq!(all.hits.len(), 1);
+
+        // Public-space floor (Some([])): labeled content is invisible and
+        // reads deny as NotFound.
+        let floor: Vec<String> = Vec::new();
+        let none = wiki
+            .search_view(
+                WikiSearchInput::from_query("琥珀回廊".to_string()),
+                Some(&floor),
+            )
+            .await
+            .unwrap();
+        assert!(none.hits.is_empty());
+        let open = wiki
+            .search_view(
+                WikiSearchInput::from_query("银杏大道".to_string()),
+                Some(&floor),
+            )
+            .await
+            .unwrap();
+        assert_eq!(open.hits.len(), 1);
+        assert!(matches!(
+            wiki.read_view(
+                WikiReadInput {
+                    doc_id: secret.doc.id,
+                    version: None,
+                    selector: WikiSelector::Full,
+                },
+                Some(&floor),
             )
             .await,
             Err(WikiError::NotFound(_))

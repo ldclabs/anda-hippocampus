@@ -730,12 +730,47 @@ impl Space {
             return Err("space token limit reached".into());
         }
 
+        // The token name is the audit identity (`st:{name}`): collisions
+        // would make two tokens indistinguishable in the event log.
+        let name = input.name.trim().to_string();
+        if !name.is_empty()
+            && self
+                .list_space_tokens()?
+                .iter()
+                .any(|st| st.name.trim() == name)
+        {
+            return Err(format!("space token name {name:?} already exists").into());
+        }
+
+        let labels = match input.labels {
+            Some(labels) => {
+                // Label-restricted tokens are read-only wiki viewers (PRD
+                // §8.2): any write scope would let them commit to, archive,
+                // relabel or export documents behind labels they cannot read.
+                if input.scope != TokenScope::Read {
+                    return Err("labeled tokens must have read scope".into());
+                }
+                let mut cleaned: Vec<String> = labels
+                    .iter()
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                cleaned.sort();
+                cleaned.dedup();
+                if cleaned.is_empty() && !labels.is_empty() {
+                    return Err("labels must not be blank".into());
+                }
+                Some(cleaned)
+            }
+            None => None,
+        };
+
         let sp = SpaceToken {
             token: token.clone(),
             scope: input.scope,
-            name: input.name,
+            name,
             expires_at: input.expires_at,
-            labels: input.labels,
+            labels,
             created_at: now_ms,
             updated_at: now_ms,
             ..Default::default()
@@ -763,6 +798,9 @@ impl Space {
                 if let Some(mut st) = v
                     && st.expires_at.map(|exp| exp > now_ms).unwrap_or(true)
                     && st.scope.allows(scope)
+                    // Labeled tokens are read-only wiki viewers; a legacy row
+                    // carrying a write scope fails closed here (PRD §8.2).
+                    && (st.labels.is_none() || scope == TokenScope::Read)
                 {
                     st.usage = st.usage.saturating_add(1);
                     st.updated_at = now_ms;
@@ -2414,13 +2452,24 @@ impl Space {
         Ok(rt)
     }
 
-    /// Non-LLM wiki housekeeping (PRD §7.4 Full tier): audit-log retention
-    /// pruning and the stale-document report. Cheap enough to run alongside
-    /// every digest kick.
+    /// Non-LLM wiki housekeeping (PRD §7.4): orphan sweep (Quick tier — not
+    /// only at startup, so long-running spaces reclaim commit-crash leftovers
+    /// too), audit-log retention pruning, the stale-document report, and the
+    /// citation sample check (independent of the digest switch). Cheap enough
+    /// to run alongside every digest kick.
     pub fn kick_wiki_housekeeping(self: &Arc<Self>) {
         let space = self.clone();
         tokio::spawn(async move {
             let now_ms = unix_ms();
+            match space.wiki.orphan_sweep(now_ms).await {
+                Ok(report) if !report.is_empty() => {
+                    log::warn!(target: "brain", space_id = space.id, report:serde = report; "wiki orphan sweep repaired state");
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    log::warn!(target: "brain", space_id = space.id; "wiki orphan sweep failed: {err:?}");
+                }
+            }
             if let Err(err) = space
                 .wiki
                 .prune_events(crate::wiki::DEFAULT_EVENT_RETENTION, now_ms)
@@ -2434,6 +2483,15 @@ impl Space {
                 .await
             {
                 log::warn!(target: "brain", space_id = space.id; "wiki stale report failed: {err:?}");
+            }
+            match space.wiki_digest.verify_recent(now_ms).await {
+                Ok((_, invalid)) if invalid > 0 => {
+                    log::error!(target: "brain", space_id = space.id, invalid = invalid; "wiki citation sample found invalid citations (storage corruption signal)");
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    log::warn!(target: "brain", space_id = space.id; "wiki citation sample failed: {err:?}");
+                }
             }
         });
     }
@@ -2678,8 +2736,26 @@ impl Space {
         // create a new models instance for each space to allow per-space customization in the future (e.g., different model providers or credentials)
         let models = Arc::new(Models::from_clone(models.as_ref()));
         let memory = Arc::new(memory);
-        let wiki_digest = Arc::new(WikiDigest::new(wiki.clone(), memory.clone()));
+        let wiki_digest = Arc::new(WikiDigest::new(
+            wiki.clone(),
+            memory.clone(),
+            models.clone(),
+        ));
         wiki.set_audit_reads(db.get_extension_as("wiki_audit_reads").unwrap_or(false));
+        // Agent wiki tools see only unlabeled content when the space is
+        // public: recall there is world-reachable, so its evidence pool must
+        // match the anonymous reader's view (PRD §8.2). Evaluated per call —
+        // toggling `public` applies immediately.
+        let wiki_tool_scope: crate::wiki::WikiToolScope = {
+            let db = db.clone();
+            Arc::new(move || {
+                if db.get_extension_as("public").unwrap_or(false) {
+                    Some(Vec::new())
+                } else {
+                    None
+                }
+            })
+        };
         let memory_r = TimedMemoryReadonly::new(memory.clone());
         let memory_tool = MemoryTool::new(memory.clone());
         let note_tool = NoteTool::new();
@@ -2709,8 +2785,14 @@ impl Space {
             .register_tool(Arc::new(memory_r))?
             .register_tool(Arc::new(memory_tool))?
             .register_tool(Arc::new(note_tool))?
-            .register_tool(Arc::new(WikiSearchTool::new(wiki.clone())))?
-            .register_tool(Arc::new(WikiReadTool::new(wiki.clone())))?
+            .register_tool(Arc::new(WikiSearchTool::new(
+                wiki.clone(),
+                wiki_tool_scope.clone(),
+            )))?
+            .register_tool(Arc::new(WikiReadTool::new(
+                wiki.clone(),
+                wiki_tool_scope.clone(),
+            )))?
             .register_tool(Arc::new(WikiCommitTool::new(wiki.clone())))?
             .register_agent(formation.clone(), None)?
             .register_agent(recall.clone(), None)?
@@ -3322,7 +3404,7 @@ mod tests {
         types::{
             AddSpaceTokenInput, FormationInput, InputContext, MaintenanceInput,
             MaintenanceParameters, MaintenanceScope, MemoryPolicy, ModelConfig, RecallInput,
-            SpaceTier, TokenScope, UpdateSpaceInput,
+            SpaceTier, SpaceToken, TokenScope, UpdateSpaceInput,
         },
     };
     use anda_core::{
@@ -4070,6 +4152,95 @@ mod tests {
             .await
             .unwrap();
         assert!(space.get_byok().is_some());
+    }
+
+    #[tokio::test]
+    async fn labeled_space_tokens_are_read_only_wiki_viewers() {
+        let app = test_app_state("labeled_tokens");
+        let space = create_loaded_space(&app, "labeled_tokens").await;
+
+        // Labels are trimmed and deduped.
+        let st = space
+            .add_space_token(
+                "STlabeled".to_string(),
+                AddSpaceTokenInput {
+                    scope: TokenScope::Read,
+                    name: "auditor".to_string(),
+                    expires_at: None,
+                    labels: Some(vec![" hr ".to_string(), "hr".to_string(), " ".to_string()]),
+                },
+                1000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(st.labels, Some(vec!["hr".to_string()]));
+
+        // Labels with a write-capable scope are rejected at creation: they
+        // would allow committing to / exporting documents behind labels the
+        // token cannot read (launch review P0-2/P1-1).
+        for (idx, scope) in [TokenScope::Write, TokenScope::All].into_iter().enumerate() {
+            let err = space
+                .add_space_token(
+                    format!("STw{idx}"),
+                    AddSpaceTokenInput {
+                        scope,
+                        name: format!("writer{idx}"),
+                        expires_at: None,
+                        labels: Some(vec!["hr".to_string()]),
+                    },
+                    1000,
+                )
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("read scope"), "{err}");
+        }
+
+        // A legacy labeled row carrying a write scope fails closed at verify
+        // but still works as the read-only viewer it was meant to be.
+        let legacy = SpaceToken {
+            token: "STlegacy".to_string(),
+            scope: TokenScope::All,
+            name: "legacy".to_string(),
+            labels: Some(vec!["hr".to_string()]),
+            ..Default::default()
+        };
+        space
+            .db
+            .save_extension_from("STlegacy".to_string(), &legacy.to_ref())
+            .await
+            .unwrap();
+        assert!(
+            space
+                .verify_space_token("STlegacy".to_string(), TokenScope::All, 2000)
+                .is_err()
+        );
+        assert!(
+            space
+                .verify_space_token("STlegacy".to_string(), TokenScope::Write, 2000)
+                .is_err()
+        );
+        assert!(
+            space
+                .verify_space_token("STlegacy".to_string(), TokenScope::Read, 2000)
+                .is_ok()
+        );
+
+        // Token names are audit identities (`st:{name}`): duplicates would
+        // make two tokens indistinguishable in the event log.
+        let err = space
+            .add_space_token(
+                "STdup".to_string(),
+                AddSpaceTokenInput {
+                    scope: TokenScope::Read,
+                    name: "auditor".to_string(),
+                    expires_at: None,
+                    labels: None,
+                },
+                1000,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
     }
 
     #[tokio::test]
@@ -5838,6 +6009,32 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(!live.to_string().contains("superseded"));
+        // The surviving fact stays live: its status is active and never the
+        // "superseded" value (the `superseded_by: null` reset key is fine).
+        let live_text = live.to_string();
+        assert!(!live_text.contains("\"superseded\""), "live: {live_text}");
+        assert!(live_text.contains("\"active\""), "live: {live_text}");
+
+        // Labeled documents never reach the graph: the Cognitive Nexus has
+        // no ACL, so digesting them would leak restricted facts to any Read
+        // principal (launch review P1-3).
+        space
+            .wiki
+            .commit(
+                "tester".to_string(),
+                WikiCommitInput {
+                    title: "受限预案".to_string(),
+                    content: "# 受限预案\n\n机密事实：夜航坐标由 Acme 维护。\n".to_string(),
+                    acl_label: Some("secret".to_string()),
+                    ..Default::default()
+                },
+                unix_ms(),
+            )
+            .await
+            .unwrap();
+        let report = space.run_wiki_digest(SELF_USER_ID).await.unwrap();
+        assert_eq!(report.digested, 0);
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.facts, 0);
     }
 }
