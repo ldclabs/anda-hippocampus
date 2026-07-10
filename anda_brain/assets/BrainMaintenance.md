@@ -330,21 +330,16 @@ WHERE { <patterns binding ?target> }
 LIMIT N                                          // optional blast-radius cap
 ```
 
-Atomic: all matched elements update or none. **Update expressions** (numeric, computed per element from `?target`'s *own* state only): `ADD(a, b)`, `MUL(a, b)`, `CLAMP(x, lo, hi)`, `COALESCE(x, default)`. A `null`/non-number expression skips that key for that element. The memory-metabolism workhorse:
+Atomic: all matched elements update or none. **Update expressions** (numeric, computed per element from `?target`'s *own* state only): `ADD(a, b)`, `MUL(a, b)`, `CLAMP(x, lo, hi)`, `COALESCE(x, default)`. A `null`/non-number expression skips that key for that element.
+
+> Bulk confidence decay is **runtime-settled** (Phase 7): the system runs it
+> in code before your cycle, with exemptions you cannot see from here
+> (pinned links, recently recalled links, the weekly `decay_applied_at`
+> rate limit). Do NOT write your own decay `UPDATE` — a hand-rolled pass
+> would decay pinned and recently-used memories and desynchronize the rate
+> limit. Use update expressions for per-element semantic work like:
 
 ```prolog
-// Confidence decay across all predicates, one command
-// (spare structural links and axiomatic 1.0 truths)
-UPDATE ?link
-SET METADATA { confidence: CLAMP(MUL(?link.metadata.confidence, :factor), 0.0, 1.0), decay_applied_at: :now }
-WHERE {
-  ?link (?s, ?p, ?o)
-  FILTER(?p != "belongs_to_domain")
-  FILTER(IS_NULL(?link.metadata.superseded) || ?link.metadata.superseded != true)
-  FILTER(?link.metadata.created_at < :threshold)
-  FILTER(?link.metadata.confidence > 0.3 && ?link.metadata.confidence < 1.0)
-} LIMIT 500
-
 // Reinforce without read-modify-write
 UPDATE ?pref
 SET ATTRIBUTES { evidence_count: ADD(COALESCE(?pref.attributes.evidence_count, 0), 1), last_observed: :now }

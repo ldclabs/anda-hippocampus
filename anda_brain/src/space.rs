@@ -121,6 +121,10 @@ pub struct AppState {
     models: Arc<Models>,
     ed25519_pubkeys: Arc<Vec<VerifyingKey>>,
     management: Arc<dyn Management>,
+    /// Independent judge model (plan M9), installed on every space this
+    /// state loads — service mode included, so shadow-eval verdicts stop
+    /// falling back to the evaluated space's own model.
+    judge_model: Arc<Option<ModelConfig>>,
 
     pub app_name: String,
     pub app_version: String,
@@ -148,10 +152,18 @@ impl AppState {
             http_client,
             models,
             ed25519_pubkeys,
+            judge_model: Arc::new(None),
             app_name,
             app_version,
             sharding,
         }
+    }
+
+    /// Configures the independent judge model this state installs on every
+    /// space it loads (consuming builder; call before the state is cloned).
+    pub fn with_judge_model(mut self, config: Option<ModelConfig>) -> Self {
+        self.judge_model = Arc::new(config);
+        self
     }
 
     pub fn cwt_auth_enabled(&self) -> bool {
@@ -217,7 +229,10 @@ impl AppState {
             return Err("a shadow evaluation is already running for this space".into());
         };
         let now_ms = unix_ms();
-        let sample = input.replay_sample.unwrap_or(4).clamp(1, 16);
+        let sample = input
+            .replay_sample
+            .unwrap_or_else(|| space.memory_policy().shadow_replay_sample as usize)
+            .clamp(1, 16);
 
         let queries = space.recent_recall_queries(sample).await?;
         if queries.is_empty() {
@@ -233,11 +248,16 @@ impl AppState {
         let candidate = self
             .fork_space_for_shadow(space_id, Some(input.policy.clone()))
             .await?;
+        // Interval 0 bypasses the weekly decay gate: the forks inherit the
+        // live space's `decay_applied_at` stamps, and under the gate both
+        // sides would settle identically whenever the live space decayed
+        // recently — turning every decay-knob comparison into a tie. Forks
+        // are throwaway copies, so over-decaying them has no consequence.
         let _ = baseline
-            .settle_memory_metabolism(MaintenanceScope::Full, now_ms)
+            .settle_memory_metabolism_with(MaintenanceScope::Full, now_ms, 0)
             .await;
         let _ = candidate
-            .settle_memory_metabolism(MaintenanceScope::Full, now_ms)
+            .settle_memory_metabolism_with(MaintenanceScope::Full, now_ms, 0)
             .await;
 
         let mut report = ShadowReport {
@@ -349,6 +369,7 @@ impl AppState {
             db_config: self.db_config.clone(),
             http_client: self.http_client.clone(),
             models: self.models.clone(),
+            judge_model: self.judge_model.clone(),
             ed25519_pubkeys: self.ed25519_pubkeys.clone(),
             management: self.management.clone(),
             app_name: self.app_name.clone(),
@@ -501,7 +522,7 @@ impl AppState {
             .get_or_try_init(|| async {
                 let mut db_config = (*self.db_config).clone();
                 db_config.name = space_id.to_string();
-                Space::connect(
+                let space = Space::connect(
                     self.object_store.clone(),
                     db_config,
                     self.management.clone(),
@@ -510,7 +531,17 @@ impl AppState {
                     pinned,
                     autostart,
                 )
-                .await
+                .await?;
+                if let Some(judge) = self.judge_model.as_ref()
+                    && let Err(err) = space.set_judge_model(judge.clone())
+                {
+                    log::warn!(
+                        target: "brain",
+                        space_id = space.id;
+                        "installing the independent judge model failed: {err:?}"
+                    );
+                }
+                Ok::<_, BoxError>(space)
             })
             .await
             .cloned()?;
@@ -976,8 +1007,28 @@ impl Space {
         let mut output = self.run_recall(user, input).await?;
         // The self-report footer (plan M4) is machine metadata; plain-text
         // callers must never see it. `query_structured` surfaces it instead.
-        let (answer, _) = assess::split_recall_meta(&output.content);
+        let (answer, meta) = assess::split_recall_meta(&output.content);
         output.content = answer;
+        // The final assistant message inside `chat_history` carries the raw
+        // model output — strip the footer there too, or clients reading the
+        // history see the markup that `content` hides. Same for the failure
+        // diagnostic, which embeds the rendered conversation.
+        strip_recall_meta_from_history(&mut output.chat_history);
+        if let Some(reason) = output.failed_reason.take() {
+            output.failed_reason = Some(assess::split_recall_meta(&reason).0);
+        }
+        // Plain recalls feed the calibration counters (plan M12) exactly
+        // like structured ones — else most production traffic is a blind
+        // spot — but only successful runs: a failed recall's self-report is
+        // not a calibration sample.
+        if output.failed_reason.is_none()
+            && let Some(uncertainty) = meta.and_then(|meta| meta.uncertainty)
+        {
+            self.bump_metrics(|metrics| {
+                metrics.uncertainty_reports += 1;
+                metrics.uncertainty_sum += uncertainty;
+            });
+        }
         Ok(output)
     }
 
@@ -1007,9 +1058,12 @@ impl Space {
             None => Vec::new(),
         };
         let meta = meta.unwrap_or_default();
-        if let Some(uncertainty) = meta.uncertainty {
+        if output.failed_reason.is_none()
+            && let Some(uncertainty) = meta.uncertainty
+        {
             // Calibration raw material (plan M12): predicted uncertainty is
-            // later audited against actual correction rates.
+            // later audited against actual correction rates. Failed recalls
+            // are excluded — their self-report is not a calibration sample.
             self.bump_metrics(|metrics| {
                 metrics.uncertainty_reports += 1;
                 metrics.uncertainty_sum += uncertainty;
@@ -1023,7 +1077,9 @@ impl Space {
             memories,
             conversation: output.conversation,
             usage: output.usage,
-            failed_reason: output.failed_reason,
+            failed_reason: output
+                .failed_reason
+                .map(|reason| assess::split_recall_meta(&reason).0),
         })
     }
 
@@ -1175,13 +1231,21 @@ impl Space {
             .db
             .get_extension_as("memory_metrics")
             .unwrap_or_default();
-        let formation = self.formation_status();
-        let graph = MemoryGraphCounters {
-            concepts: formation.concepts as u64,
-            propositions: formation.propositions as u64,
-            unsorted: assess::kip_count(self, assess::UNSORTED_COUNT_KQL).await,
-            orphans: assess::kip_count(self, assess::ORPHAN_COUNT_KQL).await,
-            predicate_types: assess::kip_count(self, assess::PREDICATE_TYPES_COUNT_KQL).await,
+        // Graph counters come from the settlement-time census (M12: readers
+        // never pay heavy queries — the orphan count is a near-full scan,
+        // and this endpoint is reachable anonymously on public spaces). A
+        // space that has never settled pays the census once and caches it.
+        let graph = match self
+            .db
+            .get_extension_as::<MemoryGraphCounters>("memory_graph_counters")
+        {
+            Some(graph) => graph,
+            None => {
+                let graph = self.census_graph_counters(unix_ms()).await;
+                self.db
+                    .set_extension_from("memory_graph_counters".to_string(), graph.clone());
+                graph
+            }
         };
         let maintenance_usage: Usage = self
             .db
@@ -1209,6 +1273,21 @@ impl Space {
         }
     }
 
+    /// Counts the graph-health numbers `memory_status` reports. Heavy (the
+    /// orphan query is a near-full scan), so it runs at settlement time and
+    /// the result is cached in the `memory_graph_counters` extension.
+    async fn census_graph_counters(&self, now_ms: u64) -> MemoryGraphCounters {
+        let formation = self.formation_status();
+        MemoryGraphCounters {
+            concepts: formation.concepts as u64,
+            propositions: formation.propositions as u64,
+            unsorted: assess::kip_count(self, assess::UNSORTED_COUNT_KQL).await,
+            orphans: assess::kip_count(self, assess::ORPHAN_COUNT_KQL).await,
+            predicate_types: assess::kip_count(self, assess::PREDICATE_TYPES_COUNT_KQL).await,
+            as_of: Some(now_ms),
+        }
+    }
+
     /// Per-predicate link census (plan M8), run by full-scope settlements.
     /// The counts feed the schema-sprawl metric and give the Maintenance
     /// prompt's merge guidance real numbers to look at.
@@ -1228,7 +1307,11 @@ impl Space {
 
         let mut predicates = BTreeMap::new();
         for name in names.into_iter().take(50) {
-            let count = assess::kip_count(
+            // A failed count (typically the engine's full-scan cap on the
+            // busiest predicates) must be *absent*, not zero: reporting the
+            // most-used predicate as having zero links would point the
+            // Phase-6 merge guidance at exactly the wrong target.
+            match assess::kip_count(
                 self,
                 &format!(
                     "FIND(COUNT(?link)) WHERE {{ ?link (?s, {}, ?o) }}",
@@ -1236,8 +1319,18 @@ impl Space {
                 ),
             )
             .await
-            .unwrap_or(0);
-            predicates.insert(name, count);
+            {
+                Some(count) => {
+                    predicates.insert(name, count);
+                }
+                None => {
+                    log::warn!(
+                        target: "brain",
+                        space_id = self.id;
+                        "schema census count failed for predicate `{name}`; omitted from audit"
+                    );
+                }
+            }
         }
         self.db.set_extension_from(
             "schema_audit".to_string(),
@@ -1246,6 +1339,41 @@ impl Space {
                 predicates,
             },
         );
+
+        // Correction *rates* need a denominator (plan M3): for every source
+        // already charged with corrections, census its total link count.
+        // Sources storing `metadata.source` as an array are skipped by the
+        // equality filter — the rate is then an upper bound, which is the
+        // safe direction for encode-time discounting.
+        let sources: BTreeMap<String, SourceReliability> = self
+            .db
+            .get_extension_as("source_reliability")
+            .unwrap_or_default();
+        if !sources.is_empty() {
+            let mut totals: BTreeMap<String, Option<u64>> = BTreeMap::new();
+            for source in sources.keys().take(20) {
+                let total = assess::kip_count(
+                    self,
+                    &format!(
+                        "FIND(COUNT(?link)) WHERE {{ ?link (?s, ?p, ?o) FILTER(?link.metadata.source == {}) }}",
+                        kip_string_literal(source)
+                    ),
+                )
+                .await;
+                totals.insert(source.clone(), total);
+            }
+            let _ = self
+                .db
+                .set_extension_from_with("source_reliability".to_string(), |value| {
+                    let mut map: BTreeMap<String, SourceReliability> = value.unwrap_or_default();
+                    for (source, total) in totals {
+                        if let (Some(entry), Some(total)) = (map.get_mut(&source), total) {
+                            entry.total_links = Some(total);
+                        }
+                    }
+                    Some(map)
+                });
+        }
         Ok(())
     }
 
@@ -1336,6 +1464,21 @@ impl Space {
         scope: MaintenanceScope,
         now_ms: u64,
     ) -> Result<MemorySettlementReport, BoxError> {
+        self.settle_memory_metabolism_with(scope, now_ms, DECAY_MIN_INTERVAL_MS)
+            .await
+    }
+
+    /// [`Self::settle_memory_metabolism`] with control over the decay rate
+    /// limit. Shadow forks pass `0`: they inherit the live space's
+    /// `decay_applied_at` stamps, and under the weekly gate both forks would
+    /// settle identically whenever the live space decayed within the window
+    /// — every comparison of decay knobs would be a systematic tie.
+    pub(crate) async fn settle_memory_metabolism_with(
+        &self,
+        scope: MaintenanceScope,
+        now_ms: u64,
+        decay_min_interval_ms: u64,
+    ) -> Result<MemorySettlementReport, BoxError> {
         let _guard = self.settlement_lock.lock().await;
         let policy = self.memory_policy();
         let mut report = MemorySettlementReport {
@@ -1406,7 +1549,7 @@ impl Space {
         // operator, not vanish into a debug log.
         if scope == MaintenanceScope::Full {
             report.decay_ran = true;
-            let command = decay_update_command(&policy, now_ms);
+            let command = decay_update_command(&policy, now_ms, decay_min_interval_ms);
             for _ in 0..SETTLEMENT_MAX_BATCHES {
                 let response = self
                     .execute_kip_settlement(anda_kip::Request {
@@ -1545,6 +1688,11 @@ impl Space {
             metrics.decayed += report.decayed;
             metrics.reinforced += report.reinforced;
         });
+        // Refresh the cached graph counters `memory_status` serves (M12:
+        // readers never pay heavy queries).
+        let counters = self.census_graph_counters(now_ms).await;
+        self.db
+            .set_extension_from("memory_graph_counters".to_string(), counters);
         self.db
             .set_extension_from("memory_settlement_at".to_string(), now_ms);
         self.db
@@ -1587,12 +1735,26 @@ impl Space {
                 ..Default::default()
             })
             .await?;
-        let hits = match &response {
+        let mut hits = match &response {
             anda_kip::Response::Ok { result, .. } => assess::citations_from_json(result),
             anda_kip::Response::Err { .. } => {
                 return Err(format!("probe search failed: {response:?}").into());
             }
         };
+        // The engine's keyword fallback has no relevance threshold, so any
+        // token can match graph plumbing (meta-schema, domains, sleep
+        // tasks, `$system` identities). Those are not user memory: counting
+        // them as `found` would tell callers to pay for a recall that has
+        // nothing to say.
+        hits.retain(|hit| {
+            !matches!(
+                hit.r#type.as_deref(),
+                Some("$ConceptType")
+                    | Some("$PropositionType")
+                    | Some("Domain")
+                    | Some("SleepTask")
+            ) && !hit.name.as_deref().unwrap_or_default().starts_with('$')
+        });
         if hits.is_empty() {
             self.miss_cache.record_miss(query, now_ms).await?;
         }
@@ -2940,6 +3102,25 @@ fn kip_timestamp(now_ms: u64) -> String {
     rfc3339_datetime(now_ms).unwrap_or_else(rfc3339_datetime_now)
 }
 
+/// Strips the recall self-report footer from assistant text in a chat
+/// history (plan M4): `content` is stripped by the callers, and the history
+/// must not re-leak the markup to clients that read it.
+fn strip_recall_meta_from_history(history: &mut [anda_core::Message]) {
+    for message in history {
+        if message.role != "assistant" {
+            continue;
+        }
+        for part in &mut message.content {
+            if let anda_core::ContentPart::Text { text } = part
+                && text.contains(assess::RECALL_META_TAG_OPEN)
+            {
+                let (stripped, _) = assess::split_recall_meta(text);
+                *text = stripped;
+            }
+        }
+    }
+}
+
 /// Settlement command: set one metadata flag on one link by id. `value` is
 /// raw KIP (pass `"true"` for booleans, a `kip_string_literal` for strings).
 fn metadata_flag_command(entity: &str, key: &str, value: &str) -> String {
@@ -3028,7 +3209,8 @@ fn self_test_task_command(candidate: &SelfTestCandidate, query: &str, now_ms: u6
       priority: 2
     }}
     SET PROPOSITIONS {{
-      ("assigned_to", {{type: "Person", name: "$system"}})
+      ("assigned_to", {{type: "Person", name: "$system"}}),
+      ("belongs_to_domain", {{type: "Domain", name: "System"}})
     }}
   }}
 }}
@@ -3045,11 +3227,14 @@ WITH METADATA {{ source: "memory_self_test", author: "$system", confidence: 1.0,
 /// This is the Maintenance prompt's former Phase-7 command with three new
 /// exemptions the runtime can now enforce: recently recalled links (usage
 /// reinforcement), pinned links, and links decayed within the weekly window.
-fn decay_update_command(policy: &MemoryPolicy, now_ms: u64) -> String {
+fn decay_update_command(policy: &MemoryPolicy, now_ms: u64, decay_min_interval_ms: u64) -> String {
     let stale_window_ms = u64::from(policy.stale_event_threshold_days) * 86_400_000;
     let created_before = kip_string_literal(&kip_timestamp(now_ms.saturating_sub(stale_window_ms)));
+    // The filter is also the intra-settlement batch cursor: rows stamped
+    // `now` this pass no longer match `< decay_before`, so an interval of 0
+    // still terminates — it just disables the *cross-cycle* rate limit.
     let decay_before =
-        kip_string_literal(&kip_timestamp(now_ms.saturating_sub(DECAY_MIN_INTERVAL_MS)));
+        kip_string_literal(&kip_timestamp(now_ms.saturating_sub(decay_min_interval_ms)));
     let now_iso = kip_string_literal(&kip_timestamp(now_ms));
     format!(
         r#"UPDATE ?link

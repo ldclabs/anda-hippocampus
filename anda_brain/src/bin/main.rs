@@ -696,9 +696,28 @@ fn build_app_state(cli: &Cli) -> Result<(AppState, String), BoxError> {
         APP_NAME.to_string(),
         APP_VERSION.to_string(),
         cli.sharding_idx,
-    );
+    )
+    .with_judge_model(judge_model_from_env());
 
     Ok((app_state, db_type))
+}
+
+/// Independent judge model for the service path (plan M9), from the same
+/// `JUDGE_MODEL_*` variables the eval subcommand exposes as flags. Without
+/// this, shadow-eval verdicts in service mode always fall back to the
+/// evaluated space's own model — a self-grading blind spot.
+fn judge_model_from_env() -> Option<BrainModelConfig> {
+    let api_key = std::env::var("JUDGE_MODEL_API_KEY").unwrap_or_default();
+    if api_key.is_empty() {
+        return None;
+    }
+    Some(BrainModelConfig {
+        family: std::env::var("JUDGE_MODEL_FAMILY").unwrap_or_else(|_| "openai".to_string()),
+        model: std::env::var("JUDGE_MODEL_NAME").unwrap_or_default(),
+        api_base: std::env::var("JUDGE_MODEL_API_BASE").unwrap_or_default(),
+        api_key,
+        ..Default::default()
+    })
 }
 
 fn build_service_runtime(
@@ -1618,10 +1637,16 @@ async fn run_mine_command(
     std::fs::create_dir_all(mine_out)?;
     let mut entries = Vec::with_capacity(mined.len());
     for item in &mined {
-        let path = Path::new(mine_out).join(format!(
-            "{}.json",
-            sanitize_space_id_part(&item.scenario.id)
-        ));
+        // The LLM readily produces the same slug for the same class of
+        // correction (this run or a previous one); never overwrite a file
+        // awaiting human review — suffix until the name is free.
+        let stem = sanitize_space_id_part(&item.scenario.id);
+        let mut path = Path::new(mine_out).join(format!("{stem}.json"));
+        let mut suffix = 1u32;
+        while path.exists() {
+            suffix += 1;
+            path = Path::new(mine_out).join(format!("{stem}_{suffix}.json"));
+        }
         std::fs::write(&path, serde_json::to_string_pretty(&item.scenario)?)?;
         entries.push(serde_json::json!({
             "id": item.scenario.id,

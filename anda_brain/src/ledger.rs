@@ -336,9 +336,17 @@ pub struct RecallMiss {
 /// nothing, so agents stop paying to hit the same wall. Invalidation is
 /// deliberately coarse — any completed formation clears the whole cache
 /// (new memory could answer any past miss) — with a TTL as backstop.
+///
+/// Keys are normalized (whitespace-folded, lowercased): the cache exists to
+/// absorb repeats, and users re-ask the same question with different casing
+/// and spacing.
 pub struct MissCache {
     collection: Arc<Collection>,
     write_lock: tokio::sync::Mutex<()>,
+    /// When the cache was last cleared (unix ms, in-process). A miss whose
+    /// graph search *started* before a clear must not be recorded: the
+    /// clear means new memory arrived, which may answer that very query.
+    last_cleared_ms: std::sync::atomic::AtomicU64,
 }
 
 /// Backstop TTL for negative-knowledge entries.
@@ -372,17 +380,27 @@ impl MissCache {
         Ok(Self {
             collection,
             write_lock: tokio::sync::Mutex::new(()),
+            last_cleared_ms: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
-    async fn get(&self, query: &str) -> Result<Option<RecallMiss>, DBError> {
+    /// Cache key: whitespace-folded, lowercased query text.
+    fn cache_key(query: &str) -> String {
+        query
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    }
+
+    async fn get(&self, key: &str) -> Result<Option<RecallMiss>, DBError> {
         let rows: Vec<RecallMiss> = self
             .collection
             .search_as(Query {
                 search: None,
                 filter: Some(Filter::Field((
                     "query".to_string(),
-                    RangeQuery::Eq(Fv::Text(query.to_string())),
+                    RangeQuery::Eq(Fv::Text(key.to_string())),
                 ))),
                 limit: Some(1),
             })
@@ -393,7 +411,7 @@ impl MissCache {
     /// True when a fresh (unexpired) miss is cached for this query. Expired
     /// rows are pruned lazily.
     pub async fn is_fresh_miss(&self, query: &str, now_ms: u64) -> Result<bool, DBError> {
-        match self.get(query).await? {
+        match self.get(&Self::cache_key(query)).await? {
             Some(row) if now_ms.saturating_sub(row.created_at) <= RECALL_MISS_TTL_MS => Ok(true),
             Some(row) => {
                 let _guard = self.write_lock.lock().await;
@@ -404,31 +422,43 @@ impl MissCache {
         }
     }
 
-    pub async fn record_miss(&self, query: &str, now_ms: u64) -> Result<(), DBError> {
-        if query.chars().count() > MISS_QUERY_MAX_CHARS {
+    /// Records a miss whose graph search started at `searched_at_ms`. A
+    /// search that started before the last cache clear is discarded: the
+    /// clear means new memory formed mid-search, and it may answer exactly
+    /// this query — caching the stale miss would mask it for up to the TTL.
+    pub async fn record_miss(&self, query: &str, searched_at_ms: u64) -> Result<(), DBError> {
+        let key = Self::cache_key(query);
+        if key.is_empty() || key.chars().count() > MISS_QUERY_MAX_CHARS {
+            return Ok(());
+        }
+        if searched_at_ms
+            <= self
+                .last_cleared_ms
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
             return Ok(());
         }
         let _guard = self.write_lock.lock().await;
-        match self.get(query).await? {
+        match self.get(&key).await? {
             Some(row) => {
                 self.collection
                     .update(
                         row._id,
-                        BTreeMap::from([("created_at".to_string(), Fv::U64(now_ms))]),
+                        BTreeMap::from([("created_at".to_string(), Fv::U64(searched_at_ms))]),
                     )
                     .await?;
             }
             None => {
                 if self.collection.len() >= MISS_CACHE_MAX_ROWS {
-                    self.purge_expired_locked(now_ms).await?;
+                    self.purge_expired_locked(searched_at_ms).await?;
                     if self.collection.len() >= MISS_CACHE_MAX_ROWS {
                         return Ok(());
                     }
                 }
                 self.collection
                     .add_from(&RecallMiss {
-                        query: query.to_string(),
-                        created_at: now_ms,
+                        query: key,
+                        created_at: searched_at_ms,
                         ..Default::default()
                     })
                     .await?;
@@ -470,6 +500,10 @@ impl MissCache {
     /// wrong.
     pub async fn clear(&self) -> Result<u64, DBError> {
         let _guard = self.write_lock.lock().await;
+        // Stamp before deleting: a probe racing this clear compares its
+        // search-start time against the stamp and drops its stale miss.
+        self.last_cleared_ms
+            .store(anda_engine::unix_ms(), std::sync::atomic::Ordering::Release);
         let mut cleared = 0u64;
         loop {
             // Filterless queries return nothing in AndaDB; scan by `_id`.

@@ -1569,11 +1569,12 @@ mod tests {
     use super::{
         WikiContentQuery, WikiEventsQuery, WikiExportQuery, add_space_token, apple_touch_icon,
         create_space, execute_kip_readonly, favicon, get_byok, get_conversation,
-        get_conversation_delta, get_formation_status, get_info, get_information, get_or_init_user,
-        get_skill, get_wiki_content, get_wiki_doc, get_wiki_export, list_conversations,
-        list_space_tokens, list_wiki_events, post_formation, post_maintenance, post_recall,
-        post_wiki_commit, post_wiki_import, post_wiki_search, post_wiki_verify, restart_formation,
-        revoke_space_token, update_byok, update_space, update_space_tier,
+        get_conversation_delta, get_formation_status, get_info, get_information, get_memory_status,
+        get_or_init_user, get_skill, get_wiki_content, get_wiki_doc, get_wiki_export,
+        list_conversations, list_space_tokens, list_wiki_events, post_formation, post_maintenance,
+        post_memory_forget, post_memory_pin, post_probe, post_recall, post_recall_structured,
+        post_shadow_eval, post_wiki_commit, post_wiki_import, post_wiki_search, post_wiki_verify,
+        restart_formation, revoke_space_token, update_byok, update_space, update_space_tier,
     };
     use crate::{
         agents::SELF_USER_ID,
@@ -2707,6 +2708,230 @@ mod tests {
         .await;
         assert_eq!(user["result"]["type"], "Person");
         assert!(user["result"].to_string().contains("external-user-1"));
+    }
+
+    #[tokio::test]
+    async fn memory_evolution_endpoints_enforce_auth_matrix() {
+        let signing_key = test_signing_key();
+        let app = test_app_state_with_signing_key("mem_auth", 0, &signing_key);
+        let space_id = "mem_auth_space";
+        let space = create_loaded_space(&app, space_id).await;
+
+        let probe_body = || json_bytes(&json!({"query": "anything"}));
+        let recall_body = || json_bytes(&json!({"query": "anything"}));
+        let pin_body = || json_bytes(&json!({"entity": "C:999", "pinned": true}));
+        let forget_body = || json_bytes(&json!({"entities": ["C:999"], "dry_run": true}));
+        let shadow_body = || json_bytes(&json!({"policy": crate::types::MemoryPolicy::default()}));
+        let no_token = || HeaderVals(String::new(), 0);
+
+        // Private space, no token: every evolution endpoint rejects.
+        err_json(
+            post_probe(
+                State(app.clone()),
+                Path(space_id.to_string()),
+                accept_json(),
+                no_token(),
+                probe_body(),
+            )
+            .await,
+            StatusCode::UNAUTHORIZED,
+        )
+        .await;
+        err_json(
+            post_recall_structured(
+                State(app.clone()),
+                Path(space_id.to_string()),
+                accept_json(),
+                no_token(),
+                recall_body(),
+            )
+            .await,
+            StatusCode::UNAUTHORIZED,
+        )
+        .await;
+        err_json(
+            get_memory_status(
+                State(app.clone()),
+                Path(space_id.to_string()),
+                accept_json(),
+                no_token(),
+            )
+            .await,
+            StatusCode::UNAUTHORIZED,
+        )
+        .await;
+        err_json(
+            post_memory_pin(
+                State(app.clone()),
+                Path(space_id.to_string()),
+                accept_json(),
+                no_token(),
+                pin_body(),
+            )
+            .await,
+            StatusCode::UNAUTHORIZED,
+        )
+        .await;
+        err_json(
+            post_memory_forget(
+                State(app.clone()),
+                Path(space_id.to_string()),
+                accept_json(),
+                no_token(),
+                forget_body(),
+            )
+            .await,
+            StatusCode::UNAUTHORIZED,
+        )
+        .await;
+        err_json(
+            post_shadow_eval(
+                State(app.clone()),
+                Path(space_id.to_string()),
+                accept_json(),
+                no_token(),
+                shadow_body(),
+            )
+            .await,
+            StatusCode::UNAUTHORIZED,
+        )
+        .await;
+
+        // Public space: read endpoints open up; write/management must not.
+        space
+            .update(
+                UpdateSpaceInput {
+                    public: Some(true),
+                    ..Default::default()
+                },
+                unix_ms(),
+            )
+            .await
+            .unwrap();
+        ok_json(
+            post_probe(
+                State(app.clone()),
+                Path(space_id.to_string()),
+                accept_json(),
+                no_token(),
+                probe_body(),
+            )
+            .await,
+        )
+        .await;
+        ok_json(
+            get_memory_status(
+                State(app.clone()),
+                Path(space_id.to_string()),
+                accept_json(),
+                no_token(),
+            )
+            .await,
+        )
+        .await;
+        ok_json(
+            post_recall_structured(
+                State(app.clone()),
+                Path(space_id.to_string()),
+                accept_json(),
+                no_token(),
+                recall_body(),
+            )
+            .await,
+        )
+        .await;
+        err_json(
+            post_memory_pin(
+                State(app.clone()),
+                Path(space_id.to_string()),
+                accept_json(),
+                no_token(),
+                pin_body(),
+            )
+            .await,
+            StatusCode::UNAUTHORIZED,
+        )
+        .await;
+        err_json(
+            post_memory_forget(
+                State(app.clone()),
+                Path(space_id.to_string()),
+                accept_json(),
+                no_token(),
+                forget_body(),
+            )
+            .await,
+            StatusCode::UNAUTHORIZED,
+        )
+        .await;
+        err_json(
+            post_shadow_eval(
+                State(app.clone()),
+                Path(space_id.to_string()),
+                accept_json(),
+                no_token(),
+                shadow_body(),
+            )
+            .await,
+            StatusCode::UNAUTHORIZED,
+        )
+        .await;
+
+        // Write-scoped CWT: pin/forget pass the gate; shadow_eval passes
+        // auth and fails only on the empty replay corpus — proving the
+        // barrier really was authentication.
+        let write_cwt = signed_token(&signing_key, SELF_USER_ID, space_id, "write");
+        let with_token = || HeaderVals(write_cwt.clone(), 0);
+        // The nonexistent entity draws a KIP domain error — not 401: the
+        // request got through the gate and reached the graph.
+        let pin_err = err_json(
+            post_memory_pin(
+                State(app.clone()),
+                Path(space_id.to_string()),
+                accept_json(),
+                with_token(),
+                pin_body(),
+            )
+            .await,
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert!(
+            pin_err["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("pin failed"),
+            "{pin_err}"
+        );
+        let forget_ok = ok_json(
+            post_memory_forget(
+                State(app.clone()),
+                Path(space_id.to_string()),
+                accept_json(),
+                with_token(),
+                forget_body(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(forget_ok["result"]["dry_run"], true);
+        // The recall_structured call above left a completed recall to
+        // replay, so an authorized shadow evaluation runs end to end.
+        let shadow_ok = ok_json(
+            post_shadow_eval(
+                State(app.clone()),
+                Path(space_id.to_string()),
+                accept_json(),
+                with_token(),
+                shadow_body(),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            shadow_ok["result"]["compared_at"].is_number(),
+            "{shadow_ok}"
+        );
     }
 
     #[tokio::test]

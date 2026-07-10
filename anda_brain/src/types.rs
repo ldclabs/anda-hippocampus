@@ -709,7 +709,27 @@ impl MemoryPolicy {
             .write()
             .expect("policy override lock poisoned") = policy;
     }
+}
 
+/// Arms a drop-time clear of the process-wide eval policy override. The
+/// optimizer holds one for the duration of a policy-genome run, so an early
+/// `?` return or panic can never leak a candidate policy into later evals
+/// (or parallel tests) through the global.
+pub struct EvalPolicyOverrideGuard(());
+
+impl EvalPolicyOverrideGuard {
+    pub fn arm() -> Self {
+        Self(())
+    }
+}
+
+impl Drop for EvalPolicyOverrideGuard {
+    fn drop(&mut self) {
+        MemoryPolicy::set_eval_override(None);
+    }
+}
+
+impl MemoryPolicy {
     fn default_version() -> u32 {
         1
     }
@@ -874,6 +894,15 @@ pub struct MemoryCitation {
     /// `metadata.confidence` when the tool output carried it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confidence: Option<f64>,
+
+    /// `metadata.source` when the tool output carried it (first entry for
+    /// multi-source facts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+
+    /// `metadata.created_at` (RFC3339) when the tool output carried it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
 }
 
 /// Machine-readable recall result (memory evolution plan, module M4): the
@@ -913,6 +942,12 @@ pub struct RecallOutput {
 pub struct SourceReliability {
     pub corrections: u64,
     pub last_corrected_at: u64,
+
+    /// Total links carrying this source, censused by full-scope settlements
+    /// — the denominator that turns `corrections` into a rate. `None` until
+    /// the first census (or when the census query failed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_links: Option<u64>,
 }
 
 /// Outcome of one deterministic memory-metabolism settlement
@@ -1162,6 +1197,12 @@ pub struct MemoryGraphCounters {
     /// (plan module M8).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub predicate_types: Option<u64>,
+
+    /// When these counters were censused. They refresh at settlement time
+    /// (M12 principle: readers never pay heavy queries), so `memory_status`
+    /// reports the graph as of the last maintenance cycle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<u64>,
 }
 
 /// Per-predicate link census (memory evolution plan, module M8), stored in
@@ -1184,8 +1225,9 @@ pub struct ShadowEvalInput {
     /// The candidate policy to evaluate.
     pub policy: MemoryPolicy,
 
-    /// Recent recall queries to replay (default 4, capped at 16 — every
-    /// query costs two recall runs plus a judge call).
+    /// Recent recall queries to replay (defaults to the space policy's
+    /// `shadow_replay_sample`, capped at 16 — every query costs two recall
+    /// runs plus a judge call).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_sample: Option<usize>,
 }

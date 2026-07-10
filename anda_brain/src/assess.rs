@@ -353,6 +353,7 @@ fn collect_citations(
                     .and_then(|rest| rest.split_once(':'))
                     .map(|(_, predicate)| predicate.to_string())
             });
+        let metadata = object.get("metadata");
         citations.push(MemoryCitation {
             entity: id.to_string(),
             r#type,
@@ -360,10 +361,21 @@ fn collect_citations(
                 .get("name")
                 .and_then(Json::as_str)
                 .map(str::to_string),
-            confidence: object
-                .get("metadata")
+            confidence: metadata
                 .and_then(|metadata| metadata.get("confidence"))
                 .and_then(Json::as_f64),
+            source: metadata
+                .and_then(|metadata| metadata.get("source"))
+                .and_then(|source| match source {
+                    Json::String(text) => Some(text.clone()),
+                    // Multi-source facts cite their first origin.
+                    Json::Array(items) => items.iter().find_map(Json::as_str).map(str::to_string),
+                    _ => None,
+                }),
+            created_at: metadata
+                .and_then(|metadata| metadata.get("created_at"))
+                .and_then(Json::as_str)
+                .map(str::to_string),
         });
     });
 }
@@ -412,39 +424,65 @@ pub struct RecallMeta {
     pub uncertainty: Option<f64>,
 }
 
-/// Splits the trailing `<memory_meta>{...}</memory_meta>` self-report off a
-/// recall answer. The tag block is always stripped; an absent or malformed
-/// payload degrades to `None` — the footer is an enhancement, never a
-/// failure mode.
+/// Splits the `<memory_meta>{...}</memory_meta>` self-report off a recall
+/// answer. Every tag occurrence is stripped (a model echoing the prompt's
+/// example block must not leak markup to plain `/recall` clients); the last
+/// parseable payload wins. An absent or malformed payload degrades to
+/// `None` — the footer is an enhancement, never a failure mode.
 pub fn split_recall_meta(content: &str) -> (String, Option<RecallMeta>) {
-    let Some(start) = content.rfind(RECALL_META_TAG_OPEN) else {
-        return (content.trim_end().to_string(), None);
-    };
-    let after = &content[start + RECALL_META_TAG_OPEN.len()..];
-    let (payload, remainder) = match after.find(RECALL_META_TAG_CLOSE) {
-        Some(end) => (
-            &after[..end],
-            after[end + RECALL_META_TAG_CLOSE.len()..].trim(),
-        ),
-        None => (after, ""),
-    };
-
-    let meta = parse_json_payload::<RecallMeta>(payload)
-        .ok()
-        .map(|meta| RecallMeta {
-            uncertainty: meta
-                .uncertainty
-                .filter(|value| value.is_finite())
-                .map(|value| value.clamp(0.0, 1.0)),
-            ..meta
-        });
-
-    let mut answer = content[..start].trim_end().to_string();
-    if !remainder.is_empty() {
-        // Prose after the footer is kept: stripping must never lose content.
-        answer.push('\n');
-        answer.push_str(remainder);
+    fn parse_meta(payload: &str) -> Option<RecallMeta> {
+        parse_json_payload::<RecallMeta>(payload)
+            .ok()
+            .map(|meta| RecallMeta {
+                uncertainty: meta
+                    .uncertainty
+                    .filter(|value| value.is_finite())
+                    .map(|value| value.clamp(0.0, 1.0)),
+                ..meta
+            })
     }
+
+    if !content.contains(RECALL_META_TAG_OPEN) {
+        return (content.trim_end().to_string(), None);
+    }
+
+    let mut segments: Vec<&str> = Vec::new();
+    let mut meta: Option<RecallMeta> = None;
+    let mut rest = content;
+    while let Some(start) = rest.find(RECALL_META_TAG_OPEN) {
+        segments.push(&rest[..start]);
+        let after = &rest[start + RECALL_META_TAG_OPEN.len()..];
+        match after.find(RECALL_META_TAG_CLOSE) {
+            Some(end) => {
+                if let Some(parsed) = parse_meta(&after[..end]) {
+                    meta = Some(parsed);
+                }
+                rest = &after[end + RECALL_META_TAG_CLOSE.len()..];
+            }
+            None => {
+                // Unclosed opening tag. A JSON-looking tail is a footer the
+                // model truncated mid-write (drop it, salvage what parses);
+                // anything else is prose that merely mentioned the tag —
+                // keep it, stripping must never lose content.
+                if after.trim_start().starts_with('{') {
+                    if let Some(parsed) = parse_meta(after) {
+                        meta = Some(parsed);
+                    }
+                } else {
+                    segments.push(after);
+                }
+                rest = "";
+            }
+        }
+    }
+    segments.push(rest);
+
+    let answer = segments
+        .iter()
+        .map(|segment| segment.trim())
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
     (answer, meta)
 }
 
@@ -576,8 +614,10 @@ mod tests {
                     call_id: None,
                     output: Some(json!({"result": [
                         {"id": "C:7", "type": "Preference", "name": "oolong",
-                         "metadata": {"confidence": 0.9}},
-                        {"id": "P:3:prefers", "metadata": {"confidence": 0.8}},
+                         "metadata": {"confidence": 0.9, "source": "chat:42",
+                                      "created_at": "2026-07-01T00:00:00.000Z"}},
+                        {"id": "P:3:prefers", "metadata": {"confidence": 0.8,
+                                                           "source": ["a", "b"]}},
                         {"id": "not-an-entity"},
                         {"nested": [{"id": "C:7"}]}
                     ]})),
@@ -605,10 +645,17 @@ mod tests {
         assert_eq!(citations[0].r#type.as_deref(), Some("Preference"));
         assert_eq!(citations[0].name.as_deref(), Some("oolong"));
         assert_eq!(citations[0].confidence, Some(0.9));
+        assert_eq!(citations[0].source.as_deref(), Some("chat:42"));
+        assert_eq!(
+            citations[0].created_at.as_deref(),
+            Some("2026-07-01T00:00:00.000Z")
+        );
         assert_eq!(citations[1].entity, "P:3:prefers");
         // Propositions derive their type from the id's predicate segment.
         assert_eq!(citations[1].r#type.as_deref(), Some("prefers"));
         assert_eq!(citations[1].confidence, Some(0.8));
+        // Multi-source facts cite their first origin.
+        assert_eq!(citations[1].source.as_deref(), Some("a"));
     }
 
     #[test]
@@ -636,6 +683,29 @@ mod tests {
             split_recall_meta("Answer.\n<memory_meta>{\"uncertainty\": 7.0}</memory_meta>\ntail");
         assert_eq!(answer, "Answer.\ntail");
         assert_eq!(meta.unwrap().uncertainty, Some(1.0));
+
+        // Every occurrence is stripped (e.g. an echoed prompt example); the
+        // last parseable payload wins.
+        let (answer, meta) = split_recall_meta(
+            "<memory_meta>{\"uncertainty\": 0.9}</memory_meta>\nAnswer.\n\
+             <memory_meta>{\"found\": true, \"uncertainty\": 0.1}</memory_meta>",
+        );
+        assert_eq!(answer, "Answer.");
+        let meta = meta.unwrap();
+        assert_eq!(meta.found, Some(true));
+        assert_eq!(meta.uncertainty, Some(0.1));
+
+        // Unclosed tag followed by prose: the tag goes, the prose stays —
+        // stripping must never lose content.
+        let (answer, meta) = split_recall_meta("The <memory_meta> tag marks the footer, see docs.");
+        assert_eq!(answer, "The\ntag marks the footer, see docs.");
+        assert!(meta.is_none());
+
+        // Unclosed tag with a JSON tail: a footer truncated mid-write is
+        // dropped, and whatever parses is salvaged.
+        let (answer, meta) = split_recall_meta("Answer.\n<memory_meta>{\"found\": false}");
+        assert_eq!(answer, "Answer.");
+        assert_eq!(meta.unwrap().found, Some(false));
     }
 
     #[test]

@@ -129,6 +129,15 @@ extension.
 > settlement report and `memory_status`), but the fix — predicate-sharded
 > scans — is not implemented yet. Watch those report fields in production.
 
+> **Single writer per space:** the usage ledger, settlement, self-test,
+> shadow, and negative-cache locks are in-process (`tokio::Mutex` /
+> atomics), like the formation processing flag they follow. Sharding
+> assigns each space to exactly one process — do not point two instances
+> at the same space's storage: concurrent ledger writes can duplicate
+> rows, and the miss-cache clear race guard does not cross processes.
+> (The graph-side fences — `decay_applied_at`, `correction_settled` —
+> stay safe either way.)
+
 **Dream self-test (self-repair):** after each maintenance cycle completes,
 the runtime samples recent memories with no usage evidence, generates one
 natural probe query per memory (a single LLM call, budgeted by

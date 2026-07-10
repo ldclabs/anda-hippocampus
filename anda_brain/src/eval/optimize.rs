@@ -477,6 +477,11 @@ where
     F: FnMut(usize) -> Fut,
     Fut: Future<Output = Result<EvalSuiteReport, BoxError>>,
 {
+    // Drop-time clear: a `?` return or panic anywhere below must not leak a
+    // candidate policy into later evals through the process-wide override.
+    let _policy_override_guard = matches!(config.genome, GenomeKind::Policy)
+        .then(crate::types::EvalPolicyOverrideGuard::arm);
+
     let mut baseline = fitness(0).await?;
     let baseline_total = baseline.score.total;
     if baseline.total_stddev.is_none() {
@@ -565,7 +570,15 @@ where
                 record.patches = patches.clone();
                 let mut policy = current;
                 let mut apply_error = None;
+                let mut touched_fields = std::collections::BTreeSet::new();
                 for patch in &patches {
+                    // One patch per field per generation: chaining patches on
+                    // the same field would compound past the ±50% step bound
+                    // (three patches ≈ ±2.25×).
+                    if !touched_fields.insert(patch.field.clone()) {
+                        apply_error = Some(format!("duplicate patch for field `{}`", patch.field));
+                        break;
+                    }
                     match apply_policy_patch(&policy, patch) {
                         Ok(next) => policy = next,
                         Err(err) => {
@@ -625,7 +638,10 @@ where
                     ),
                 };
             } else {
-                holdout_baseline = Some(hold_total);
+                // Monotone: the bar only rises. Re-baselining downward would
+                // let N accepted generations ratchet holdout down by N×ε,
+                // each step individually "within epsilon".
+                holdout_baseline = Some(base.max(hold_total));
             }
         }
 
@@ -1013,15 +1029,9 @@ mod tests {
         assert!(report.generations[0].target.is_none());
         assert_eq!(report.generations[0].patches.len(), 1);
         assert!(!report.generations[1].decision.accepted);
-        // The rejected candidate was reverted to the accepted policy.
-        assert_eq!(
-            MemoryPolicy::eval_override()
-                .unwrap()
-                .confidence_decay_factor,
-            0.9
-        );
-
-        MemoryPolicy::set_eval_override(None);
+        // The RAII guard cleared the process-wide override on return: the
+        // accepted policy lives in the report, not in a leaked global.
+        assert!(MemoryPolicy::eval_override().is_none());
     }
 
     #[tokio::test]
