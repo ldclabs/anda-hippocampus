@@ -63,6 +63,7 @@ tokio = { version = "1", features = ["full"] }
 structured-logger = "1"
 log = { version = "0.4", features = ["kv_serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
+tower = { version = "0.5", features = ["limit", "load-shed", "util"] }
 tower-http = { version = "0.6", features = ["compression-gzip", "cors"] }
 markdown = "1"
 mimalloc = { version = "0.1", features = ["v3"] }

@@ -36,26 +36,36 @@ pub struct JudgeVerdict {
 }
 
 /// Wire shape for the judge output: findings are parsed leniently so a single
-/// unknown kind does not discard an otherwise valid verdict.
+/// unknown kind does not discard an otherwise valid verdict. The core score
+/// fields are `Option` so a shape-mismatched payload (e.g. scores nested in a
+/// wrapper object) parses to all-`None` and is rejected as a judge error —
+/// falling back to lexical scoring — instead of silently scoring the sample
+/// all-zero and poisoning the trajectory.
 #[derive(Debug, Default, Deserialize)]
 struct RawVerdict {
-    #[serde(default)]
-    memory_utility: f64,
+    memory_utility: Option<f64>,
 
-    #[serde(default)]
-    forgetting_quality: f64,
+    forgetting_quality: Option<f64>,
 
-    #[serde(default)]
-    uncertainty_calibration: f64,
+    uncertainty_calibration: Option<f64>,
 
-    #[serde(default)]
-    satisfaction: f64,
+    satisfaction: Option<f64>,
 
     #[serde(default)]
     reasoning: String,
 
     #[serde(default)]
     findings: Vec<Json>,
+}
+
+impl RawVerdict {
+    /// True when at least one core score field was present in the payload.
+    fn has_any_score(&self) -> bool {
+        self.memory_utility.is_some()
+            || self.forgetting_quality.is_some()
+            || self.uncertainty_calibration.is_some()
+            || self.satisfaction.is_some()
+    }
 }
 
 impl From<RawVerdict> for JudgeVerdict {
@@ -67,10 +77,13 @@ impl From<RawVerdict> for JudgeVerdict {
             .filter(|finding| is_answer_finding(finding.kind))
             .collect();
         Self {
-            memory_utility: raw.memory_utility.clamp(0.0, 1.0),
-            forgetting_quality: raw.forgetting_quality.clamp(0.0, 1.0),
-            uncertainty_calibration: raw.uncertainty_calibration.clamp(0.0, 1.0),
-            satisfaction: raw.satisfaction.clamp(0.0, 1.0),
+            memory_utility: raw.memory_utility.unwrap_or_default().clamp(0.0, 1.0),
+            forgetting_quality: raw.forgetting_quality.unwrap_or_default().clamp(0.0, 1.0),
+            uncertainty_calibration: raw
+                .uncertainty_calibration
+                .unwrap_or_default()
+                .clamp(0.0, 1.0),
+            satisfaction: raw.satisfaction.unwrap_or_default().clamp(0.0, 1.0),
             reasoning: raw.reasoning,
             findings,
         }
@@ -114,6 +127,8 @@ Also report findings, attributing each failure to the responsible stage:
 - "bad_synthesis": the memory was retrieved (visible in trace) but the answer failed to use it.
 - "overconfidence": the answer asserts stale or unsupported facts as current truth.
 
+A probe with "error": true (its "satisfied" is null, and the matching expectation's "probe_satisfied" is null) could not observe the graph at all — an infrastructure failure, not a memory failure. Treat that expectation's graph state as UNKNOWN: never report formation_miss or bad_consolidation from an errored probe; judge only from the remaining evidence.
+
 Respond with ONLY a JSON object:
 {"memory_utility": 0.0, "forgetting_quality": 0.0, "uncertainty_calibration": 0.0, "satisfaction": 0.0, "reasoning": "...", "findings": [{"kind": "bad_synthesis", "message": "...", "expectation_id": null}]}"#;
 
@@ -128,12 +143,18 @@ where
         .probes
         .iter()
         .map(|probe| {
+            // An errored probe never observed the graph: its `satisfied`
+            // value is meaningless, so it is reported as null plus an
+            // explicit error flag the instructions tell the judge not to
+            // attribute memory failures from.
+            let errored = probe.errored();
             serde_json::json!({
                 "expectation_id": probe.expectation_id,
                 "mode": probe.mode,
-                "satisfied": probe.satisfied,
+                "satisfied": if errored { Json::Null } else { Json::Bool(probe.satisfied) },
                 "hit_count": probe.hit_count,
                 "assertion": probe.assertion,
+                "error": errored,
             })
         })
         .collect();
@@ -173,6 +194,17 @@ where
         .await?;
 
     let raw: RawVerdict = parse_json_payload(&output.content)?;
+    if !raw.has_any_score() {
+        // Any legal JSON object parses into `RawVerdict`; without at least
+        // one core score field it is a shape mismatch, and treating it as an
+        // all-zero verdict would tank the sample. Erroring here routes the
+        // sample through the existing JudgeError + lexical fallback.
+        return Err(format!(
+            "judge output has none of the core score fields (memory_utility, forgetting_quality, uncertainty_calibration, satisfaction): {}",
+            truncate_chars(&output.content, 200)
+        )
+        .into());
+    }
     Ok(JudgeCall {
         verdict: raw.into(),
         usage: output.usage,
@@ -195,6 +227,7 @@ pub(crate) fn is_answer_finding(kind: EvalFindingKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anda_core::AgentOutput;
 
     #[test]
     fn parse_json_payload_tolerates_fences_and_prose() {
@@ -207,5 +240,90 @@ mod tests {
         assert_eq!(verdict.reasoning, "good");
         assert_eq!(verdict.findings.len(), 1);
         assert_eq!(verdict.findings[0].kind, EvalFindingKind::BadSynthesis);
+    }
+
+    /// Judge driver returning one canned completion.
+    struct FakeJudge {
+        response: String,
+    }
+
+    #[async_trait::async_trait]
+    impl AssessContext for FakeJudge {
+        async fn complete(
+            &self,
+            _req: CompletionRequest,
+        ) -> Result<AgentOutput, anda_core::BoxError> {
+            Ok(AgentOutput {
+                content: self.response.clone(),
+                ..Default::default()
+            })
+        }
+
+        async fn execute_kip_readonly(
+            &self,
+            _request: anda_kip::Request,
+        ) -> Result<anda_kip::Response, anda_core::BoxError> {
+            Err("not used".into())
+        }
+    }
+
+    fn checkpoint_input<'a>(profile: &'a Json) -> JudgeCheckpointInput<'a> {
+        JudgeCheckpointInput {
+            query: "what do I like?",
+            answer: "green tea",
+            scoring_rubric: None,
+            hidden_profile: profile,
+            required_terms: &[],
+            forbidden_terms: &[],
+            probes: &[],
+            expectations: Vec::new(),
+            trace_summary: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn judge_checkpoint_rejects_shape_mismatched_output_instead_of_scoring_zero() {
+        // A nested wrapper is legal JSON that used to deserialize into an
+        // all-zero verdict; it must error so the caller can fall back to
+        // lexical scoring.
+        let driver = FakeJudge {
+            response: serde_json::json!({
+                "verdict": {
+                    "memory_utility": 0.9,
+                    "forgetting_quality": 0.9,
+                    "uncertainty_calibration": 0.9,
+                    "satisfaction": 0.9
+                }
+            })
+            .to_string(),
+        };
+        let profile = Json::Null;
+        let err = judge_checkpoint(&driver, checkpoint_input(&profile))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("core score fields"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn judge_checkpoint_accepts_partial_scores() {
+        // A verdict carrying at least one core score field is not a shape
+        // mismatch; missing fields default to zero as before.
+        let driver = FakeJudge {
+            response: serde_json::json!({
+                "memory_utility": 0.8,
+                "reasoning": "partial"
+            })
+            .to_string(),
+        };
+        let profile = Json::Null;
+        let call = judge_checkpoint(&driver, checkpoint_input(&profile))
+            .await
+            .unwrap();
+        assert_eq!(call.verdict.memory_utility, 0.8);
+        assert_eq!(call.verdict.satisfaction, 0.0);
+        assert_eq!(call.verdict.reasoning, "partial");
     }
 }

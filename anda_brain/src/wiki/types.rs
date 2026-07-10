@@ -9,6 +9,13 @@ use super::model::WikiDocRecord;
 /// Default namespace for documents committed without one.
 pub const DEFAULT_NAMESPACE: &str = "default";
 
+/// Caps enforced by [`WikiCommitInput::validate`] on every write path.
+pub const MAX_TAGS: usize = 64;
+pub const MAX_TAG_CHARS: usize = 120;
+pub const MAX_SLUG_CHARS: usize = 256;
+pub const MAX_METADATA_KEYS: usize = 64;
+pub const MAX_METADATA_BYTES: usize = 64 * 1024;
+
 /// Wiki errors carry enough structure for HTTP status mapping (409/413/404)
 /// and for agents to self-correct (a conflict names the current version).
 #[derive(Debug, Clone, Serialize)]
@@ -127,6 +134,50 @@ impl WikiCommitInput {
         if let Some(tags) = &self.tags {
             self.tags = Some(normalize_tags(tags));
         }
+    }
+
+    /// Bounds checks beyond normalization (call after [`Self::normalize`]):
+    /// tag count/length, slug length and metadata size are otherwise
+    /// unbounded caller input persisted verbatim.
+    pub fn validate(&self) -> Result<(), WikiError> {
+        if let Some(tags) = &self.tags {
+            if tags.len() > MAX_TAGS {
+                return Err(WikiError::Invalid(format!(
+                    "too many tags: {} exceeds the {MAX_TAGS} limit",
+                    tags.len()
+                )));
+            }
+            if let Some(tag) = tags.iter().find(|t| t.chars().count() > MAX_TAG_CHARS) {
+                return Err(WikiError::Invalid(format!(
+                    "tag {tag:?} exceeds {MAX_TAG_CHARS} characters"
+                )));
+            }
+        }
+        if let Some(slug) = &self.slug
+            && slug.chars().count() > MAX_SLUG_CHARS
+        {
+            return Err(WikiError::Invalid(format!(
+                "slug exceeds {MAX_SLUG_CHARS} characters"
+            )));
+        }
+        if let Some(metadata) = &self.metadata {
+            if metadata.len() > MAX_METADATA_KEYS {
+                return Err(WikiError::Invalid(format!(
+                    "too many metadata keys: {} exceeds the {MAX_METADATA_KEYS} limit",
+                    metadata.len()
+                )));
+            }
+            let size: usize = metadata
+                .iter()
+                .map(|(key, value)| key.len() + value.to_string().len())
+                .sum();
+            if size > MAX_METADATA_BYTES {
+                return Err(WikiError::Invalid(format!(
+                    "metadata too large: ~{size} bytes exceeds the {MAX_METADATA_BYTES} byte limit"
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -568,14 +619,15 @@ fn normalize_opt(value: &mut Option<String>) {
 }
 
 fn normalize_tags(tags: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = tags
-        .iter()
+    // Order-preserving global dedup: `Vec::dedup` only removes adjacent
+    // duplicates, so ["a", "b", "a"] used to keep the second "a".
+    let mut seen = std::collections::BTreeSet::new();
+    tags.iter()
         .map(|tag| tag.trim())
         .filter(|tag| !tag.is_empty())
+        .filter(|tag| seen.insert(tag.to_string()))
         .map(ToString::to_string)
-        .collect();
-    out.dedup();
-    out
+        .collect()
 }
 
 #[cfg(test)]
@@ -600,5 +652,54 @@ mod tests {
             Some("部署指南")
         );
         assert_eq!(markdown_title("no headings"), None);
+    }
+
+    #[test]
+    fn tags_dedupe_globally_and_commit_input_caps_hold() {
+        let mut input = WikiCommitInput {
+            title: "t".to_string(),
+            content: "# t\n\nbody\n".to_string(),
+            tags: Some(vec![
+                "a".to_string(),
+                " b ".to_string(),
+                "a".to_string(), // non-adjacent duplicate
+                "b".to_string(),
+                String::new(),
+            ]),
+            ..Default::default()
+        };
+        input.normalize();
+        assert_eq!(input.tags, Some(vec!["a".to_string(), "b".to_string()]));
+        assert!(input.validate().is_ok());
+
+        let too_many = WikiCommitInput {
+            tags: Some((0..MAX_TAGS + 1).map(|i| format!("t{i}")).collect()),
+            ..Default::default()
+        };
+        assert!(matches!(too_many.validate(), Err(WikiError::Invalid(_))));
+
+        let long_tag = WikiCommitInput {
+            tags: Some(vec!["长".repeat(MAX_TAG_CHARS + 1)]),
+            ..Default::default()
+        };
+        assert!(matches!(long_tag.validate(), Err(WikiError::Invalid(_))));
+
+        let long_slug = WikiCommitInput {
+            slug: Some("s/".repeat(MAX_SLUG_CHARS)),
+            ..Default::default()
+        };
+        assert!(matches!(long_slug.validate(), Err(WikiError::Invalid(_))));
+
+        let fat_metadata = WikiCommitInput {
+            metadata: Some(BTreeMap::from([(
+                "k".to_string(),
+                Json::from("x".repeat(MAX_METADATA_BYTES)),
+            )])),
+            ..Default::default()
+        };
+        assert!(matches!(
+            fat_metadata.validate(),
+            Err(WikiError::Invalid(_))
+        ));
     }
 }

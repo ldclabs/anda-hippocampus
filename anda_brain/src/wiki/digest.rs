@@ -47,6 +47,9 @@ const DIGEST_USAGE_KEY: &str = "wiki_digest_usage";
 /// Collection-extension key tracking consecutive failures of one version
 /// (the poison-version fuse).
 const DIGEST_FAILURE_KEY: &str = "wiki_digest_failure";
+/// Collection-extension key holding doc ids queued for a digest catch-up
+/// (documents restored from archive after the cursor passed their version).
+pub(super) const DIGEST_PENDING_KEY: &str = "wiki_digest_pending";
 /// After this many consecutive failures a version is skipped (with a
 /// `DigestFailed` event) instead of wedging the pipeline and re-burning
 /// tokens every run.
@@ -310,11 +313,142 @@ impl WikiDigest {
             }
         }
 
+        self.digest_pending_restores(&ctx, now_ms, cursor, &mut processed, &mut report)
+            .await;
+
         let (checked, invalid) = self.verify_recent(now_ms).await?;
         report.citations_checked = checked;
         report.citations_invalid = invalid;
         self.save_usage(&report.usage).await;
         Ok(report)
+    }
+
+    /// Catch-up pass for documents restored from archive after the cursor
+    /// passed their version: the main loop never revisits those ids, so
+    /// without this their facts would never enter the graph. Each queued
+    /// document's current version is digested unless the ledger shows it
+    /// already was. Never fails the run; entries that error stay queued,
+    /// with the poison fuse bounding retries.
+    async fn digest_pending_restores(
+        &self,
+        ctx: &AgentCtx,
+        now_ms: u64,
+        cursor: u64,
+        processed: &mut usize,
+        report: &mut WikiDigestReport,
+    ) {
+        let pending = self
+            .wiki
+            .docs
+            .get_extension_as::<BTreeSet<u64>>(DIGEST_PENDING_KEY)
+            .unwrap_or_default();
+        for doc_id in pending {
+            if *processed >= MAX_VERSIONS_PER_RUN {
+                break; // budget spent; the rest stays queued for the next run
+            }
+            let doc = match self.wiki.doc_record(doc_id).await {
+                Ok(doc) => doc,
+                Err(WikiError::NotFound(_)) => {
+                    // Reclaimed or re-initializing: nothing to catch up.
+                    self.clear_pending(doc_id);
+                    continue;
+                }
+                Err(err) => {
+                    log::warn!(
+                        target: "brain",
+                        doc_id = doc_id;
+                        "pending digest doc load failed, kept queued: {err:?}"
+                    );
+                    continue;
+                }
+            };
+            if doc.current_version > cursor {
+                // The main cursor loop reaches this version by itself; once
+                // its DigestExtracted lands, the ledger check below clears
+                // the entry on the next run.
+                continue;
+            }
+            match version_digested(&self.wiki, doc_id, doc.current_version).await {
+                Ok(true) => {
+                    self.clear_pending(doc_id);
+                    continue;
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    log::warn!(
+                        target: "brain",
+                        doc_id = doc_id;
+                        "pending digest ledger check failed, kept queued: {err:?}"
+                    );
+                    continue;
+                }
+            }
+            let version = match self.wiki.version_record(doc.current_version).await {
+                Ok(version) => version,
+                Err(err) => {
+                    // The current version row is gone for good: unqueue.
+                    log::warn!(
+                        target: "brain",
+                        doc_id = doc_id,
+                        version_id = doc.current_version;
+                        "pending digest version load failed, dropped: {err:?}"
+                    );
+                    self.clear_pending(doc_id);
+                    continue;
+                }
+            };
+            *processed += 1;
+            self.running.store(version._id, Ordering::SeqCst);
+            match self.digest_version(ctx, &version, now_ms, report).await {
+                // Digested, or permanently skipped (re-archived, labeled,
+                // eval corpus): either way the queue entry is done. A
+                // later restore re-queues re-archived documents.
+                Ok(_) => {
+                    self.clear_pending(doc_id);
+                    self.clear_failure();
+                }
+                Err(err) => {
+                    let failures = self.bump_failure(version._id);
+                    log::error!(
+                        target: "brain",
+                        version_id = version._id,
+                        doc_id = doc_id;
+                        "pending digest failed (attempt {failures}/{MAX_VERSION_FAILURES}): {err:?}"
+                    );
+                    if failures >= MAX_VERSION_FAILURES {
+                        let _ = self
+                            .wiki
+                            .write_event(
+                                EVENT_DIGEST_FAILED,
+                                Some(doc_id),
+                                Some(version._id),
+                                "wiki_digest".to_string(),
+                                BTreeMap::from([
+                                    ("error".to_string(), Json::from(err.to_string())),
+                                    ("attempts".to_string(), Json::from(failures)),
+                                    ("extractor".to_string(), Json::from(self.extractor())),
+                                ]),
+                                now_ms,
+                            )
+                            .await;
+                        self.clear_pending(doc_id);
+                        self.clear_failure();
+                        report.skipped += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    fn clear_pending(&self, doc_id: u64) {
+        let _ = self.wiki.docs.set_extension_from_with::<_, BTreeSet<u64>>(
+            DIGEST_PENDING_KEY.to_string(),
+            |v| {
+                let mut set = v.unwrap_or_default();
+                set.remove(&doc_id);
+                Some(set)
+            },
+        );
     }
 
     async fn digest_version(
@@ -351,7 +485,14 @@ impl WikiDigest {
             return Ok(DigestOutcome::Skipped);
         }
 
-        let chunks = self.current_chunks(&doc, version._id).await?;
+        let Some(chunks) = digest_chunks(&self.wiki, version).await? else {
+            // The doc pointed at this version a moment ago but its chunks
+            // are gone: a concurrent commit superseded it mid-digest. Skip —
+            // running an empty extraction here would let `supersede_stale`
+            // mark every fact of the previous digest superseded.
+            report.skipped += 1;
+            return Ok(DigestOutcome::Skipped);
+        };
         let extraction = self.extract(ctx, &doc, version, &chunks, report).await?;
         let extractor = self.extractor();
         let (facts, alive) =
@@ -411,34 +552,6 @@ impl WikiDigest {
         report.facts += facts.len();
         report.superseded += superseded;
         Ok(DigestOutcome::Digested)
-    }
-
-    async fn current_chunks(
-        &self,
-        doc: &WikiDocRecord,
-        version_id: u64,
-    ) -> Result<Vec<WikiChunkRecord>, BoxError> {
-        let mut rows: Vec<WikiChunkRecord> = self
-            .wiki
-            .chunks
-            .search_as(Query {
-                search: None,
-                filter: Some(Filter::And(vec![
-                    Box::new(Filter::Field((
-                        "doc_id".to_string(),
-                        RangeQuery::Eq(Fv::U64(doc._id)),
-                    ))),
-                    Box::new(Filter::Field((
-                        "version_id".to_string(),
-                        RangeQuery::Eq(Fv::U64(version_id)),
-                    ))),
-                ])),
-                limit: Some(Collection::MAX_SEARCH_LIMIT),
-            })
-            .await
-            .map_err(WikiError::from)?;
-        rows.sort_by_key(|row| row.ordinal);
-        Ok(rows)
     }
 
     /// Runs the extraction prompt over section batches and merges the
@@ -649,48 +762,10 @@ impl WikiDigest {
     }
 
     /// Re-verifies every citation recorded by recent digests; `Invalid`
-    /// results are storage-corruption signals and are evented by `verify`.
+    /// results are corruption signals (evented inside `verify` when the
+    /// stored content itself is corrupt).
     pub async fn verify_recent(&self, now_ms: u64) -> Result<(usize, usize), BoxError> {
-        let events = self
-            .wiki
-            .list_events(
-                Some(EVENT_DIGEST_EXTRACTED.to_string()),
-                None,
-                None,
-                Some(VERIFY_SAMPLE_EVENTS),
-            )
-            .await?;
-        let mut checked = 0usize;
-        let mut invalid = 0usize;
-        for event in events.events {
-            let Some(facts) = event
-                .detail
-                .get("facts")
-                .cloned()
-                .and_then(|v| serde_json::from_value::<Vec<DigestedFact>>(v).ok())
-            else {
-                continue;
-            };
-            for fact in facts {
-                let outcome = self
-                    .wiki
-                    .verify(
-                        "wiki_digest".to_string(),
-                        WikiVerifyInput {
-                            uri: Some(fact.citation.clone()),
-                            checksum: Some(fact.checksum.clone()),
-                            ..Default::default()
-                        },
-                        now_ms,
-                    )
-                    .await?;
-                checked += 1;
-                if outcome.status == WikiVerifyStatus::Invalid {
-                    invalid += 1;
-                }
-            }
-        }
-        Ok((checked, invalid))
+        verify_recent_citations(&self.wiki, now_ms).await
     }
 
     async fn save_cursor(&self, cursor: u64) {
@@ -752,6 +827,150 @@ impl WikiDigest {
                 Some((0, 0))
             });
     }
+}
+
+/// Chunk rows for one version, or `None` when they raced away: a concurrent
+/// commit can activate a newer version and delete this version's chunks
+/// between the caller's doc check and this read. A committed version always
+/// has at least one chunk (content is never empty), so an empty set is that
+/// race, not a real state — callers must skip WITHOUT extracting or
+/// superseding, or the previous digest's facts would all be marked stale.
+async fn digest_chunks(
+    wiki: &WikiService,
+    version: &WikiVersionRecord,
+) -> Result<Option<Vec<WikiChunkRecord>>, BoxError> {
+    let mut rows: Vec<WikiChunkRecord> = wiki
+        .chunks
+        .search_as(Query {
+            search: None,
+            filter: Some(Filter::And(vec![
+                Box::new(Filter::Field((
+                    "doc_id".to_string(),
+                    RangeQuery::Eq(Fv::U64(version.doc_id)),
+                ))),
+                Box::new(Filter::Field((
+                    "version_id".to_string(),
+                    RangeQuery::Eq(Fv::U64(version._id)),
+                ))),
+            ])),
+            limit: Some(Collection::MAX_SEARCH_LIMIT),
+        })
+        .await
+        .map_err(WikiError::from)?;
+    if rows.is_empty() {
+        match wiki.doc_record(version.doc_id).await {
+            Ok(doc) if doc.current_version == version._id => {
+                // Should be impossible (commits delete chunks only after
+                // flipping the doc away): stay loud, but never fall through
+                // to an empty extraction.
+                log::warn!(
+                    target: "brain",
+                    doc_id = version.doc_id,
+                    version_id = version._id;
+                    "current version has no chunk rows; digest skipped without superseding"
+                );
+            }
+            Ok(_) | Err(WikiError::NotFound(_)) => {}
+            Err(err) => return Err(err.into()),
+        }
+        return Ok(None);
+    }
+    rows.sort_by_key(|row| row.ordinal);
+    Ok(Some(rows))
+}
+
+/// Whether the digest ledger already covers (doc, version): true when the
+/// document's newest `DigestExtracted` event points at that version.
+async fn version_digested(
+    wiki: &WikiService,
+    doc_id: u64,
+    version_id: u64,
+) -> Result<bool, BoxError> {
+    let events = wiki
+        .list_events(
+            Some(EVENT_DIGEST_EXTRACTED.to_string()),
+            Some(doc_id),
+            None,
+            Some(20),
+        )
+        .await?;
+    Ok(events
+        .events
+        .iter()
+        .max_by_key(|e| e.id)
+        .is_some_and(|e| e.version_id == Some(version_id)))
+}
+
+/// Re-verifies the citations recorded by the most recent digests. Facts of
+/// one digest cite the same version, so (doc, version) loads are cached
+/// across facts instead of re-reading full version content per fact.
+async fn verify_recent_citations(
+    wiki: &WikiService,
+    now_ms: u64,
+) -> Result<(usize, usize), BoxError> {
+    let events = wiki
+        .list_events(
+            Some(EVENT_DIGEST_EXTRACTED.to_string()),
+            None,
+            None,
+            Some(VERIFY_SAMPLE_EVENTS),
+        )
+        .await?;
+    type Loaded = Option<(WikiDocRecord, WikiVersionRecord)>;
+    let mut cache: BTreeMap<(u64, u64), Loaded> = BTreeMap::new();
+    let mut checked = 0usize;
+    let mut invalid = 0usize;
+    for event in events.events {
+        let Some(facts) = event
+            .detail
+            .get("facts")
+            .cloned()
+            .and_then(|v| serde_json::from_value::<Vec<DigestedFact>>(v).ok())
+        else {
+            continue;
+        };
+        for fact in facts {
+            let input = WikiVerifyInput {
+                uri: Some(fact.citation.clone()),
+                checksum: Some(fact.checksum.clone()),
+                ..Default::default()
+            };
+            let (doc_id, version_id, start, end) = wiki.verify_target(&input)?;
+            let loaded = match cache.entry((doc_id, version_id)) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    let loaded = match wiki.doc_record(doc_id).await {
+                        Ok(doc) => match wiki.version_record(version_id).await {
+                            Ok(version) => Some((doc, version)),
+                            Err(_) => None,
+                        },
+                        Err(_) => None,
+                    };
+                    entry.insert(loaded)
+                }
+            };
+            let status = match loaded {
+                Some((doc, version)) => {
+                    wiki.verify_resolved(
+                        "wiki_digest".to_string(),
+                        doc,
+                        version,
+                        (start, end),
+                        Some(&fact.checksum),
+                        now_ms,
+                    )
+                    .await?
+                    .status
+                }
+                None => WikiVerifyStatus::NotFound,
+            };
+            checked += 1;
+            if status == WikiVerifyStatus::Invalid {
+                invalid += 1;
+            }
+        }
+    }
+    Ok((checked, invalid))
 }
 
 /// Whether a KQL FIND result contains any row.
@@ -1302,5 +1521,157 @@ mod tests {
         assert!(!kql_has_rows(&json!(null)));
         assert!(kql_has_rows(&json!({"?link": [{"id": "P1"}]})));
         assert!(kql_has_rows(&json!([{"id": "P1"}])));
+    }
+
+    use super::super::EVENT_CITATION_VERIFY_FAILED;
+    use super::super::tests::{commit_input, test_wiki};
+
+    #[tokio::test]
+    async fn digest_chunks_skips_versions_raced_by_commits() {
+        let wiki = test_wiki("wiki_digest_race").await;
+        let v1 = wiki
+            .commit(
+                "a".to_string(),
+                commit_input("竞态", "# 竞态\n\n第一版内容。\n"),
+                1000,
+            )
+            .await
+            .unwrap();
+        let v1_record = wiki
+            .versions
+            .get_as::<WikiVersionRecord>(v1.version.id)
+            .await
+            .unwrap();
+
+        // A concurrent commit lands v2 and removes v1's chunk set — exactly
+        // what a digest can observe between its doc check and chunk read.
+        let mut update = commit_input("竞态", "# 竞态\n\n第二版内容。\n");
+        update.doc_id = Some(v1.doc.id);
+        update.parent_version = Some(v1.version.id);
+        let v2 = wiki.commit("a".to_string(), update, 2000).await.unwrap();
+
+        // v1 resolves to "raced away" (None), never to an empty chunk list
+        // that would supersede the previous digest's facts wholesale.
+        assert!(digest_chunks(&wiki, &v1_record).await.unwrap().is_none());
+        let v2_record = wiki
+            .versions
+            .get_as::<WikiVersionRecord>(v2.version.id)
+            .await
+            .unwrap();
+        let chunks = digest_chunks(&wiki, &v2_record).await.unwrap().unwrap();
+        assert!(!chunks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn restore_queues_doc_for_digest_catchup() {
+        let wiki = test_wiki("wiki_digest_restore_pending").await;
+        let out = wiki
+            .commit(
+                "a".to_string(),
+                commit_input("归档文档", "# 归档文档\n\n内容。\n"),
+                1000,
+            )
+            .await
+            .unwrap();
+        wiki.archive("a".to_string(), out.doc.id, 2000)
+            .await
+            .unwrap();
+        assert!(
+            wiki.docs
+                .get_extension_as::<BTreeSet<u64>>(DIGEST_PENDING_KEY)
+                .unwrap_or_default()
+                .is_empty()
+        );
+        wiki.restore("a".to_string(), out.doc.id, 3000)
+            .await
+            .unwrap();
+        let pending = wiki
+            .docs
+            .get_extension_as::<BTreeSet<u64>>(DIGEST_PENDING_KEY)
+            .unwrap_or_default();
+        assert!(pending.contains(&out.doc.id));
+
+        // The ledger check driving the catch-up: false until a
+        // DigestExtracted event covers the document's current version.
+        assert!(
+            !version_digested(&wiki, out.doc.id, out.doc.current_version)
+                .await
+                .unwrap()
+        );
+        wiki.write_event(
+            EVENT_DIGEST_EXTRACTED,
+            Some(out.doc.id),
+            Some(out.doc.current_version),
+            "wiki_digest".to_string(),
+            BTreeMap::new(),
+            4000,
+        )
+        .await
+        .unwrap();
+        assert!(
+            version_digested(&wiki, out.doc.id, out.doc.current_version)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_recent_checks_ledger_citations_with_grouped_loads() {
+        let wiki = test_wiki("wiki_digest_verify_recent").await;
+        let out = wiki
+            .commit(
+                "a".to_string(),
+                commit_input("样本", "# 样本\n\n引用样本内容。\n"),
+                1000,
+            )
+            .await
+            .unwrap();
+        let version = wiki
+            .versions
+            .get_as::<WikiVersionRecord>(out.version.id)
+            .await
+            .unwrap();
+        let ok = fact(("A", "a"), "p", ("B", "b"));
+        let ok = DigestedFact {
+            citation: citation_uri("test_space", out.doc.id, out.version.id, 0, version.size),
+            checksum: chunk_checksum(
+                &version.checksum,
+                0,
+                version.size as usize,
+                &version.content,
+            ),
+            ..ok
+        };
+        let mut stale = ok.clone();
+        stale.predicate = "q".into();
+        stale.checksum = "sha3-256:wrong".to_string();
+        wiki.write_event(
+            EVENT_DIGEST_EXTRACTED,
+            Some(out.doc.id),
+            Some(out.version.id),
+            "wiki_digest".to_string(),
+            BTreeMap::from([(
+                "facts".to_string(),
+                serde_json::to_value(vec![ok, stale]).unwrap(),
+            )]),
+            2000,
+        )
+        .await
+        .unwrap();
+
+        let (checked, invalid) = verify_recent_citations(&wiki, 3000).await.unwrap();
+        assert_eq!((checked, invalid), (2, 1));
+        // The mismatched recorded checksum sits over intact content: a
+        // reference error, not corruption — no audit event.
+        let events = wiki
+            .list_events(
+                Some(EVENT_CITATION_VERIFY_FAILED.to_string()),
+                None,
+                None,
+                Some(10),
+            )
+            .await
+            .unwrap();
+        assert!(events.events.is_empty());
     }
 }

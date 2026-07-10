@@ -55,21 +55,21 @@ export interface Message {
 }
 
 export interface FormationInput {
-  messages: Message[];
+  messages: Message[]; // 至少包含一条非空消息（否则 400）
   context?: InputContext;
   timestamp: string; // ISO 8601
 }
 
 export interface RecallInput {
-  query: string;
+  query: string; // 不能为空/纯空白（否则 400）
   context?: InputContext;
 }
 
 export interface MaintenanceParameters {
-  stale_event_threshold_days?: number;
-  confidence_decay_factor?: number;
-  unsorted_max_backlog?: number;
-  orphan_max_count?: number;
+  stale_event_threshold_days?: number; // [1, 365]
+  confidence_decay_factor?: number; // (0, 1]
+  unsorted_max_backlog?: number; // [1, 10000]
+  orphan_max_count?: number; // [1, 10000]
 }
 
 export interface MaintenanceInput {
@@ -80,14 +80,15 @@ export interface MaintenanceInput {
 }
 
 export interface AddSpaceTokenInput {
-  scope: TokenScope;
-  name: string;
+  scope: TokenScope; // 铸造 "*" 需要 "*" scope 的 CWT
+  name: string; // 必填，空间内唯一
   expires_at?: number; // Unix timestamp in milliseconds
   labels?: string[]; // wiki ACL 标签；缺省 = 不受限
 }
 
 export interface RevokeSpaceTokenInput {
-  token: string;
+  token?: string; // 完整 token 值……
+  name?: string; // ……或唯一 token 名称（两者必填其一）
 }
 
 export interface UpdateSpaceInput {
@@ -601,17 +602,17 @@ MCP_AUTH_TOKEN="$SPACE_TOKEN" \
 ### GET `/v1/{space_id}/conversations/{conversation_id}?collection=<collection>`
 
 - 作用：获取单条会话详情
-- 鉴权：SpaceToken/CWT `read`（公开空间免鉴权，私有空间需有效 token）
+- 鉴权：SpaceToken/CWT `read`（公开空间免鉴权，私有空间需有效 token）；带 ACL 标签限制的 token 返回 `403`——会话持久化了完整的 agent 运行历史，不受标签过滤
 - Query:
-  - `collection?: string` // 使用 "recall" 区分召回 vs 记忆会话
+  - `collection?: string` // "recall" 或 "maintenance" 指定非默认会话集合；未知值返回 `400`
 - 响应：`RpcResponse<Conversation>`
 
 ### GET `/v1/{space_id}/conversations/{conversation_id}/delta?collection=<collection>&messages_offset=<n>&artifacts_offset=<n>`
 
 - 作用：按客户端已消费的 offset 获取会话增量更新
-- 鉴权：SpaceToken/CWT `read`（公开空间免鉴权，私有空间需有效 token）
+- 鉴权：SpaceToken/CWT `read`（公开空间免鉴权，私有空间需有效 token）；带 ACL 标签限制的 token 返回 `403`
 - Query:
-  - `collection?: string` // 使用 "recall" 或 "maintenance" 区分非默认会话集合
+  - `collection?: string` // "recall" 或 "maintenance" 指定非默认会话集合；未知值返回 `400`
   - `messages_offset?: number` // 仅返回该偏移量之后的新消息，默认 `0`
   - `artifacts_offset?: number` // 仅返回该偏移量之后的新 artifacts，默认 `0`
 - 响应：`RpcResponse<ConversationDelta>`
@@ -619,9 +620,9 @@ MCP_AUTH_TOKEN="$SPACE_TOKEN" \
 ### GET `/v1/{space_id}/conversations?collection=<collection>&cursor=<cursor>&limit=<n>`
 
 - 作用：分页列出会话
-- 鉴权：SpaceToken/CWT `read`（公开空间免鉴权，私有空间需有效 token）
+- 鉴权：SpaceToken/CWT `read`（公开空间免鉴权，私有空间需有效 token）；带 ACL 标签限制的 token 返回 `403`
 - Query:
-  - `collection?: string` // 使用 "recall" 区分召回 vs 记忆会话
+  - `collection?: string` // "recall" 或 "maintenance" 指定非默认会话集合；未知值返回 `400`
   - `cursor?: string`
   - `limit?: number`
 - 响应：`RpcResponse<Conversation[]>`（并通过 `next_cursor` 给出下一页游标）
@@ -723,21 +724,21 @@ Wiki 专属错误语义：`409` 提交冲突（`error.data.current_version` 为�
 ### GET `/v1/{space_id}/management/space_tokens`
 
 - 作用：列出 Space Token
-- 鉴权：必须通过 CWT `write`（用户管理级鉴权；响应包含原始 token secret）
-- 响应：`RpcResponse<SpaceToken[]>`
+- 鉴权：必须通过 CWT `write`（用户管理级鉴权）
+- 响应：`RpcResponse<SpaceToken[]>` —— `token` 字段仅显示前缀（如 `STabc123…`）；完整 token 值只在 `add_space_token` 响应中出现一次，铸造时务必保存，或后续凭 `name` 吊销
 
 ### POST `/v1/{space_id}/management/add_space_token`
 
 - 作用：新增 Space Token
-- 鉴权：必须通过 CWT `write`（用户管理级鉴权）
-- 请求体：`AddSpaceTokenInput`
-- 响应：`RpcResponse<SpaceToken>`（新 token，前缀总是 `ST`）
+- 鉴权：必须通过 CWT `write`（用户管理级鉴权）。铸造 `*`（全 scope）token 需要 `*` scope 的 CWT——`write` CWT 不能铸造高于自身 scope 的 token
+- 请求体：`AddSpaceTokenInput` —— `name` 必填且空间内唯一（是 token 的审计身份与吊销句柄）
+- 响应：`RpcResponse<SpaceToken>`（新 token，前缀总是 `ST`；这是唯一携带完整 token 值的响应）
 
 ### POST `/v1/{space_id}/management/revoke_space_token`
 
 - 作用：吊销 Space Token
 - 鉴权：必须通过 CWT `write`（用户管理级鉴权）
-- 请求体：`RevokeSpaceTokenInput`
+- 请求体：`RevokeSpaceTokenInput` —— 传 `token`（完整 token 值）或 `name`（唯一 token 名称，供未保存 token 值的管理者使用）
 - 响应：`RpcResponse<boolean>`（是否成功吊销）
 
 ### PATCH `/v1/{space_id}/management/update_space`

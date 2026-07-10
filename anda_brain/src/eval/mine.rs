@@ -275,29 +275,52 @@ fn mask_emails(text: &str) -> String {
     out
 }
 
-/// Masks digit runs of 7+ characters (phone/account numbers).
+/// Masks digit runs of 7+ characters (phone/account numbers). Digit runs in
+/// fractional-second position of an RFC3339 timestamp (`…HH:MM:SS.1234567`)
+/// are exempt: they are wall-clock precision, not identifiers, and masking
+/// them would corrupt every high-precision timeline timestamp.
 fn mask_digit_runs(text: &str) -> String {
     let mut masked = String::with_capacity(text.len());
     let mut digits = String::new();
+    let flush = |masked: &mut String, digits: &mut String| {
+        if digits.len() >= 7 && !ends_with_time_and_dot(masked) {
+            masked.push_str("[number]");
+        } else {
+            masked.push_str(digits);
+        }
+        digits.clear();
+    };
     for ch in text.chars() {
         if ch.is_ascii_digit() {
             digits.push(ch);
             continue;
         }
-        if digits.len() >= 7 {
-            masked.push_str("[number]");
-        } else {
-            masked.push_str(&digits);
-        }
-        digits.clear();
+        flush(&mut masked, &mut digits);
         masked.push(ch);
     }
-    if digits.len() >= 7 {
-        masked.push_str("[number]");
-    } else {
-        masked.push_str(&digits);
-    }
+    flush(&mut masked, &mut digits);
     masked
+}
+
+/// True when `prefix` ends with `HH:MM:SS.` — the shape immediately before
+/// an RFC3339 fractional-second digit run. Ordinary identifiers (account
+/// numbers, phone numbers) never follow this shape, so the exemption cannot
+/// leak them.
+fn ends_with_time_and_dot(prefix: &str) -> bool {
+    let tail: Vec<char> = prefix.chars().rev().take(9).collect();
+    if tail.len() < 9 {
+        return false;
+    }
+    // Reversed: '.' S S ':' M M ':' H H
+    tail[0] == '.'
+        && tail[1].is_ascii_digit()
+        && tail[2].is_ascii_digit()
+        && tail[3] == ':'
+        && tail[4].is_ascii_digit()
+        && tail[5].is_ascii_digit()
+        && tail[6] == ':'
+        && tail[7].is_ascii_digit()
+        && tail[8].is_ascii_digit()
 }
 
 /// Scrubs every string field of a scenario in place by round-tripping it
@@ -305,7 +328,8 @@ fn mask_digit_runs(text: &str) -> String {
 /// *instructed* to put the corrected fact into `required_answer_terms` /
 /// `forbidden_answer_terms` / `expected_memories[].assertion`, so any
 /// field-by-field allowlist that misses one of them ships raw PII to disk.
-/// (RFC3339 timestamps survive: their digit runs are ≤4 chars.)
+/// (RFC3339 timestamps survive: date/time digit runs are ≤4 chars and
+/// fractional seconds are exempted by shape in `mask_digit_runs`.)
 fn scrub_scenario(scenario: &mut EvalScenario) -> Result<(), BoxError> {
     let mut value = serde_json::to_value(&*scenario)?;
     scrub_json_strings(&mut value);
@@ -339,6 +363,24 @@ mod tests {
         // Emails whose local part contains a long digit run must still be
         // recognized as emails (email pass runs before the digit pass).
         assert_eq!(scrub_pii("alice12345678@example.com"), "[email]");
+    }
+
+    #[test]
+    fn scrub_pii_preserves_rfc3339_fractional_second_timestamps() {
+        // Fractional seconds of 7+ digits must survive; other long digit
+        // runs in the same text are still masked.
+        assert_eq!(
+            scrub_pii("at 2026-07-10T12:34:56.1234567Z call 13800138000"),
+            "at 2026-07-10T12:34:56.1234567Z call [number]"
+        );
+        assert_eq!(
+            scrub_pii("\"timestamp\":\"2026-07-10T00:00:09.123456789+08:00\""),
+            "\"timestamp\":\"2026-07-10T00:00:09.123456789+08:00\""
+        );
+        // A long digit run after a dot without the time shape is masked.
+        assert_eq!(scrub_pii("acct.12345678"), "acct.[number]");
+        // A long digit run at end-of-text is still masked (flush path).
+        assert_eq!(scrub_pii("call 13800138000"), "call [number]");
     }
 
     #[test]

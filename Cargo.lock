@@ -152,6 +152,7 @@ dependencies = [
  "structured-logger",
  "tokio",
  "tokio-util",
+ "tower",
  "tower-http",
  "unicode-normalization",
 ]
@@ -5043,6 +5044,7 @@ dependencies = [
  "pin-project-lite",
  "sync_wrapper",
  "tokio",
+ "tokio-util",
  "tower-layer",
  "tower-service",
  "tracing",

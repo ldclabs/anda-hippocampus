@@ -15,7 +15,7 @@ use super::{
     DEFAULT_NAMESPACE, DOC_STATUS_ACTIVE, EVENT_EXPORT_COMPLETED, EVENT_IMPORT_COMPLETED,
     WikiBundleEntry, WikiCommitInput, WikiDocInfo, WikiError, WikiExportOutput, WikiImportInput,
     WikiImportOutput, WikiImportSkip, WikiImportStatus, WikiImportedDoc, WikiListDocsInput,
-    WikiService, markdown_title, slugify_path,
+    WikiService, markdown_title, prepare_commit, slugify_path,
 };
 
 pub const OKF_VERSION: &str = "0.1";
@@ -26,7 +26,9 @@ pub const OKF_TYPE_KEY: &str = "okf_type";
 /// Sized so a full export of a large namespace replays in one call (M4
 /// acceptance); bundles beyond this must be split by the external toolchain.
 const MAX_IMPORT_ENTRIES: usize = 65_536;
-const IMPORT_CAS_RETRIES: usize = 3;
+/// Export ceiling, aligned with the import side: a namespace beyond this
+/// cannot round-trip anyway and must be reorganized first.
+const MAX_EXPORT_DOCS: usize = MAX_IMPORT_ENTRIES;
 
 impl WikiService {
     /// Imports an OKF bundle into one namespace. Concept paths become
@@ -144,79 +146,83 @@ impl WikiService {
             metadata.insert(OKF_TYPE_KEY.to_string(), Json::from(kind));
         }
 
-        // CAS retry: another writer may commit between the slug lookup and
-        // our commit; re-reading the moved-to version converges because
-        // import is last-write-wins by design.
-        for _ in 0..IMPORT_CAS_RETRIES {
-            let existing = match self.find_doc_id_by_slug(namespace, &slug).await? {
-                Some(id) => Some(self.doc_record(id).await?),
-                None => None,
-            };
-            let (doc_id, parent_version) = match &existing {
-                Some(doc) => (Some(doc._id), Some(doc.current_version)),
-                None => (None, None),
-            };
-            // A bundle exported from a commit-origin document carries
-            // synthesized frontmatter; storing it verbatim would mutate
-            // metadata and grow the version chain by one on the first
-            // replay. A block matching what export synthesizes for the
-            // current document state is therefore not persisted.
-            let mut commit_metadata = metadata.clone();
-            if let (Some(doc), Some(raw)) = (&existing, &frontmatter)
-                && !doc.metadata.contains_key(FRONTMATTER_KEY)
-                && *raw
-                    == synthesized_frontmatter(
-                        doc.metadata.get(OKF_TYPE_KEY).and_then(|v| v.as_str()),
-                        &doc.title,
-                        &doc.tags,
-                        doc.source_uri.as_deref(),
-                    )
-            {
-                commit_metadata.remove(FRONTMATTER_KEY);
-                commit_metadata.remove(OKF_TYPE_KEY);
-            }
-            let commit = WikiCommitInput {
-                doc_id,
-                parent_version,
-                namespace: Some(namespace.to_string()),
-                slug: Some(slug.clone()),
-                title: title.clone(),
-                content: body.to_string(),
-                tags: parsed.as_ref().and_then(|fm| fm.tags.clone()),
-                // OKF cannot express enterprise ACLs (PRD §9): imported docs
-                // keep their stored label or inherit the namespace default.
-                acl_label: None,
-                source_uri: parsed.as_ref().and_then(|fm| fm.resource.clone()),
-                message: Some(format!("okf import: {}", entry.path)),
-                metadata: if commit_metadata.is_empty() {
-                    None
-                } else {
-                    Some(commit_metadata)
-                },
-            };
-            match self.commit(actor.to_string(), commit, now_ms).await {
-                Ok(out) => {
-                    return Ok(Some(WikiImportedDoc {
-                        path: entry.path.clone(),
-                        doc_id: out.doc.id,
-                        version_id: out.version.id,
-                        status: if out.created {
-                            WikiImportStatus::Created
-                        } else if out.idempotent {
-                            WikiImportStatus::Unchanged
-                        } else {
-                            WikiImportStatus::Updated
-                        },
-                    }));
-                }
-                Err(WikiError::Conflict { .. }) => continue,
-                Err(err) => return Err(err),
+        // Pure-CPU commit preparation (normalization, chunking, hashing)
+        // stays outside the lock; document identity is resolved under it.
+        let mut prepared = prepare_commit(WikiCommitInput {
+            doc_id: None,
+            parent_version: None,
+            namespace: Some(namespace.to_string()),
+            slug: Some(slug.clone()),
+            title,
+            content: body.to_string(),
+            // A deleted `tags:` key must propagate on re-import: `None`
+            // would read as "keep the stored tags" and the next export
+            // would resurrect them.
+            tags: Some(
+                parsed
+                    .as_ref()
+                    .and_then(|fm| fm.tags.clone())
+                    .unwrap_or_default(),
+            ),
+            // OKF cannot express enterprise ACLs (PRD §9): imported docs
+            // keep their stored label or inherit the namespace default.
+            acl_label: None,
+            source_uri: parsed.as_ref().and_then(|fm| fm.resource.clone()),
+            message: Some(format!("okf import: {}", entry.path)),
+            metadata: (!metadata.is_empty()).then_some(metadata),
+        })?;
+
+        // "Slug lookup + commit" runs under one write-lock acquisition:
+        // concurrent imports of the same bundle would otherwise both miss
+        // the lookup and duplicate the document under a suffixed slug
+        // instead of converging on one create + idempotent replays. The
+        // lock is per entry, so large bundles do not starve other writers.
+        let _guard = self.write_lock.lock().await;
+        let existing = match self.find_doc_id_by_slug(namespace, &slug).await? {
+            Some(id) => Some(self.doc_record(id).await?),
+            None => None,
+        };
+        if let Some(doc) = &existing {
+            prepared.input.doc_id = Some(doc._id);
+            prepared.input.parent_version = Some(doc.current_version);
+        }
+        // A bundle exported from a commit-origin document carries
+        // synthesized frontmatter; storing it verbatim would mutate
+        // metadata and grow the version chain by one on the first
+        // replay. A block matching what export synthesizes for the
+        // current document state is therefore not persisted.
+        if let (Some(doc), Some(raw)) = (&existing, &frontmatter)
+            && !doc.metadata.contains_key(FRONTMATTER_KEY)
+            && *raw
+                == synthesized_frontmatter(
+                    doc.metadata.get(OKF_TYPE_KEY).and_then(|v| v.as_str()),
+                    &doc.title,
+                    &doc.tags,
+                    doc.source_uri.as_deref(),
+                )
+            && let Some(commit_metadata) = &mut prepared.input.metadata
+        {
+            commit_metadata.remove(FRONTMATTER_KEY);
+            commit_metadata.remove(OKF_TYPE_KEY);
+            if commit_metadata.is_empty() {
+                prepared.input.metadata = None;
             }
         }
-        Err(WikiError::Invalid(format!(
-            "import of {} kept conflicting with concurrent commits",
-            entry.path
-        )))
+        let out = self
+            .commit_prepared(actor.to_string(), prepared, now_ms)
+            .await?;
+        Ok(Some(WikiImportedDoc {
+            path: entry.path.clone(),
+            doc_id: out.doc.id,
+            version_id: out.version.id,
+            status: if out.created {
+                WikiImportStatus::Created
+            } else if out.idempotent {
+                WikiImportStatus::Unchanged
+            } else {
+                WikiImportStatus::Updated
+            },
+        }))
     }
 
     /// Exports one namespace as an OKF bundle: concept `.md` files (verbatim
@@ -249,6 +255,14 @@ impl WikiService {
                 })
                 .await?;
             docs.extend(page.docs);
+            if docs.len() > MAX_EXPORT_DOCS {
+                // The whole namespace is buffered in memory and serialized
+                // into a single response: refuse unbounded exports early.
+                return Err(WikiError::Invalid(format!(
+                    "namespace {namespace:?} has more than {MAX_EXPORT_DOCS} active documents; \
+                     split content across namespaces and export them separately"
+                )));
+            }
             match page.next_cursor {
                 Some(next) => cursor = Some(next),
                 None => break,

@@ -39,11 +39,31 @@ impl Drop for ProcessingGuard {
     }
 }
 
+/// An externally-held claim on the maintenance processing slot (see
+/// [`MaintenanceAgent::try_claim_processing`]). If the claim is never
+/// consumed by [`MaintenanceAgent::run`] — e.g. the settlement or agent
+/// dispatch errored first — dropping it releases the slot.
+pub(crate) struct MaintenanceClaim {
+    processing: Arc<AtomicBool>,
+    external_claim: Arc<AtomicBool>,
+}
+
+impl Drop for MaintenanceClaim {
+    fn drop(&mut self) {
+        if self.external_claim.swap(false, Ordering::SeqCst) {
+            self.processing.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct MaintenanceAgent {
     pub conversations: Conversations,
     memory: Arc<MemoryManagement>,
     processing: Arc<AtomicBool>,
+    /// True while a [`MaintenanceClaim`] holds `processing` on behalf of
+    /// `Space::maintenance` and the claim has not been consumed by `run`.
+    external_claim: Arc<AtomicBool>,
     hook: Arc<dyn BrainHook>,
     history: Arc<RwLock<VecDeque<Document>>>,
 }
@@ -59,9 +79,32 @@ impl MaintenanceAgent {
             memory,
             conversations,
             processing: Arc::new(AtomicBool::new(false)),
+            external_claim: Arc::new(AtomicBool::new(false)),
             hook,
             history: Arc::new(RwLock::new(VecDeque::new())),
         }
+    }
+
+    /// Claims the processing slot on behalf of `Space::maintenance` so the
+    /// deterministic settlement that precedes the LLM cycle runs under the
+    /// same formation/maintenance mutual exclusion as the cycle itself
+    /// (review P1-3: without this, formation could start inside the
+    /// multi-second settlement window and write the graph concurrently).
+    /// The claim is inherited by the next [`Agent::run`] call; if `run` is
+    /// never reached, dropping the claim releases the slot.
+    pub(crate) fn try_claim_processing(&self) -> Option<MaintenanceClaim> {
+        if self
+            .processing
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return None;
+        }
+        self.external_claim.store(true, Ordering::SeqCst);
+        Some(MaintenanceClaim {
+            processing: self.processing.clone(),
+            external_claim: self.external_claim.clone(),
+        })
     }
 
     pub async fn init(&self) -> Result<(), BoxError> {
@@ -169,11 +212,14 @@ impl Agent<AgentCtx> for MaintenanceAgent {
         let maintenance_input = serde_json::from_str::<MaintenanceInput>(&prompt)
             .map_err(|err| format!("invalid MaintenanceInput: {err}"))?;
 
-        // Prevent concurrent maintenance runs
-        if self
-            .processing
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
+        // Prevent concurrent maintenance runs. A claim taken by
+        // `Space::maintenance` before settlement is inherited here instead of
+        // re-acquired, so the slot is held continuously across settlement.
+        if !self.external_claim.swap(false, Ordering::SeqCst)
+            && self
+                .processing
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
         {
             return Ok(AgentOutput {
                 content: "Maintenance cycle is already in progress.".to_string(),
@@ -248,6 +294,20 @@ impl Agent<AgentCtx> for MaintenanceAgent {
     }
 }
 
+/// Hard guardrails for the maintenance runner loop (review P2-3).
+///
+/// A model that keeps emitting tool calls without converging would otherwise
+/// run forever: the runner compacts every ~81 turns and simply continues, so
+/// `processing` stays true and the whole space's memory system stalls
+/// (formation only resumes after maintenance completes). Maintenance
+/// legitimately needs far more turns than recall (`RECALL_MAX_MODEL_TURNS` =
+/// 7 + 180s), so these caps are intentionally loose. Exceeding either budget
+/// marks the conversation Failed, which releases the processing slot through
+/// the existing guard/hook flow. Budgets are checked between turns so an
+/// in-flight KIP write turn is never cancelled halfway.
+const MAINTENANCE_MAX_MODEL_TURNS: usize = 200;
+const MAINTENANCE_MAX_WALL_CLOCK_MS: u64 = 30 * 60 * 1000;
+
 impl MaintenanceAgent {
     async fn mark_conversation_failed(&self, conversation: &mut Conversation, reason: String) {
         log::error!(
@@ -267,6 +327,27 @@ impl MaintenanceAgent {
         }
     }
 
+    /// Persists the current full conversation snapshot; `to_changes` failures
+    /// are logged and must not interrupt the processing loop.
+    async fn persist_conversation_snapshot(&self, conversation: &Conversation) {
+        match conversation.to_changes() {
+            Ok(changes) => {
+                let _ = self
+                    .conversations
+                    .update_conversation(conversation._id, changes)
+                    .await;
+            }
+            Err(err) => {
+                log::error!(
+                    target: "brain",
+                    "Failed to serialize maintenance conversation {} changes: {:?}",
+                    conversation._id,
+                    err
+                );
+            }
+        }
+    }
+
     async fn process_one(&self, ctx: &AgentCtx, conversation: &mut Conversation) {
         let prompt = match conversation
             .messages
@@ -282,8 +363,18 @@ impl MaintenanceAgent {
             }
         };
 
-        let primer = self.memory.describe_primer().await.unwrap_or_default();
         let now_ms = unix_ms();
+        // The context sources are independent; fetch them concurrently (same
+        // pattern as recall's context assembly).
+        let (primer, notes) = tokio::join!(
+            async { self.memory.describe_primer().await.unwrap_or_default() },
+            async {
+                match load_notes(ctx).await {
+                    Some(n) => n,
+                    None => load_notes_from_legacy(ctx).await.unwrap_or_default(),
+                }
+            },
+        );
         let chat_history: Vec<Document> = { self.history.read().iter().cloned().collect() };
 
         let chat_history = if chat_history.is_empty() {
@@ -300,10 +391,6 @@ impl MaintenanceAgent {
                 timestamp: Some(now_ms),
                 ..Default::default()
             }]
-        };
-        let notes = match load_notes(ctx).await {
-            Some(n) => n,
-            None => load_notes_from_legacy(ctx).await.unwrap_or_default(),
         };
         let mut runner = ctx.clone().completion_iter(
             CompletionRequest {
@@ -323,11 +410,45 @@ impl MaintenanceAgent {
             vec![],
         );
 
+        let started_at_ms = unix_ms();
         let mut replace_initial_input = true;
         let mut persisted_runner_history_len = 0;
+        let mut total_model_turns = 0usize;
+        let mut accounted_runner_turns = 0usize;
+        let mut unpersisted_turns = 0usize;
         loop {
+            // Guardrails against a non-converging tool loop; see
+            // MAINTENANCE_MAX_MODEL_TURNS. Exceeding a budget takes the
+            // existing mark_conversation_failed path and releases the slot.
+            if total_model_turns >= MAINTENANCE_MAX_MODEL_TURNS {
+                self.mark_conversation_failed(
+                    conversation,
+                    format!(
+                        "maintenance exceeded model turn limit of {}",
+                        MAINTENANCE_MAX_MODEL_TURNS
+                    ),
+                )
+                .await;
+                break;
+            }
+            if unix_ms().saturating_sub(started_at_ms) >= MAINTENANCE_MAX_WALL_CLOCK_MS {
+                self.mark_conversation_failed(
+                    conversation,
+                    format!(
+                        "maintenance exceeded wall-clock budget of {} seconds",
+                        MAINTENANCE_MAX_WALL_CLOCK_MS / 1000
+                    ),
+                )
+                .await;
+                break;
+            }
+
             match compact_runner_if_needed(&mut runner, 0, true).await {
                 Ok(true) => {
+                    // The compaction handoff consumed one model turn, and the
+                    // replacement runner restarts its own turn counter.
+                    total_model_turns = total_model_turns.saturating_add(1);
+                    accounted_runner_turns = runner.turns();
                     persisted_runner_history_len = 0;
                     replace_initial_input = false;
                 }
@@ -345,6 +466,11 @@ impl MaintenanceAgent {
             match runner.next().await {
                 Ok(None) => break,
                 Ok(Some(res)) => {
+                    let runner_turns = runner.turns();
+                    total_model_turns = total_model_turns
+                        .saturating_add(runner_turns.saturating_sub(accounted_runner_turns));
+                    accounted_runner_turns = runner_turns;
+
                     let now_ms = unix_ms();
                     let is_done = runner.is_done();
 
@@ -371,21 +497,16 @@ impl MaintenanceAgent {
                         push_completed_history(&self.history, conversation, 2);
                     }
 
-                    match conversation.to_changes() {
-                        Ok(changes) => {
-                            let _ = self
-                                .conversations
-                                .update_conversation(conversation._id, changes)
-                                .await;
-                        }
-                        Err(err) => {
-                            log::error!(
-                                target: "brain",
-                                "Failed to serialize maintenance conversation {} changes: {:?}",
-                                conversation._id,
-                                err
-                            );
-                        }
+                    // Persisting rewrites the full message array (O(turns^2)
+                    // over a session), so intermediate Working turns are
+                    // throttled; terminal statuses always persist. See
+                    // PERSIST_EVERY_N_TURNS.
+                    unpersisted_turns = unpersisted_turns.saturating_add(1);
+                    if conversation.status != ConversationStatus::Working
+                        || unpersisted_turns >= super::PERSIST_EVERY_N_TURNS
+                    {
+                        self.persist_conversation_snapshot(conversation).await;
+                        unpersisted_turns = 0;
                     }
 
                     if conversation.status == ConversationStatus::Cancelled
@@ -404,6 +525,14 @@ impl MaintenanceAgent {
                 }
             }
         }
+
+        // Terminal and failure exits above always persist (any non-Working
+        // status forces a write, and mark_conversation_failed writes its own
+        // snapshot), so only a Working exit — e.g. the runner returning
+        // `Ok(None)` — can still hold turns skipped by the throttle.
+        if unpersisted_turns > 0 && conversation.status == ConversationStatus::Working {
+            self.persist_conversation_snapshot(conversation).await;
+        }
     }
 }
 
@@ -416,7 +545,8 @@ mod tests {
         types::{MaintenanceInput, MaintenanceScope},
     };
     use anda_core::{
-        Agent, AgentOutput, BoxError, BoxPinFut, CompletionRequest, Message, Principal,
+        Agent, AgentOutput, BoxError, BoxPinFut, CompletionRequest, Message, Principal, ToolCall,
+        Usage,
     };
     use anda_db::{database::DBConfig, storage::StorageConfig};
     use anda_engine::{
@@ -490,6 +620,48 @@ mod tests {
 
         fn completion(&self, _req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
             Box::pin(async move { Err("model error".into()) })
+        }
+    }
+
+    /// Emits an endless stream of tool calls (a non-converging model), and a
+    /// summary for compaction handoff requests so the runner keeps looping.
+    #[derive(Debug)]
+    struct ToolLoopCompleter;
+
+    impl CompletionFeaturesDyn for ToolLoopCompleter {
+        fn model_name(&self) -> String {
+            "maintenance-tool-loop-test-model".to_string()
+        }
+
+        fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+            Box::pin(async move {
+                let usage = Usage {
+                    input_tokens: 10,
+                    output_tokens: 1,
+                    requests: 1,
+                    ..Default::default()
+                };
+                if req.tools.is_empty() {
+                    // Compaction handoff turn: tools are cleared for the
+                    // summarization request.
+                    return Ok(AgentOutput {
+                        content: "handoff summary".to_string(),
+                        usage,
+                        ..Default::default()
+                    });
+                }
+                Ok(AgentOutput {
+                    tool_calls: vec![ToolCall {
+                        name: "execute_kip".to_string(),
+                        args: serde_json::json!({"commands": []}),
+                        result: None,
+                        call_id: Some("loop".to_string()),
+                        remote_id: None,
+                    }],
+                    usage,
+                    ..Default::default()
+                })
+            })
         }
     }
 
@@ -732,6 +904,57 @@ mod tests {
                 .as_deref()
                 .unwrap_or_default()
                 .contains("CompletionRunner error")
+        );
+    }
+
+    #[tokio::test]
+    async fn process_one_fails_tool_loop_at_model_turn_limit_and_throttles_persistence() {
+        let app = test_app_state_with_completer("maintenance_turn_limit", ToolLoopCompleter);
+        let space = create_loaded_space(&app, "maintenance_turn_limit").await;
+        let maintenance = space.maintenance_for_test();
+        let ctx = space
+            .ctx_for_test(SELF_USER_ID, MaintenanceAgent::NAME)
+            .unwrap();
+        let mut conversation = stored_conversation(
+            &maintenance,
+            vec![json!(Message {
+                role: "user".to_string(),
+                content: vec![maintenance_prompt(MaintenanceScope::Quick).into()],
+                ..Default::default()
+            })],
+        )
+        .await;
+
+        let updates_before = maintenance.conversations.conversations.stats().update_count;
+        maintenance.process_one(&ctx, &mut conversation).await;
+        let updates_after = maintenance.conversations.conversations.stats().update_count;
+
+        assert_eq!(conversation.status, ConversationStatus::Failed);
+        assert!(
+            conversation
+                .failed_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains(&format!(
+                    "exceeded model turn limit of {}",
+                    super::MAINTENANCE_MAX_MODEL_TURNS
+                )),
+            "failed_reason: {:?}",
+            conversation.failed_reason
+        );
+        let stored = maintenance
+            .conversations
+            .get_conversation(conversation._id)
+            .await
+            .unwrap();
+        assert_eq!(stored.status, ConversationStatus::Failed);
+
+        // ~200 Working turns persisted every PERSIST_EVERY_N_TURNS plus the
+        // final failure write — far fewer than one write per turn.
+        let update_delta = updates_after - updates_before;
+        assert!(
+            (2..100).contains(&update_delta),
+            "update_delta: {update_delta}"
         );
     }
 

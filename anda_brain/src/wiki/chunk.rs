@@ -22,6 +22,10 @@ pub const CHUNK_TARGET_MIN: usize = 800;
 pub const CHUNK_TARGET_MAX: usize = 2000;
 /// Non-atomic runs without blank lines are force-split at this size.
 pub const CHUNK_HARD_MAX: usize = 4096;
+/// Even atomic units (code fences, tables) are force-split at line
+/// boundaries past this size: a single retrieval hit must stay bounded, a
+/// megabyte fence must never travel whole into an agent context.
+pub const CHUNK_ATOMIC_MAX: usize = 32 * 1024;
 /// Upper bound on chunks per version so any per-document chunk query fits in
 /// a single AndaDB search (`MAX_SEARCH_LIMIT` is 1000).
 pub const MAX_CHUNKS_PER_VERSION: usize = 1000;
@@ -425,8 +429,16 @@ fn pack_section(
             if len == 0 {
                 return;
             }
-            if len > CHUNK_HARD_MAX && !atomic {
-                force_split(content, start, end, &section.heading_path, drafts);
+            // Atomic units stay whole up to CHUNK_ATOMIC_MAX; beyond that
+            // atomicity degrades to line-boundary splits so a single chunk
+            // (and thus a single search hit) is always bounded.
+            let cap = if atomic {
+                CHUNK_ATOMIC_MAX
+            } else {
+                CHUNK_HARD_MAX
+            };
+            if len > cap {
+                force_split(content, start, end, &section.heading_path, drafts, cap);
                 *forced_splits += 1;
             } else {
                 drafts.push(ChunkDraft {
@@ -458,12 +470,15 @@ fn pack_section(
     }
 }
 
+/// Splits `[start, end)` into pieces of at most `max` bytes, preferring
+/// line boundaries (falling back to char boundaries for single mega-lines).
 fn force_split(
     content: &str,
     start: usize,
     end: usize,
     heading_path: &[String],
     drafts: &mut Vec<ChunkDraft>,
+    max: usize,
 ) {
     let push = |piece_start: usize, piece_end: usize, drafts: &mut Vec<ChunkDraft>| {
         drafts.push(ChunkDraft {
@@ -478,14 +493,14 @@ fn force_split(
     let mut cursor = start;
     for raw in content[start..end].split_inclusive('\n') {
         let line_end = cursor + raw.len();
-        if line_end - piece_start > CHUNK_HARD_MAX && cursor > piece_start {
+        if line_end - piece_start > max && cursor > piece_start {
             push(piece_start, cursor, drafts);
             piece_start = cursor;
         }
-        // A single line longer than the hard cap cannot break on a line
+        // A single line longer than the cap cannot break on a line
         // boundary: split it on char boundaries so the cap actually holds.
-        while line_end - piece_start > CHUNK_HARD_MAX {
-            let cut = floor_char_boundary(content, piece_start + CHUNK_HARD_MAX);
+        while line_end - piece_start > max {
+            let cut = floor_char_boundary(content, piece_start + max);
             if cut <= piece_start {
                 break;
             }
@@ -739,6 +754,22 @@ mod tests {
         assert!(plan.drafts.len() > 1);
         assert!(plan.forced_splits > 0);
         assert!(plan.drafts.iter().any(|d| d.forced));
+    }
+
+    #[test]
+    fn oversized_atomic_units_are_split_at_the_atomic_cap() {
+        // ~50 KiB fenced block: atomicity degrades at CHUNK_ATOMIC_MAX so a
+        // single hit can never return an unbounded blob.
+        let code_body = "0123456789abcdef\n".repeat(3000);
+        let content = normalize_content(&format!("# Big\n```\n{code_body}```\n"));
+        assert!(content.len() > CHUNK_ATOMIC_MAX);
+        let plan = chunk_markdown(&content);
+        assert_tiling(&content, &plan);
+        assert!(plan.drafts.len() > 1);
+        assert!(plan.forced_splits > 0);
+        for draft in &plan.drafts {
+            assert!(draft.byte_end - draft.byte_start <= CHUNK_ATOMIC_MAX);
+        }
     }
 
     #[test]

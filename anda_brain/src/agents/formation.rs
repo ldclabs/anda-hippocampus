@@ -32,6 +32,20 @@ use crate::types::FormationInput;
 const SELF_INSTRUCTIONS: &str = include_str!("../../assets/BrainFormation.md");
 const REVIEW_INSTRUCTIONS: &str = include_str!("../../assets/BrainFormationReview.md");
 
+/// Hard guardrails for the formation runner loop (review P2-3).
+///
+/// A model that keeps emitting tool calls without converging would otherwise
+/// run forever: the runner compacts every ~81 turns and simply continues, so
+/// `processing_conversation` stays non-zero and the formation queue freezes.
+/// Formation legitimately needs far more turns than recall
+/// (`RECALL_MAX_MODEL_TURNS` = 7 + 180s), so these caps are intentionally
+/// loose. Exceeding either budget marks the conversation Failed, which reuses
+/// the existing Failed retry path and releases the processing slot. Budgets
+/// are checked between turns so an in-flight KIP write turn is never
+/// cancelled halfway.
+const FORMATION_MAX_MODEL_TURNS: usize = 200;
+const FORMATION_MAX_WALL_CLOCK_MS: u64 = 30 * 60 * 1000;
+
 /// Resets the AtomicU64 to 0 on drop (panic guard for processing_conversation).
 struct ProcessingGuard(Arc<AtomicU64>);
 impl Drop for ProcessingGuard {
@@ -286,6 +300,30 @@ impl FormationAgent {
         }
     }
 
+    /// Persists the current full conversation snapshot; `to_changes` failures
+    /// are logged and must not interrupt the processing loop.
+    async fn persist_conversation_snapshot(&self, conversation: &Conversation) {
+        match conversation.to_changes() {
+            Ok(mut changes) => {
+                if conversation.failed_reason.is_none() {
+                    changes.insert("failed_reason".to_string(), Fv::Null);
+                }
+                let _ = self
+                    .memory
+                    .update_conversation(conversation._id, changes)
+                    .await;
+            }
+            Err(err) => {
+                log::error!(
+                    target: "brain",
+                    "Failed to serialize formation conversation {} changes: {:?}",
+                    conversation._id,
+                    err
+                );
+            }
+        }
+    }
+
     async fn process_one(&self, ctx: &AgentCtx, conversation: &mut Conversation) {
         let prompt = match conversation
             .messages
@@ -301,16 +339,32 @@ impl FormationAgent {
             }
         };
 
-        let counterparty_info = if let Ok(input) = serde_json::from_str::<FormationInput>(&prompt)
-            && let Some(ctx) = input.context
-            && let Some(counterparty) = ctx.counterparty
-        {
-            self.get_or_init_counterparty(counterparty, None).await.ok()
-        } else {
-            None
-        };
+        let counterparty = serde_json::from_str::<FormationInput>(&prompt)
+            .ok()
+            .and_then(|input| input.context)
+            .and_then(|input_ctx| input_ctx.counterparty);
 
         let now_ms = unix_ms();
+        // The context sources are independent; fetch them concurrently (same
+        // pattern as recall's context assembly).
+        let (counterparty_info, primer, notes) = tokio::join!(
+            async {
+                match counterparty {
+                    Some(counterparty) => {
+                        self.get_or_init_counterparty(counterparty, None).await.ok()
+                    }
+                    None => None,
+                }
+            },
+            async { self.memory.describe_primer().await.unwrap_or_default() },
+            async {
+                match load_notes(ctx).await {
+                    Some(n) => n,
+                    None => load_notes_from_legacy(ctx).await.unwrap_or_default(),
+                }
+            },
+        );
+
         // add history conversations to provide more context for recall
         let chat_history: Vec<Document> = { self.history.read().iter().cloned().collect() };
 
@@ -328,11 +382,6 @@ impl FormationAgent {
                 timestamp: Some(now_ms),
                 ..Default::default()
             }]
-        };
-        let primer = self.memory.describe_primer().await.unwrap_or_default();
-        let notes = match load_notes(ctx).await {
-            Some(n) => n,
-            None => load_notes_from_legacy(ctx).await.unwrap_or_default(),
         };
         let should_review = estimate_tokens(&prompt) >= 10000;
         let mut runner = ctx.clone().completion_iter(
@@ -355,12 +404,46 @@ impl FormationAgent {
         );
         runner.set_unbound(true);
 
+        let started_at_ms = unix_ms();
         let mut replace_initial_input = true;
         let mut persisted_runner_history_len = 0;
         let mut review_pending = should_review;
+        let mut total_model_turns = 0usize;
+        let mut accounted_runner_turns = 0usize;
+        let mut unpersisted_turns = 0usize;
         loop {
+            // Guardrails against a non-converging tool loop; see
+            // FORMATION_MAX_MODEL_TURNS. Exceeding a budget takes the
+            // existing mark_conversation_failed -> Failed retry path.
+            if total_model_turns >= FORMATION_MAX_MODEL_TURNS {
+                self.mark_conversation_failed(
+                    conversation,
+                    format!(
+                        "formation exceeded model turn limit of {}",
+                        FORMATION_MAX_MODEL_TURNS
+                    ),
+                )
+                .await;
+                break;
+            }
+            if unix_ms().saturating_sub(started_at_ms) >= FORMATION_MAX_WALL_CLOCK_MS {
+                self.mark_conversation_failed(
+                    conversation,
+                    format!(
+                        "formation exceeded wall-clock budget of {} seconds",
+                        FORMATION_MAX_WALL_CLOCK_MS / 1000
+                    ),
+                )
+                .await;
+                break;
+            }
+
             match compact_runner_if_needed(&mut runner, 0, true).await {
                 Ok(true) => {
+                    // The compaction handoff consumed one model turn, and the
+                    // replacement runner restarts its own turn counter.
+                    total_model_turns = total_model_turns.saturating_add(1);
+                    accounted_runner_turns = runner.turns();
                     persisted_runner_history_len = 0;
                     replace_initial_input = false;
                 }
@@ -378,6 +461,11 @@ impl FormationAgent {
             match runner.next().await {
                 Ok(None) => break,
                 Ok(Some(res)) => {
+                    let runner_turns = runner.turns();
+                    total_model_turns = total_model_turns
+                        .saturating_add(runner_turns.saturating_sub(accounted_runner_turns));
+                    accounted_runner_turns = runner_turns;
+
                     let now_ms = unix_ms();
                     let is_done = runner.is_done() || runner.is_idle() && !review_pending;
 
@@ -405,25 +493,16 @@ impl FormationAgent {
                         push_completed_history(&self.history, conversation, 2);
                     }
 
-                    // to_changes 失败不中断处理循环
-                    match conversation.to_changes() {
-                        Ok(mut changes) => {
-                            if conversation.failed_reason.is_none() {
-                                changes.insert("failed_reason".to_string(), Fv::Null);
-                            }
-                            let _ = self
-                                .memory
-                                .update_conversation(conversation._id, changes)
-                                .await;
-                        }
-                        Err(err) => {
-                            log::error!(
-                                target: "brain",
-                                "Failed to serialize formation conversation {} changes: {:?}",
-                                conversation._id,
-                                err
-                            );
-                        }
+                    // Persisting rewrites the full message array (O(turns^2)
+                    // over a session), so intermediate Working turns are
+                    // throttled; terminal statuses always persist. See
+                    // PERSIST_EVERY_N_TURNS.
+                    unpersisted_turns = unpersisted_turns.saturating_add(1);
+                    if conversation.status != ConversationStatus::Working
+                        || unpersisted_turns >= super::PERSIST_EVERY_N_TURNS
+                    {
+                        self.persist_conversation_snapshot(conversation).await;
+                        unpersisted_turns = 0;
                     }
 
                     if conversation.status == ConversationStatus::Cancelled
@@ -452,6 +531,14 @@ impl FormationAgent {
                     break;
                 }
             }
+        }
+
+        // Terminal and failure exits above always persist (any non-Working
+        // status forces a write, and mark_conversation_failed writes its own
+        // snapshot), so only a Working exit — e.g. the runner returning
+        // `Ok(None)` — can still hold turns skipped by the throttle.
+        if unpersisted_turns > 0 && conversation.status == ConversationStatus::Working {
+            self.persist_conversation_snapshot(conversation).await;
         }
     }
 }
@@ -548,7 +635,7 @@ mod tests {
     };
     use anda_core::{
         Agent, AgentOutput, BoxError, BoxPinFut, CompletionRequest, ContentPart, Message,
-        Principal, Usage,
+        Principal, ToolCall, Usage,
     };
     use anda_db::{database::DBConfig, storage::StorageConfig};
     use anda_engine::{
@@ -662,6 +749,98 @@ mod tests {
 
         fn completion(&self, _req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
             Box::pin(async move { Err("model error".into()) })
+        }
+    }
+
+    /// Emits an endless stream of tool calls (a non-converging model), and a
+    /// summary for compaction handoff requests so the runner keeps looping.
+    #[derive(Debug)]
+    struct ToolLoopCompleter;
+
+    impl CompletionFeaturesDyn for ToolLoopCompleter {
+        fn model_name(&self) -> String {
+            "formation-tool-loop-test-model".to_string()
+        }
+
+        fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+            Box::pin(async move {
+                let usage = Usage {
+                    input_tokens: 10,
+                    output_tokens: 1,
+                    requests: 1,
+                    ..Default::default()
+                };
+                if req.tools.is_empty() {
+                    // Compaction handoff turn: tools are cleared for the
+                    // summarization request.
+                    return Ok(AgentOutput {
+                        content: "handoff summary".to_string(),
+                        usage,
+                        ..Default::default()
+                    });
+                }
+                Ok(AgentOutput {
+                    tool_calls: vec![ToolCall {
+                        name: "execute_kip".to_string(),
+                        args: serde_json::json!({"commands": []}),
+                        result: None,
+                        call_id: Some("loop".to_string()),
+                        remote_id: None,
+                    }],
+                    usage,
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
+    /// Emits `tool_turns` tool-call turns, then a final content turn.
+    #[derive(Debug)]
+    struct CountedToolThenDoneCompleter {
+        calls: Arc<AtomicU64>,
+        tool_turns: u64,
+    }
+
+    impl CompletionFeaturesDyn for CountedToolThenDoneCompleter {
+        fn model_name(&self) -> String {
+            "formation-counted-tool-test-model".to_string()
+        }
+
+        fn completion(&self, _req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+            let calls = self.calls.clone();
+            let tool_turns = self.tool_turns;
+            Box::pin(async move {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                let usage = Usage {
+                    input_tokens: 10,
+                    output_tokens: 1,
+                    requests: 1,
+                    ..Default::default()
+                };
+                if call < tool_turns {
+                    return Ok(AgentOutput {
+                        tool_calls: vec![ToolCall {
+                            name: "execute_kip".to_string(),
+                            args: serde_json::json!({"commands": []}),
+                            result: None,
+                            call_id: Some(format!("call-{call}")),
+                            remote_id: None,
+                        }],
+                        usage,
+                        ..Default::default()
+                    });
+                }
+                Ok(AgentOutput {
+                    content: "formation done".to_string(),
+                    chat_history: vec![Message {
+                        role: "assistant".to_string(),
+                        content: vec!["formation done".to_string().into()],
+                        ..Default::default()
+                    }],
+                    usage,
+                    ..Default::default()
+                })
+            })
         }
     }
 
@@ -1297,6 +1476,91 @@ mod tests {
             .unwrap();
         assert_eq!(stored.status, ConversationStatus::Failed);
         assert_eq!(stored.failed_reason.as_deref(), Some("formation failed"));
+    }
+
+    #[tokio::test]
+    async fn process_one_fails_tool_loop_at_model_turn_limit() {
+        let app = test_app_state_with_completer("formation_turn_limit", ToolLoopCompleter);
+        let space = create_loaded_space(&app, "formation_turn_limit").await;
+        let ctx = space
+            .ctx_for_test(SELF_USER_ID, FormationAgent::NAME)
+            .unwrap();
+        let mut conversation = stored_conversation(
+            &space,
+            vec![json!(Message {
+                role: "user".to_string(),
+                content: vec![formation_prompt(None).into()],
+                ..Default::default()
+            })],
+        )
+        .await;
+
+        space.formation.process_one(&ctx, &mut conversation).await;
+
+        assert_eq!(conversation.status, ConversationStatus::Failed);
+        assert!(
+            conversation
+                .failed_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains(&format!(
+                    "exceeded model turn limit of {}",
+                    super::FORMATION_MAX_MODEL_TURNS
+                )),
+            "failed_reason: {:?}",
+            conversation.failed_reason
+        );
+        let stored = space
+            .memory
+            .get_conversation(conversation._id)
+            .await
+            .unwrap();
+        assert_eq!(stored.status, ConversationStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn process_one_throttles_intermediate_persistence_until_terminal() {
+        let app = test_app_state_with_completer(
+            "formation_persist_throttle",
+            CountedToolThenDoneCompleter {
+                calls: Arc::new(AtomicU64::new(0)),
+                // Fewer working turns than PERSIST_EVERY_N_TURNS, so only the
+                // terminal turn triggers a write.
+                tool_turns: 3,
+            },
+        );
+        let space = create_loaded_space(&app, "formation_persist_throttle").await;
+        let ctx = space
+            .ctx_for_test(SELF_USER_ID, FormationAgent::NAME)
+            .unwrap();
+        let mut conversation = stored_conversation(
+            &space,
+            vec![json!(Message {
+                role: "user".to_string(),
+                content: vec![formation_prompt(None).into()],
+                ..Default::default()
+            })],
+        )
+        .await;
+
+        let updates_before = space.memory.conversations.stats().update_count;
+        space.formation.process_one(&ctx, &mut conversation).await;
+        let updates_after = space.memory.conversations.stats().update_count;
+
+        assert_eq!(conversation.status, ConversationStatus::Completed);
+        // 4 model turns total: 3 intermediate Working turns are throttled and
+        // only the terminal Completed turn is written.
+        assert_eq!(updates_after - updates_before, 1);
+        let stored = space
+            .memory
+            .get_conversation(conversation._id)
+            .await
+            .unwrap();
+        assert_eq!(stored.status, ConversationStatus::Completed);
+        // The terminal write carries the full accumulated usage (4 model
+        // turns x 10 input tokens; `requests` also counts tool executions),
+        // so throttled turns are not lost from the stored snapshot.
+        assert_eq!(stored.usage.input_tokens, 40);
     }
 
     #[tokio::test]

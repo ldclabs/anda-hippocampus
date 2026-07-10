@@ -343,7 +343,14 @@ pub struct AddSpaceTokenInput {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct RevokeSpaceTokenInput {
+    /// The full token value to revoke. May be empty when `name` is given.
+    #[serde(default)]
     pub token: String,
+    /// Revoke by (unique, required-at-mint) token name instead.
+    /// `list_space_tokens` no longer echoes full token values, so this is
+    /// the path for managers who did not save the value at mint time.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
@@ -595,6 +602,40 @@ pub struct MaintenanceParameters {
     pub unsorted_max_backlog: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub orphan_max_count: Option<u32>,
+}
+
+impl MaintenanceParameters {
+    /// Same bounds as [`MemoryPolicy::validate`]: these values are settable
+    /// per run over HTTP/MCP and go straight into the KIP-writing
+    /// maintenance prompt, so an out-of-range value (e.g. a negative decay
+    /// factor) must be rejected at the entry point, not trusted downstream.
+    pub fn validate(&self) -> Result<(), BoxError> {
+        if let Some(decay) = self.confidence_decay_factor
+            && !(decay.is_finite() && 0.0 < decay && decay <= 1.0)
+        {
+            return Err("maintenance parameter `confidence_decay_factor` must be in (0, 1]".into());
+        }
+        if let Some(days) = self.stale_event_threshold_days
+            && !(1..=365).contains(&days)
+        {
+            return Err(
+                "maintenance parameter `stale_event_threshold_days` must be in [1, 365]".into(),
+            );
+        }
+        if let Some(backlog) = self.unsorted_max_backlog
+            && !(1..=10_000).contains(&backlog)
+        {
+            return Err(
+                "maintenance parameter `unsorted_max_backlog` must be in [1, 10000]".into(),
+            );
+        }
+        if let Some(orphans) = self.orphan_max_count
+            && !(1..=10_000).contains(&orphans)
+        {
+            return Err("maintenance parameter `orphan_max_count` must be in [1, 10000]".into());
+        }
+        Ok(())
+    }
 }
 
 /// Evolvable memory-policy knobs (memory evolution plan, module M-P; see

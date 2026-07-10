@@ -26,8 +26,21 @@ pub trait BrainHook: Send + Sync {
 
 /// Principal ID: uuc56-gyb
 pub static SELF_USER_ID: Principal = Principal::from_slice(&[1]);
-pub static SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__";
 const COMPACTION_CONTINUE_PROMPT: &str = "Continue the active memory-agent work from the compaction handoff. The handoff contains the conversation state immediately before compaction.";
+
+/// Persist in-flight (non-terminal) runner turns to the conversation store
+/// only every N turns.
+///
+/// `Conversation::to_changes` re-encodes the full message array as CBOR and
+/// rewrites the whole document, so persisting every turn costs O(turns^2)
+/// over a long session. `Conversation::to_delta` cannot replace it: it is a
+/// read-side view for the incremental fetch API (`GetConversationDelta`) and
+/// there is no delta-write API in AndaDB. Terminal statuses are always
+/// persisted immediately; a crash between throttled snapshots loses at most
+/// N-1 turns of observability history, while crash recovery is unaffected
+/// because reprocessing always restarts from the first (input) message of the
+/// persisted conversation.
+pub(super) const PERSIST_EVERY_N_TURNS: usize = 5;
 
 fn queued_runner_tokens(runner: &CompletionRunner) -> u64 {
     runner

@@ -26,6 +26,23 @@ const SKILL_MARKDOWN: &str = include_str!("../SKILL.md");
 const FAVICON: &[u8] = include_bytes!("../favicon.ico");
 const APPLE_TOUCH_ICON: &[u8] = include_bytes!("../apple-touch-icon.webp");
 
+/// Maps a space-load failure to an HTTP error: a nonexistent space is 404
+/// with a generic message, anything else 500. Either way the Debug detail
+/// stays in the log — AndaDB/object-store errors can embed storage paths,
+/// which must not leak into response bodies.
+fn space_load_error(space_id: &str, err: anda_core::BoxError) -> AppError {
+    let not_found = matches!(
+        err.downcast_ref::<anda_db::error::DBError>(),
+        Some(anda_db::error::DBError::NotFound { .. })
+    );
+    log::warn!(target: "brain", space_id; "failed to load space: {err:?}");
+    if not_found {
+        AppError::with_status(StatusCode::NOT_FOUND, "space not found")
+    } else {
+        AppError::with_status(StatusCode::INTERNAL_SERVER_ERROR, "failed to load space")
+    }
+}
+
 fn ensure_sharding(app: &AppState, sharding: u32) -> Result<(), AppError> {
     if sharding != app.sharding {
         return Err(AppError::bad_request(format!(
@@ -82,7 +99,7 @@ pub async fn get_info(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
 
     if !space.is_public() && t.is_none() {
         // 如果空间不是公开的，且没有验证 CWToken，则验证 SpaceToken
@@ -112,7 +129,7 @@ pub async fn get_formation_status(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
 
     if !space.is_public() && t.is_none() {
         // 如果空间不是公开的，且没有验证 CWToken，则验证 SpaceToken
@@ -145,7 +162,7 @@ pub async fn post_formation(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
 
     if t.is_none() {
         // 如果没有验证 CWToken，则验证 SpaceToken
@@ -160,7 +177,13 @@ pub async fn post_formation(
         .await
         .map_err(AppError::bad_request)?;
     match ct.response_type() {
-        ContentType::Markdown(_) => Ok(ct.response(rt.content).into_response()),
+        ContentType::Markdown(_) if !rt.content.is_empty() => {
+            Ok(ct.response(rt.content).into_response())
+        }
+        // Formation queues work and answers with ids, not text: an empty
+        // markdown body would drop the conversation id, so fall back to the
+        // object form (serialized as pretty JSON text under markdown).
+        ContentType::Markdown(_) => Ok(ct.response(rt).into_response()),
         _ => Ok(ct.response(RpcResponse::success(rt)).into_response()),
     }
 }
@@ -185,12 +208,12 @@ pub async fn post_recall(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
 
     // A supplied token is verified even on public spaces so its ACL
     // restriction is honored rather than silently widened.
     let st = wiki_read_token(&space, &t, token, now_ms)?;
-    if st.as_ref().is_some_and(|st| st.labels.is_some()) {
+    if label_restricted(st.as_ref()) {
         // RecallAgent's wiki tools span all labels; a label-restricted token
         // cannot use agentic recall (mirrors the /wiki/events guard).
         return Err(AppError::with_status(
@@ -204,7 +227,12 @@ pub async fn post_recall(
         .query(SELF_USER_ID, input)
         .await
         .map_err(AppError::bad_request)?;
-    Ok(ct.response(RpcResponse::success(rt)))
+    match ct.response_type() {
+        // SKILL.md: `Accept: text/markdown` returns the result's content
+        // directly, not the RPC envelope as pretty-printed JSON.
+        ContentType::Markdown(_) => Ok(ct.response(rt.content).into_response()),
+        _ => Ok(ct.response(RpcResponse::success(rt)).into_response()),
+    }
 }
 
 /// POST /v1/{space_id}/recall_structured
@@ -231,10 +259,10 @@ pub async fn post_recall_structured(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
 
     let st = wiki_read_token(&space, &t, token, now_ms)?;
-    if st.as_ref().is_some_and(|st| st.labels.is_some()) {
+    if label_restricted(st.as_ref()) {
         // Same guard as /recall: the agent's wiki tools span all labels.
         return Err(AppError::with_status(
             StatusCode::FORBIDDEN,
@@ -246,7 +274,12 @@ pub async fn post_recall_structured(
         .query_structured(SELF_USER_ID, input)
         .await
         .map_err(AppError::bad_request)?;
-    Ok(ct.response(RpcResponse::success(rt)))
+    match ct.response_type() {
+        // Markdown negotiation returns the synthesized answer; the
+        // structured provenance is JSON/CBOR-only by nature.
+        ContentType::Markdown(_) => Ok(ct.response(rt.answer).into_response()),
+        _ => Ok(ct.response(RpcResponse::success(rt)).into_response()),
+    }
 }
 
 /// POST /v1/{space_id}/probe
@@ -277,7 +310,7 @@ pub async fn post_probe(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
 
     if !space.is_public() && t.is_none() {
         space
@@ -318,7 +351,7 @@ pub async fn post_memory_pin(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
 
     if t.is_none() {
         space
@@ -363,7 +396,7 @@ pub async fn post_memory_forget(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
 
     if t.is_none() {
         space
@@ -399,7 +432,7 @@ pub async fn get_memory_status(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
 
     if !space.is_public() && t.is_none() {
         space
@@ -475,8 +508,9 @@ fn wiki_error(err: WikiError) -> AppError {
 }
 
 /// Resolves the audit actor: the authenticated CWT user, else a stable
-/// space-token identity, else the local dev identity. Shared with the MCP
-/// channel so both audit trails name identical subjects.
+/// space-token identity, else the anonymous marker (public-space readers
+/// with no credential must not be recorded as the space's own identity).
+/// Shared with the MCP channel so both audit trails name identical subjects.
 pub(crate) fn wiki_actor(t: &Option<CWToken>, st: Option<&SpaceToken>) -> String {
     if let Some(t) = t {
         return t.user.to_string();
@@ -484,7 +518,7 @@ pub(crate) fn wiki_actor(t: &Option<CWToken>, st: Option<&SpaceToken>) -> String
     match st {
         Some(st) if !st.name.trim().is_empty() => format!("st:{}", st.name.trim()),
         Some(_) => "st:unnamed".to_string(),
-        None => SELF_USER_ID.to_string(),
+        None => "anonymous".to_string(),
     }
 }
 
@@ -506,6 +540,16 @@ fn wiki_read_token(
         Err(_) if space.is_public() => Ok(None),
         Err(_) => Err(AppError::unauthorized()),
     }
+}
+
+/// True when the space token is label-restricted (a read-only wiki viewer,
+/// PRD §8.2). Such tokens must not reach surfaces that span all labels:
+/// agentic recall (its wiki tools run unrestricted), the audit event log,
+/// and stored conversations — recall conversations persist the full runner
+/// history, including wiki tool output from behind any label. Shared with
+/// the MCP channel so the guards cannot drift apart.
+pub(crate) fn label_restricted(st: Option<&SpaceToken>) -> bool {
+    st.is_some_and(|st| st.labels.is_some())
 }
 
 /// Read scope resolution (PRD §8.2): CWT holders and label-less space
@@ -581,7 +625,7 @@ pub async fn post_wiki_commit(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
     let st = match &t {
         Some(_) => None,
         None => Some(
@@ -617,7 +661,7 @@ pub async fn list_wiki_docs(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
     let st = wiki_read_token(&space, &t, token, now_ms)?;
     let access = wiki_read_access(&t, st.as_ref());
 
@@ -658,18 +702,13 @@ pub async fn get_wiki_doc(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
     let st = wiki_read_token(&space, &t, token, now_ms)?;
     let access = wiki_read_access(&t, st.as_ref());
 
-    let doc = space
-        .wiki
-        .get_doc_scoped(&access, doc_id)
-        .await
-        .map_err(wiki_error)?;
-    let toc = space
-        .wiki
-        .read_scoped(
+    let (doc, toc) = tokio::try_join!(
+        space.wiki.get_doc_scoped(&access, doc_id),
+        space.wiki.read_scoped(
             &access,
             WikiReadInput {
                 doc_id,
@@ -677,9 +716,9 @@ pub async fn get_wiki_doc(
                 selector: WikiSelector::Toc,
             },
             now_ms,
-        )
-        .await
-        .map_err(wiki_error)?;
+        ),
+    )
+    .map_err(wiki_error)?;
     Ok(ct.response(RpcResponse::success(json!({
         "doc": doc,
         "toc": toc.toc,
@@ -706,16 +745,24 @@ pub async fn get_wiki_content(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
     let st = wiki_read_token(&space, &t, token, now_ms)?;
     let access = wiki_read_access(&t, st.as_ref());
 
     let selector = if let Some(anchor) = q.anchor {
         WikiSelector::Section { anchor }
-    } else if let (Some(start), Some(end)) = (q.start, q.end) {
-        WikiSelector::Range { start, end }
     } else {
-        WikiSelector::Full
+        match (q.start, q.end) {
+            (Some(start), Some(end)) => WikiSelector::Range { start, end },
+            (None, None) => WikiSelector::Full,
+            // Half a range is a caller mistake; silently returning the full
+            // (possibly large) document would hide it.
+            _ => {
+                return Err(AppError::bad_request(
+                    "range read requires both `start` and `end`",
+                ));
+            }
+        }
     };
     let rt = space
         .wiki
@@ -750,7 +797,7 @@ pub async fn list_wiki_versions(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
     let st = wiki_read_token(&space, &t, token, now_ms)?;
     let access = wiki_read_access(&t, st.as_ref());
 
@@ -804,7 +851,7 @@ async fn wiki_set_archived(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
     let st = match &t {
         Some(_) => None,
         None => Some(
@@ -847,7 +894,7 @@ pub async fn post_wiki_search(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
     let st = wiki_read_token(&space, &t, token, now_ms)?;
     let access = wiki_read_access(&t, st.as_ref());
 
@@ -885,7 +932,7 @@ pub async fn post_wiki_verify(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
     let st = wiki_read_token(&space, &t, token, now_ms)?;
     let access = wiki_read_access(&t, st.as_ref());
     let rt = space
@@ -913,7 +960,7 @@ pub async fn list_wiki_events(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
     let st = wiki_read_token(&space, &t, token, now_ms)?;
     let access = wiki_read_access(&t, st.as_ref());
     if access.labels.is_some() {
@@ -965,7 +1012,7 @@ pub async fn post_wiki_import(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
     let st = match &t {
         Some(_) => None,
         None => Some(
@@ -1001,7 +1048,7 @@ pub async fn get_wiki_export(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
     let st = match &t {
         Some(_) => None,
         None => Some(
@@ -1037,7 +1084,7 @@ pub async fn post_wiki_digest(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
     if t.is_none() {
         space
             .verify_space_token(token, TokenScope::Write, now_ms)
@@ -1074,7 +1121,7 @@ pub async fn post_maintenance(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
 
     if t.is_none() {
         // 如果没有验证 CWToken，则验证 SpaceToken
@@ -1120,7 +1167,7 @@ pub async fn execute_kip_readonly(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
 
     if !space.is_public() && t.is_none() {
         // 如果没有验证 CWToken，则验证 SpaceToken
@@ -1161,7 +1208,7 @@ pub async fn get_or_init_user(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
 
     if t.is_none() {
         // 如果没有验证 CWToken，则验证 SpaceToken
@@ -1201,13 +1248,17 @@ pub async fn get_conversation(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
 
-    if !space.is_public() && t.is_none() {
-        // 如果空间不是公开的，且没有验证 CWToken，则验证 SpaceToken
-        space
-            .verify_space_token(token, TokenScope::Read, now_ms)
-            .map_err(|_| AppError::unauthorized())?;
+    let st = wiki_read_token(&space, &t, token, now_ms)?;
+    if label_restricted(st.as_ref()) {
+        // Conversations persist the full runner history (recall's wiki tool
+        // output is unrestricted); a label-restricted token reading them
+        // would bypass its wiki ACL — same guard as /recall.
+        return Err(AppError::with_status(
+            StatusCode::FORBIDDEN,
+            "conversations require an unrestricted token",
+        ));
     }
 
     let rt = space
@@ -1238,13 +1289,16 @@ pub async fn get_conversation_delta(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
 
-    if !space.is_public() && t.is_none() {
-        // 如果空间不是公开的，且没有验证 CWToken，则验证 SpaceToken
-        space
-            .verify_space_token(token, TokenScope::Read, now_ms)
-            .map_err(|_| AppError::unauthorized())?;
+    let st = wiki_read_token(&space, &t, token, now_ms)?;
+    if label_restricted(st.as_ref()) {
+        // Same guard as get_conversation: the delta view exposes the same
+        // unrestricted runner history.
+        return Err(AppError::with_status(
+            StatusCode::FORBIDDEN,
+            "conversations require an unrestricted token",
+        ));
     }
 
     let rt = space
@@ -1275,12 +1329,16 @@ pub async fn list_conversations(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
 
-    if !space.is_public() && t.is_none() {
-        space
-            .verify_space_token(token, TokenScope::Read, now_ms)
-            .map_err(|_| AppError::unauthorized())?;
+    let st = wiki_read_token(&space, &t, token, now_ms)?;
+    if label_restricted(st.as_ref()) {
+        // Same guard as get_conversation: listings expose the same
+        // unrestricted runner history.
+        return Err(AppError::with_status(
+            StatusCode::FORBIDDEN,
+            "conversations require an unrestricted token",
+        ));
     }
 
     let rt = space
@@ -1314,7 +1372,7 @@ pub async fn list_space_tokens(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
 
     let rt = space.list_space_tokens().map_err(AppError::bad_request)?;
     Ok(ct.response(RpcResponse::success(rt)))
@@ -1330,21 +1388,29 @@ pub async fn add_space_token(
 ) -> Result<impl IntoResponse, AppError> {
     ensure_sharding(&app, sharding)?;
 
-    let now_ms = unix_ms();
-    let _ = app
-        .check_auth(&token, &space_id, TokenScope::Write, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
-
     let input: AddSpaceTokenInput = ct
         .parse_body(&body)
         .map_err(AppError::bad_request)?
         .value()
         .map_err(|_| AppError::bad_request("invalid input"))?;
 
+    // Minting must not escalate: an All-scoped space token unlocks endpoints
+    // (wiki export/import) that a Write CWT holder cannot call itself, so
+    // minting one requires an All-scoped CWT.
+    let required = if input.scope == TokenScope::All {
+        TokenScope::All
+    } else {
+        TokenScope::Write
+    };
+    let now_ms = unix_ms();
+    let _ = app
+        .check_auth(&token, &space_id, required, now_ms)
+        .map_err(|_| AppError::unauthorized())?;
+
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
 
     let mut data: [u8; 20] = [0; 20];
     rand::rng().fill_bytes(&mut data);
@@ -1380,12 +1446,21 @@ pub async fn revoke_space_token(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
 
-    let rt = space
-        .revoke_space_token(&input.token)
-        .await
-        .map_err(AppError::bad_request)?;
+    // Revoke by full token value, or by unique name for managers who did
+    // not save the value at mint time (list_space_tokens only shows a
+    // prefix).
+    let rt = match input.name.as_deref().map(str::trim) {
+        Some(name) if !name.is_empty() && input.token.is_empty() => space
+            .revoke_space_token_by_name(name)
+            .await
+            .map_err(AppError::bad_request)?,
+        _ => space
+            .revoke_space_token(&input.token)
+            .await
+            .map_err(AppError::bad_request)?,
+    };
     Ok(ct.response(RpcResponse::success(rt)))
 }
 
@@ -1413,7 +1488,7 @@ pub async fn update_space(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
 
     space
         .update(input, now_ms)
@@ -1446,7 +1521,7 @@ pub async fn restart_formation(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
 
     space
         .restart_formation(SELF_USER_ID, input.conversation)
@@ -1472,7 +1547,7 @@ pub async fn get_byok(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
 
     let byok = space.get_byok();
     Ok(ct.response(RpcResponse::success(byok)))
@@ -1502,7 +1577,7 @@ pub async fn update_byok(
     let space = app
         .load_space(&space_id, false)
         .await
-        .map_err(AppError::bad_request)?;
+        .map_err(|err| space_load_error(&space_id, err))?;
 
     space
         .update_byok(input)
@@ -2034,7 +2109,10 @@ mod tests {
                 Path(space_id.clone()),
                 accept_json(),
                 headers(&app),
-                json_bytes(&RevokeSpaceTokenInput { token: space_token }),
+                json_bytes(&RevokeSpaceTokenInput {
+                    token: space_token,
+                    name: None,
+                }),
             )
             .await,
         )
@@ -2187,7 +2265,11 @@ mod tests {
             .await,
         )
         .await;
-        assert_eq!(tokens["result"][0]["token"], "SThandler-secret-token");
+        // The listing must never echo the full token value (a Write-scoped
+        // manager could otherwise harvest other callers' credentials); it
+        // shows a display prefix only.
+        assert_eq!(tokens["result"][0]["token"], "SThandle…");
+        assert_ne!(tokens["result"][0]["token"], "SThandler-secret-token");
     }
 
     #[tokio::test]
@@ -2382,6 +2464,7 @@ mod tests {
                 wrong(),
                 json_bytes(&RevokeSpaceTokenInput {
                     token: "STunused".to_string(),
+                    name: None,
                 }),
             )
             .await,
@@ -2985,6 +3068,137 @@ mod tests {
             shadow_ok["result"]["compared_at"].is_number(),
             "{shadow_ok}"
         );
+    }
+
+    #[tokio::test]
+    async fn conversation_handlers_reject_label_restricted_tokens() {
+        let app = test_app_state_with_auth_enabled("handler_conv_labels", 0);
+        let space_id = "handler_conv_labels_space";
+        let space = create_loaded_space(&app, space_id).await;
+        let now = unix_ms();
+
+        let labeled_token = "SThandler-labeled".to_string();
+        space
+            .add_space_token(
+                labeled_token.clone(),
+                AddSpaceTokenInput {
+                    scope: TokenScope::Read,
+                    name: "hr-viewer".to_string(),
+                    expires_at: None,
+                    labels: Some(vec!["hr".to_string()]),
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        let plain_token = "SThandler-plain".to_string();
+        space
+            .add_space_token(
+                plain_token.clone(),
+                AddSpaceTokenInput {
+                    scope: TokenScope::Read,
+                    name: "plain-reader".to_string(),
+                    expires_at: None,
+                    labels: None,
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        let conv_id = space
+            .recall
+            .conversations
+            .add_conversation(ConversationRef::from(&Conversation {
+                user: SELF_USER_ID,
+                status: ConversationStatus::Completed,
+                label: Some("recall".to_string()),
+                created_at: now,
+                updated_at: now,
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+
+        // Recall conversations persist the unrestricted runner history; a
+        // label-restricted token must not read them through any endpoint.
+        let recall_query = || ConversationDeltaQuery {
+            messages_offset: None,
+            artifacts_offset: None,
+            collection: Some("recall".to_string()),
+        };
+        let _ = err_json(
+            get_conversation(
+                State(app.clone()),
+                Path((space_id.to_string(), conv_id.to_string())),
+                Query(recall_query()),
+                accept_json(),
+                HeaderVals(labeled_token.clone(), 0),
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+        )
+        .await;
+        let _ = err_json(
+            get_conversation_delta(
+                State(app.clone()),
+                Path((space_id.to_string(), conv_id.to_string())),
+                Query(recall_query()),
+                accept_json(),
+                HeaderVals(labeled_token.clone(), 0),
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+        )
+        .await;
+        let _ = err_json(
+            list_conversations(
+                State(app.clone()),
+                Path(space_id.to_string()),
+                Query(Pagination {
+                    cursor: None,
+                    limit: None,
+                    collection: Some("recall".to_string()),
+                }),
+                accept_json(),
+                HeaderVals(labeled_token, 0),
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+        )
+        .await;
+
+        // An unrestricted token still reads them.
+        let read = ok_json(
+            get_conversation(
+                State(app.clone()),
+                Path((space_id.to_string(), conv_id.to_string())),
+                Query(recall_query()),
+                accept_json(),
+                HeaderVals(plain_token.clone(), 0),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(read["result"]["label"], "recall");
+
+        // Unknown collection names error instead of falling through to the
+        // formation collection.
+        let _ = err_json(
+            get_conversation(
+                State(app.clone()),
+                Path((space_id.to_string(), conv_id.to_string())),
+                Query(ConversationDeltaQuery {
+                    messages_offset: None,
+                    artifacts_offset: None,
+                    collection: Some("Recall".to_string()),
+                }),
+                accept_json(),
+                HeaderVals(plain_token, 0),
+            )
+            .await,
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
     }
 
     #[tokio::test]

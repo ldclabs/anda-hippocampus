@@ -89,7 +89,7 @@ struct McpAccess {
     sharding: Option<u32>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct McpInputContext {
     #[serde(alias = "user", skip_serializing_if = "Option::is_none")]
     pub counterparty: Option<String>,
@@ -99,6 +99,24 @@ pub struct McpInputContext {
     pub source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for McpInputContext {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Reuse the HTTP channel's wire format, which also accepts a
+        // JSON-string body (LLM callers frequently double-encode `context`);
+        // the MCP channel must not be stricter than the HTTP one.
+        let context = InputContext::deserialize(deserializer)?;
+        Ok(Self {
+            counterparty: context.counterparty,
+            agent: context.agent,
+            source: context.source,
+            topic: context.topic,
+        })
+    }
 }
 
 impl From<McpInputContext> for InputContext {
@@ -385,7 +403,15 @@ impl AndaBrainMcpServer {
         })
     }
 
-    async fn load_configured_space(&self, space_id: &str) -> Result<Arc<Space>, ErrorData> {
+    /// `owner` is the verified caller when one exists (remote auto-create
+    /// requires a write CWT); the local stdio mode falls back to
+    /// `SELF_USER_ID`. Recording the real principal keeps
+    /// `get_space_info.owner` truthful.
+    async fn load_configured_space(
+        &self,
+        space_id: &str,
+        owner: Principal,
+    ) -> Result<Arc<Space>, ErrorData> {
         match self.app.load_space(space_id, false).await {
             Ok(space) => Ok(space),
             Err(load_err) if self.config.auto_create_space => {
@@ -393,7 +419,7 @@ impl AndaBrainMcpServer {
                     .app
                     .admin_create_space(
                         SELF_USER_ID,
-                        SELF_USER_ID,
+                        owner,
                         space_id.to_string(),
                         self.config.auto_create_tier,
                         unix_ms(),
@@ -489,7 +515,8 @@ impl AndaBrainMcpServer {
                         None,
                     ));
                 }
-                self.app
+                let creator = self
+                    .app
                     .check_auth(
                         &access.auth_token,
                         &access.space_id,
@@ -497,7 +524,10 @@ impl AndaBrainMcpServer {
                         now_ms,
                     )
                     .map_err(|_| unauthorized(TokenScope::Write))?;
-                self.load_configured_space(&access.space_id).await?
+                // The verified write-CWT principal owns the space it caused
+                // to be created; `SELF_USER_ID` would misreport ownership.
+                self.load_configured_space(&access.space_id, creator.user)
+                    .await?
             }
             Err(err) => return Err(err),
         };
@@ -518,7 +548,9 @@ impl AndaBrainMcpServer {
         if self.config.dynamic_space_from_path {
             return Ok(());
         }
-        self.load_configured_space(&self.config.space_id)
+        // Local fixed-space (stdio) mode has no authenticated caller; the
+        // space belongs to the local dev identity.
+        self.load_configured_space(&self.config.space_id, SELF_USER_ID)
             .await
             .map(|_| ())
     }
@@ -633,7 +665,17 @@ impl AndaBrainMcpServer {
         access: &McpAccess,
         input: ListConversationsInput,
     ) -> Result<CallToolResult, ErrorData> {
-        let space = self.load_authorized_space(TokenScope::Read, access).await?;
+        let (space, _cwt, st) = self
+            .load_authorized_space_with_token(TokenScope::Read, access)
+            .await?;
+        if crate::handler::label_restricted(st.as_ref()) {
+            // Conversations persist the full runner history (recall's wiki
+            // tools run unrestricted); same guard as the HTTP channel.
+            return Err(ErrorData::invalid_request(
+                "conversations require an unrestricted token",
+                None,
+            ));
+        }
         let (conversations, next_cursor) = space
             .list_conversations(input.collection, input.cursor, input.limit)
             .await
@@ -649,7 +691,16 @@ impl AndaBrainMcpServer {
         access: &McpAccess,
         input: GetConversationInput,
     ) -> Result<CallToolResult, ErrorData> {
-        let space = self.load_authorized_space(TokenScope::Read, access).await?;
+        let (space, _cwt, st) = self
+            .load_authorized_space_with_token(TokenScope::Read, access)
+            .await?;
+        if crate::handler::label_restricted(st.as_ref()) {
+            // Same guard as list_conversations_for / the HTTP channel.
+            return Err(ErrorData::invalid_request(
+                "conversations require an unrestricted token",
+                None,
+            ));
+        }
         let conversation = space
             .get_conversation(input.collection, input.conversation_id)
             .await
@@ -693,9 +744,10 @@ impl AndaBrainMcpServer {
             .load_authorized_space_with_token(TokenScope::Read, access)
             .await?;
         let scope = crate::handler::wiki_read_access(&cwt, st.as_ref());
+        let input = WikiSearchInput::try_from(input)?;
         let output = space
             .wiki
-            .search_scoped(&scope, input.into(), unix_ms())
+            .search_scoped(&scope, input, unix_ms())
             .await
             .map_err(wiki_tool_error)?;
         structured_result(output)
@@ -813,20 +865,31 @@ pub struct WikiSearchToolInput {
     pub expand: Option<u8>,
 }
 
-impl From<WikiSearchToolInput> for WikiSearchInput {
-    fn from(input: WikiSearchToolInput) -> Self {
-        Self {
+impl TryFrom<WikiSearchToolInput> for WikiSearchInput {
+    type Error = ErrorData;
+
+    fn try_from(input: WikiSearchToolInput) -> Result<Self, Self::Error> {
+        // The HTTP channel rejects unknown modes; the MCP channel must not
+        // silently degrade them to "chunks" (an LLM typo like "documents"
+        // would quietly change the result shape).
+        let mode = match input.mode.as_deref() {
+            Some("docs") => WikiSearchMode::Docs,
+            Some("chunks") | None => WikiSearchMode::Chunks,
+            Some(other) => {
+                return Err(invalid_params(format!(
+                    "invalid mode {other:?} (expected \"chunks\" or \"docs\")"
+                )));
+            }
+        };
+        Ok(Self {
             query: input.query,
             namespaces: input.namespaces.unwrap_or_default(),
             doc_ids: input.doc_ids.unwrap_or_default(),
             tags: input.tags.unwrap_or_default(),
             top_k: input.top_k,
-            mode: match input.mode.as_deref() {
-                Some("docs") => WikiSearchMode::Docs,
-                _ => WikiSearchMode::Chunks,
-            },
+            mode,
             expand: input.expand,
-        }
+        })
     }
 }
 

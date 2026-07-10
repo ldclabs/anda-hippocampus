@@ -39,7 +39,11 @@ pub struct MemoryUsage {
     /// Unix ms of the newest production recall that surfaced this entity.
     pub last_recalled_at: u64,
 
-    /// Times this entity was observed superseded/corrected.
+    /// 1 once the entity has been observed superseded/corrected.
+    /// `record_correction` deliberately deduplicates — repeat observations of
+    /// the same supersede event must not compound the correction penalty —
+    /// so despite the name this is a flag, kept as a count for schema
+    /// compatibility.
     pub correction_count: u64,
 
     /// Unix ms when the newest correction was observed.
@@ -226,12 +230,13 @@ impl UsageLedger {
         now_ms: u64,
     ) -> Result<(), DBError> {
         let _guard = self.write_lock.lock().await;
-        let current = self
-            .collection
-            .get_as::<MemoryUsage>(id)
-            .await
-            .map(|row| row.recall_count)
-            .unwrap_or(recall_count);
+        let current = match self.collection.get_as::<MemoryUsage>(id).await {
+            Ok(row) => row.recall_count,
+            // Row already removed (forget cascade racing the settlement
+            // scan): there is nothing left to settle for this entity, and
+            // erroring here would abort the whole reinforcement pass.
+            Err(_) => return Ok(()),
+        };
         let dirty = if current > recall_count { 1 } else { 0 };
         self.collection
             .update(
@@ -431,6 +436,11 @@ impl MissCache {
         if key.is_empty() || key.chars().count() > MISS_QUERY_MAX_CHARS {
             return Ok(());
         }
+        let _guard = self.write_lock.lock().await;
+        // Compare against the clear stamp only *after* taking the lock: a
+        // clear() that runs between an early check and the lock would
+        // otherwise let this stale miss be written back, masking a query the
+        // just-formed memory can now answer for up to the TTL.
         if searched_at_ms
             <= self
                 .last_cleared_ms
@@ -438,7 +448,6 @@ impl MissCache {
         {
             return Ok(());
         }
-        let _guard = self.write_lock.lock().await;
         match self.get(&key).await? {
             Some(row) => {
                 self.collection

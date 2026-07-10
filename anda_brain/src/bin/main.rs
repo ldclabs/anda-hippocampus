@@ -5,8 +5,9 @@ use anda_engine::{
     model::{ModelConfig, Models, Proxy, request_client_builder, reqwest},
 };
 use anda_object_store::MetaStoreBuilder;
-use axum::{Router, routing};
+use axum::{Router, error_handling::HandleErrorLayer, routing};
 use clap::{Parser, Subcommand};
+use http::StatusCode;
 use mimalloc::MiMalloc;
 use object_store::{
     ObjectStore,
@@ -18,8 +19,9 @@ use std::{
     collections::BTreeSet, fmt::Write as _, net::SocketAddr, path::Path, sync::Arc, time::Duration,
 };
 use structured_logger::{Builder, async_json::new_writer, get_env_level};
-use tokio::signal;
+use tokio::{signal, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
+use tower::{ServiceBuilder, limit::GlobalConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::{
     compression::CompressionLayer,
     cors::{AllowHeaders, AllowMethods, CorsLayer},
@@ -28,8 +30,9 @@ use tower_http::{
 use anda_brain::{
     agents::{SELF_USER_ID, prompts, prompts::PromptTarget},
     eval::{
-        EvalExperimentReport, EvalGate, EvalGateReport, EvalProfile, EvalReport, EvalScenario,
-        EvalScore, EvalSuiteReport, EvalValidationReport, EvalValidationSeverity,
+        EvalExperimentReport, EvalFinding, EvalFindingKind, EvalGate, EvalGateReport, EvalProfile,
+        EvalReport, EvalScenario, EvalScore, EvalSuiteReport, EvalTurnReport, EvalValidationReport,
+        EvalValidationSeverity,
         mine::{MineConfig, mine_scenarios},
         optimize::{BoxedFitness, GenomeKind, OptimizeConfig, OptimizeReport, run_optimize},
         run_formation_phase, run_policy_phase, run_scenario, shared_formation_issues,
@@ -99,6 +102,22 @@ struct Cli {
     /// CORS allowed origins, separated by comma. Use "*" to allow all origins.
     #[arg(long, env = "CORS_ORIGINS", default_value = "")]
     cors_origins: String,
+
+    /// Global cap on in-flight HTTP requests; excess requests are shed with
+    /// 503 instead of queueing without bound. The default is deliberately
+    /// generous so normal multi-tenant traffic never hits it; it only bounds
+    /// pathological floods.
+    #[arg(long, env = "HTTP_MAX_CONCURRENCY", default_value_t = 1024)]
+    http_max_concurrency: usize,
+
+    /// Cap on concurrent LLM-billed requests (formation, recall,
+    /// recall_structured, maintenance, shadow_eval, wiki digest); excess is
+    /// shed with 429. Each such request can drive a full multi-turn model
+    /// round (recall may run for over a minute), so this bounds worst-case
+    /// model spend from anonymous callers on public spaces. The default is
+    /// loose enough for normal multi-tenant use.
+    #[arg(long, env = "LLM_MAX_CONCURRENCY", default_value_t = 64)]
+    llm_max_concurrency: usize,
 
     /// Enable the Streamable HTTP MCP endpoint mounted with the HTTP service
     #[arg(
@@ -383,10 +402,10 @@ fn build_http_client(cli: &Cli) -> Result<reqwest::Client, BoxError> {
 
 fn parse_managers(input: &str) -> Result<BTreeSet<Principal>, BoxError> {
     let mut managers = BTreeSet::new();
-    if !input.is_empty() {
-        for id in input.split(',') {
-            managers.insert(Principal::from_text(id)?);
-        }
+    // Tolerate whitespace around entries and stray commas ("a, b," would
+    // otherwise fail on " b" and ""); a malformed id still fails startup.
+    for id in input.split(',').map(str::trim).filter(|id| !id.is_empty()) {
+        managers.insert(Principal::from_text(id)?);
     }
     Ok(managers)
 }
@@ -455,12 +474,82 @@ fn mcp_http_config_from_cli(cli: &Cli) -> McpHttpServerConfig {
     }
 }
 
+/// Wraps `router` in a shared in-flight request cap: at most `max_in_flight`
+/// requests run at once and excess requests are shed immediately with
+/// `shed_status` instead of queueing without bound.
+///
+/// `GlobalConcurrencyLimitLayer` shares one semaphore across every route of
+/// the router (axum applies a layer to each route separately, so the plain
+/// `ConcurrencyLimitLayer` would be a per-route limit). `LoadShedLayer`
+/// turns "no permit available" into an error and `HandleErrorLayer` maps
+/// that error to an HTTP response, which axum requires: its services must
+/// be infallible.
+fn with_concurrency_limit<S>(
+    router: Router<S>,
+    max_in_flight: usize,
+    shed_status: StatusCode,
+) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router.layer(
+        ServiceBuilder::new()
+            .layer(HandleErrorLayer::new(
+                move |err: tower::BoxError| async move {
+                    if err.is::<tower::load_shed::error::Overloaded>() {
+                        (
+                            shed_status,
+                            "too many concurrent requests, retry later".to_string(),
+                        )
+                    } else {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("unhandled middleware error: {err}"),
+                        )
+                    }
+                },
+            ))
+            .layer(LoadShedLayer::new())
+            // `max(1)` keeps a misconfigured `0` from shedding every request.
+            .layer(GlobalConcurrencyLimitLayer::new(max_in_flight.max(1))),
+    )
+}
+
 // grcov-excl-start: route registration is verified through direct handler tests; axum's builder chain gives low-value line coverage.
 fn build_router(
     app_state: AppState,
     cli: &Cli,
     cancel_token: CancellationToken,
 ) -> Router<AppState> {
+    // Endpoints that can each drive a full multi-turn LLM round. They share
+    // a stricter concurrency cap so anonymous callers on public spaces
+    // cannot turn unbounded request concurrency into unbounded model spend.
+    // Default `LLM_MAX_CONCURRENCY=64` is loose: it never throttles normal
+    // multi-tenant traffic, it only bounds floods.
+    let llm_router = with_concurrency_limit(
+        Router::new()
+            .route("/v1/{space_id}/formation", routing::post(post_formation))
+            .route("/v1/{space_id}/recall", routing::post(post_recall))
+            .route(
+                "/v1/{space_id}/recall_structured",
+                routing::post(post_recall_structured),
+            )
+            .route(
+                "/v1/{space_id}/maintenance",
+                routing::post(post_maintenance),
+            )
+            .route(
+                "/v1/{space_id}/management/shadow_eval",
+                routing::post(post_shadow_eval),
+            )
+            .route(
+                "/v1/{space_id}/wiki/digest",
+                routing::post(post_wiki_digest),
+            ),
+        cli.llm_max_concurrency,
+        StatusCode::TOO_MANY_REQUESTS,
+    );
+
     let mut router = Router::new()
         .route("/favicon.ico", routing::get(favicon))
         .route("/apple-touch-icon.webp", routing::get(apple_touch_icon))
@@ -472,12 +561,6 @@ fn build_router(
             "/v1/{space_id}/formation_status",
             routing::get(get_formation_status),
         )
-        .route("/v1/{space_id}/formation", routing::post(post_formation))
-        .route("/v1/{space_id}/recall", routing::post(post_recall))
-        .route(
-            "/v1/{space_id}/recall_structured",
-            routing::post(post_recall_structured),
-        )
         .route("/v1/{space_id}/probe", routing::post(post_probe))
         .route("/v1/{space_id}/memory/pin", routing::post(post_memory_pin))
         .route(
@@ -487,14 +570,6 @@ fn build_router(
         .route(
             "/v1/{space_id}/memory_status",
             routing::get(get_memory_status),
-        )
-        .route(
-            "/v1/{space_id}/management/shadow_eval",
-            routing::post(post_shadow_eval),
-        )
-        .route(
-            "/v1/{space_id}/maintenance",
-            routing::post(post_maintenance),
         )
         .route(
             "/v1/{space_id}/wiki/docs",
@@ -534,10 +609,6 @@ fn build_router(
             routing::post(post_wiki_import),
         )
         .route("/v1/{space_id}/wiki/export", routing::get(get_wiki_export))
-        .route(
-            "/v1/{space_id}/wiki/digest",
-            routing::post(post_wiki_digest),
-        )
         .route(
             "/v1/{space_id}/execute_kip_readonly",
             routing::post(execute_kip_readonly),
@@ -591,6 +662,13 @@ fn build_router(
             routing::post(update_space_tier),
         )
         .route("/admin/create_space", routing::post(create_space))
+        .merge(llm_router)
+        // Error bodies follow the Accept header like success bodies do
+        // (SKILL.md content negotiation); `AppError` itself cannot see the
+        // request headers, so this middleware re-encodes for CBOR clients.
+        .layer(axum::middleware::from_fn(
+            anda_brain::payload::negotiate_error_encoding,
+        ))
         .layer(CompressionLayer::new());
 
     if cli.mcp_http_enabled {
@@ -601,26 +679,48 @@ fn build_router(
         router = router.nest_service(&path_prefix, mcp_service);
     }
 
-    router
+    // Global backstop over every route, the nested MCP endpoint included
+    // (MCP tool calls are only covered by this outer cap): beyond
+    // `HTTP_MAX_CONCURRENCY` in-flight requests the service sheds with 503
+    // instead of accumulating unbounded queued work.
+    with_concurrency_limit(
+        router,
+        cli.http_max_concurrency,
+        StatusCode::SERVICE_UNAVAILABLE,
+    )
 }
 // grcov-excl-stop
 
-fn build_cors(cors_origins: &str) -> CorsLayer {
-    if cors_origins.is_empty() {
-        CorsLayer::new()
+fn build_cors(cors_origins: &str) -> Result<CorsLayer, BoxError> {
+    if cors_origins.trim().is_empty() {
+        Ok(CorsLayer::new())
     } else if cors_origins.trim() == "*" {
-        CorsLayer::very_permissive()
+        Ok(CorsLayer::very_permissive())
     } else {
-        let origins: Vec<http::HeaderValue> = cors_origins
+        // A silently dropped origin would ship a service that "has CORS
+        // configured" but rejects the intended frontend; fail startup loudly
+        // instead.
+        let mut origins: Vec<http::HeaderValue> = Vec::new();
+        for origin in cors_origins
             .split(',')
-            .filter_map(|s| s.trim().parse().ok())
-            .collect();
-        CorsLayer::new()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            origins.push(
+                origin
+                    .parse()
+                    .map_err(|err| format!("invalid CORS origin {origin:?}: {err}"))?,
+            );
+        }
+        if origins.is_empty() {
+            return Err(format!("CORS_ORIGINS contains no valid origin: {cors_origins:?}").into());
+        }
+        Ok(CorsLayer::new()
             .allow_origin(origins)
             .allow_credentials(true)
             .max_age(Duration::from_secs(86400))
             .allow_headers(AllowHeaders::mirror_request())
-            .allow_methods(AllowMethods::mirror_request())
+            .allow_methods(AllowMethods::mirror_request()))
     }
 }
 
@@ -726,7 +826,7 @@ fn build_service_runtime(
 ) -> Result<ServiceRuntime, BoxError> {
     let (app_state, db_type) = build_app_state(cli)?;
     let app = build_router(app_state.clone(), cli, cancel_token)
-        .layer(build_cors(&cli.cors_origins))
+        .layer(build_cors(&cli.cors_origins)?)
         .with_state(app_state.clone());
     let addr: SocketAddr = cli.addr.parse()?;
 
@@ -779,8 +879,49 @@ async fn run_service(
         db_type,
         model_name
     );
+    if db_type == "memory" {
+        log::warn!(
+            target: "brain",
+            "WARNING: in-memory storage is active (no `local` or `aws` storage subcommand); ALL long-term memory will be LOST when the process exits. Configure persistent storage for production."
+        );
+    }
 
-    let _ = tokio::join!(server_handle, spaces_handle);
+    join_service_tasks(server_handle, spaces_handle, global_cancel_token).await
+}
+
+/// Awaits both service tasks. Neither should finish on its own: the server
+/// runs until the graceful-shutdown signal and the background tasks run
+/// until the global cancel token fires. If one exits early (server accept
+/// loop error, or a panic in either task), cancel the token so the peer
+/// shuts down too, and propagate the failure so the process exits non-zero.
+/// Without this the process would keep running with no listener — a zombie
+/// an orchestrator never restarts.
+async fn join_service_tasks(
+    mut server_handle: JoinHandle<std::io::Result<()>>,
+    mut spaces_handle: JoinHandle<()>,
+    cancel_token: CancellationToken,
+) -> Result<(), BoxError> {
+    let (server_res, spaces_res) = tokio::select! {
+        res = &mut server_handle => {
+            if !cancel_token.is_cancelled() {
+                log::error!(target: "brain", "server task exited before shutdown was requested; stopping background tasks");
+            }
+            cancel_token.cancel();
+            (res, spaces_handle.await)
+        }
+        res = &mut spaces_handle => {
+            if !cancel_token.is_cancelled() {
+                log::error!(target: "brain", "space background task exited before shutdown was requested; stopping server");
+            }
+            cancel_token.cancel();
+            (server_handle.await, res)
+        }
+    };
+
+    server_res
+        .map_err(|err| format!("server task failed: {err}"))?
+        .map_err(|err| format!("server exited with error: {err}"))?;
+    spaces_res.map_err(|err| format!("space background task failed: {err}"))?;
     Ok(())
 }
 
@@ -1329,17 +1470,61 @@ async fn run_eval_suite(
             &scenario.id,
             &env.run_id.to_string(),
         ]);
-        let space = load_eval_space(env, &scenario_space_id).await?;
-        // Close and clean the run-scoped space even when the scenario fails;
-        // otherwise every aborted run leaks its objects into the store.
-        let result = run_scenario(space.as_ref(), scenario, &profile.profile).await;
-        let close_result = space.db.close().await;
-        cleanup_eval_space(&env.app_state, &scenario_space_id, env.keep_spaces).await;
-        reports.push(result?);
-        close_result?;
+        let result = match load_eval_space(env, &scenario_space_id).await {
+            Ok(space) => {
+                // Close and clean the run-scoped space even when the scenario
+                // fails; otherwise every aborted run leaks its objects into
+                // the store. Close failures only warn: the space is deleted
+                // right after, so there is nothing durable to lose.
+                let result = run_scenario(space.as_ref(), scenario, &profile.profile).await;
+                if let Err(err) = space.db.close().await {
+                    eprintln!("warning: failed to close eval space {scenario_space_id}: {err}");
+                }
+                cleanup_eval_space(&env.app_state, &scenario_space_id, env.keep_spaces).await;
+                result
+            }
+            Err(err) => Err(err),
+        };
+        // One scenario's failure must not discard the other (paid) scenario
+        // reports: record it as a zero-score report with a finding so the
+        // suite mean is not silently inflated either, and keep going.
+        reports.push(match result {
+            Ok(report) => report,
+            Err(err) => {
+                eprintln!("warning: eval scenario `{}` aborted: {err}", scenario.id);
+                failed_scenario_report(scenario, &profile.id, err.as_ref())
+            }
+        });
     }
 
     Ok(EvalSuiteReport::from_reports(profile.id.clone(), reports))
+}
+
+/// Zero-score stand-in for a scenario that aborted before producing a
+/// report. Dropping the scenario instead would inflate the suite mean —
+/// poisonous when the suite is an optimizer fitness function or gated.
+fn failed_scenario_report(
+    scenario: &EvalScenario,
+    profile_id: &str,
+    err: &(dyn std::error::Error + Send + Sync),
+) -> EvalReport {
+    let mut report = EvalReport {
+        scenario_id: scenario.id.clone(),
+        description: scenario.description.clone(),
+        profile_id: Some(profile_id.to_string()),
+        started_at: Some(anda_engine::rfc3339_datetime_now()),
+        ..Default::default()
+    };
+    report.turns.push(EvalTurnReport {
+        findings: vec![EvalFinding {
+            kind: EvalFindingKind::JudgeError,
+            expectation_id: None,
+            message: format!("scenario aborted before completion: {err}"),
+        }],
+        ..Default::default()
+    });
+    report.attribution.judge_error = 1;
+    report
 }
 
 /// Best-effort removal of a run-scoped eval space once its report is
@@ -1500,7 +1685,7 @@ async fn run_optimize_command(
                 as futures::future::BoxFuture<'static, Result<EvalSuiteReport, BoxError>>
         }))
     };
-    let report = run_optimize(
+    let outcome = run_optimize(
         proposer.as_ref(),
         &config,
         move |generation| {
@@ -1519,12 +1704,41 @@ async fn run_optimize_command(
     prompts::clear_overrides();
     MemoryPolicy::set_eval_override(None);
     cleanup_eval_space(&env.app_state, &proposer_id, env.keep_spaces).await;
-    let report = match report {
+    let report = match outcome {
         Ok(report) => report,
-        Err(err) => return Err(err),
+        Err(abort) => {
+            // Accepted generations are full paid suite replays: persist
+            // whatever completed before the failure instead of losing it.
+            if let Some(partial) = abort.partial.as_deref() {
+                write_optimize_artifacts(out_dir, partial)?;
+                return Err(format!(
+                    "optimize run aborted after {} generation(s); the partial report and accepted genomes were written to {out_dir}: {}",
+                    partial.generations.len(),
+                    abort.error
+                )
+                .into());
+            }
+            return Err(abort.error);
+        }
     };
     close_result?;
 
+    write_optimize_artifacts(out_dir, &report)?;
+    let report_output = if summary_only {
+        optimize_summary(&report, out_dir)
+    } else {
+        serde_json::to_string_pretty(&report)?
+    };
+    match output_path {
+        Some(path) => std::fs::write(path, report_output)?,
+        None => println!("{report_output}"),
+    }
+    Ok(())
+}
+
+/// Writes the optimize report and accepted genomes for human review; also
+/// used to preserve partial results when a run aborts mid-way.
+fn write_optimize_artifacts(out_dir: &str, report: &OptimizeReport) -> Result<(), BoxError> {
     std::fs::create_dir_all(out_dir)?;
     for accepted in &report.accepted_prompts {
         let filename = match accepted.target {
@@ -1540,21 +1754,10 @@ async fn run_optimize_command(
             serde_json::to_string_pretty(policy)?,
         )?;
     }
-    let report_json = serde_json::to_string_pretty(&report)?;
     std::fs::write(
         Path::new(out_dir).join("optimize_report.json"),
-        &report_json,
+        serde_json::to_string_pretty(report)?,
     )?;
-
-    let report_output = if summary_only {
-        optimize_summary(&report, out_dir)
-    } else {
-        report_json
-    };
-    match output_path {
-        Some(path) => std::fs::write(path, report_output)?,
-        None => println!("{report_output}"),
-    }
     Ok(())
 }
 
@@ -1821,11 +2024,10 @@ async fn main() -> Result<(), BoxError> {
     let cli = Cli::parse();
 
     match &cli.command {
-        // MCP stdio keeps stdout reserved for JSON-RPC messages.
-        Some(Commands::Mcp { .. }) => {}
-        // Eval reserves stdout for reports; logs (judge fallbacks, space
-        // setup) go to stderr instead of being silently dropped.
-        Some(Commands::Eval { .. }) => {
+        // MCP stdio keeps stdout reserved for JSON-RPC messages and eval
+        // reserves stdout for reports; logs (auth failures, space setup,
+        // judge fallbacks) go to stderr instead of being silently dropped.
+        Some(Commands::Mcp { .. }) | Some(Commands::Eval { .. }) => {
             Builder::with_level(&get_env_level().to_string())
                 .with_target_writer("*", new_writer(tokio::io::stderr()))
                 .init();
@@ -1981,10 +2183,11 @@ mod tests {
     use super::{
         AnyHost, Cli, Commands, EvalCommandConfig, EvalCommandReport, MAX_SPACE_ID_LEN,
         StorageCommand, build_cors, build_http_client, build_router, build_service_runtime,
-        compose_space_id, create_reuse_port_listener, default_db_config, mcp_http_config_from_cli,
-        model_config_from_cli, normalize_http_path_prefix, object_store_from_command,
-        parse_ed25519_pubkeys, parse_managers, read_json_file, run_eval_command, run_service,
-        sanitize_space_id_part, split_csv_values,
+        compose_space_id, create_reuse_port_listener, default_db_config, join_service_tasks,
+        mcp_http_config_from_cli, model_config_from_cli, normalize_http_path_prefix,
+        object_store_from_command, parse_ed25519_pubkeys, parse_managers, read_json_file,
+        run_eval_command, run_service, sanitize_space_id_part, split_csv_values,
+        with_concurrency_limit,
     };
     use anda_brain::agents::SELF_USER_ID;
     use anda_brain::eval::{AttributionSummary, EvalGate, EvalReport, EvalScenario, EvalScore};
@@ -2009,6 +2212,8 @@ mod tests {
             sharding_idx: 7,
             managers: String::new(),
             cors_origins: String::new(),
+            http_max_concurrency: 1024,
+            llm_max_concurrency: 64,
             mcp_http_enabled: true,
             mcp_http_path_prefix: "/mcp".to_string(),
             mcp_http_allowed_hosts: String::new(),
@@ -2053,9 +2258,15 @@ mod tests {
 
         let (app_state, _) = super::build_app_state(&test_cli()).unwrap();
         let _ = build_router(app_state, &test_cli(), CancellationToken::new());
-        let _ = build_cors("");
-        let _ = build_cors("*");
-        let _ = build_cors("https://example.test, https://app.example.test");
+        let _ = build_cors("").unwrap();
+        let _ = build_cors("  ").unwrap();
+        let _ = build_cors("*").unwrap();
+        let _ = build_cors("https://example.test, https://app.example.test,").unwrap();
+        // An origin that fails HeaderValue parsing (embedded DEL byte) must
+        // abort startup instead of being silently dropped.
+        assert!(build_cors("https://example.test,bad\u{7f}origin").is_err());
+        // Only separators and whitespace is a configuration mistake too.
+        assert!(build_cors(",").is_err());
 
         assert_eq!(normalize_http_path_prefix("mcp/"), "/mcp");
         assert_eq!(
@@ -2103,7 +2314,14 @@ mod tests {
         assert_eq!(managers.len(), 1);
         assert!(managers.contains(&SELF_USER_ID));
 
+        // Whitespace around ids and stray commas are tolerated.
+        let managers = parse_managers(&format!(" {SELF_USER_ID} , ,{SELF_USER_ID},")).unwrap();
+        assert_eq!(managers.len(), 1);
+        assert!(managers.contains(&SELF_USER_ID));
+        assert!(parse_managers(" , ").unwrap().is_empty());
+
         assert!(parse_managers("not a principal").is_err());
+        assert!(parse_managers(&format!("{SELF_USER_ID},not a principal")).is_err());
     }
 
     #[test]
@@ -2450,5 +2668,125 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn join_service_tasks_cancels_peer_and_propagates_server_error() {
+        let cancel = CancellationToken::new();
+        let server: tokio::task::JoinHandle<std::io::Result<()>> =
+            tokio::spawn(async { Err(std::io::Error::other("accept loop died")) });
+        // Models `start_background_tasks`: runs until the token fires.
+        let peer_token = cancel.clone();
+        let spaces = tokio::spawn(async move { peer_token.cancelled().await });
+
+        let err = timeout(
+            Duration::from_secs(2),
+            join_service_tasks(server, spaces, cancel.clone()),
+        )
+        .await
+        .expect("must not hang once the server task is gone")
+        .unwrap_err();
+
+        assert!(cancel.is_cancelled(), "peer task must be cancelled");
+        assert!(err.to_string().contains("accept loop died"));
+    }
+
+    #[tokio::test]
+    async fn join_service_tasks_cancels_server_when_background_task_dies() {
+        let cancel = CancellationToken::new();
+        let server_token = cancel.clone();
+        let server: tokio::task::JoinHandle<std::io::Result<()>> = tokio::spawn(async move {
+            server_token.cancelled().await;
+            Ok(())
+        });
+        let spaces = tokio::spawn(async { panic!("background task crashed") });
+
+        let err = timeout(
+            Duration::from_secs(2),
+            join_service_tasks(server, spaces, cancel.clone()),
+        )
+        .await
+        .expect("must not hang once the background task is gone")
+        .unwrap_err();
+
+        assert!(cancel.is_cancelled(), "server must be told to shut down");
+        assert!(err.to_string().contains("space background task failed"));
+    }
+
+    #[tokio::test]
+    async fn join_service_tasks_is_clean_on_graceful_shutdown() {
+        let cancel = CancellationToken::new();
+        let server_token = cancel.clone();
+        let server: tokio::task::JoinHandle<std::io::Result<()>> = tokio::spawn(async move {
+            server_token.cancelled().await;
+            Ok(())
+        });
+        let spaces_token = cancel.clone();
+        let spaces = tokio::spawn(async move { spaces_token.cancelled().await });
+        cancel.cancel();
+
+        timeout(
+            Duration::from_secs(2),
+            join_service_tasks(server, spaces, cancel),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn with_concurrency_limit_sheds_excess_requests() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let handler_started = started.clone();
+        let app = with_concurrency_limit(
+            axum::Router::new()
+                .route(
+                    "/hang",
+                    super::routing::get(move || {
+                        let started = handler_started.clone();
+                        async move {
+                            started.notify_one();
+                            // Hold the single permit forever.
+                            std::future::pending::<String>().await
+                        }
+                    }),
+                )
+                .route("/other", super::routing::get(|| async { "ok" })),
+            1,
+            http::StatusCode::SERVICE_UNAVAILABLE,
+        );
+
+        let hanging = app.clone();
+        let first = tokio::spawn(async move {
+            let _ = hanging
+                .oneshot(http::Request::get("/hang").body(Body::empty()).unwrap())
+                .await;
+        });
+        // The permit is acquired before the handler body runs, so once the
+        // handler has signalled, the sole permit is provably taken.
+        timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+
+        let res = app
+            .clone()
+            .oneshot(http::Request::get("/hang").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+
+        // Requests to other routes are shed too: the cap is shared across
+        // the whole router, not per route.
+        let res = app
+            .clone()
+            .oneshot(http::Request::get("/other").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+
+        first.abort();
     }
 }

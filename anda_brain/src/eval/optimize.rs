@@ -452,37 +452,168 @@ pub struct AcceptedPrompt {
 pub type BoxedFitness =
     Box<dyn FnMut(usize) -> BoxFuture<'static, Result<EvalSuiteReport, BoxError>> + Send>;
 
+/// A failed optimize run: the underlying error plus the report of everything
+/// decided before it, so callers can persist already-accepted generations —
+/// each one is a full paid suite replay — instead of losing them to a single
+/// transient failure.
+#[derive(Debug)]
+pub struct OptimizeAbort {
+    /// Report accumulated before the failure, with the accepted genomes
+    /// attached. `None` only when the baseline evaluation itself failed and
+    /// there is nothing worth persisting.
+    pub partial: Option<Box<OptimizeReport>>,
+    pub error: BoxError,
+}
+
+impl std::fmt::Display for OptimizeAbort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "optimize run aborted: {}", self.error)
+    }
+}
+
+impl std::error::Error for OptimizeAbort {}
+
 /// The candidate genome one generation proposes.
 enum Candidate {
     Prompt { target: PromptTarget, text: String },
     Policy { policy: MemoryPolicy },
 }
 
+/// Tracks the last-known-good prompt text of every target this run touched
+/// and reinstalls it on drop. Symmetric to `EvalPolicyOverrideGuard` for the
+/// prompt genome: an early return or panic between candidate install and the
+/// accept decision can never leak an unvalidated prompt into later evals
+/// through the process-wide override layer. On a clean return the restore is
+/// a no-op — the installed state already equals the last accepted state.
+struct PromptGenomeGuard {
+    restore: Vec<(PromptTarget, String)>,
+}
+
+impl PromptGenomeGuard {
+    fn new() -> Self {
+        Self {
+            restore: Vec::new(),
+        }
+    }
+
+    /// Records the pre-candidate text the first time a target is touched.
+    /// This is the run's starting genome for that target — the state that
+    /// produced the baseline — so rejections restore it rather than the
+    /// compiled default (which may differ when the caller pre-installed an
+    /// override).
+    fn note_target(&mut self, target: PromptTarget, current: &str) {
+        if !self.restore.iter().any(|(kept, _)| *kept == target) {
+            self.restore.push((target, current.to_string()));
+        }
+    }
+
+    /// An accepted candidate becomes the target's new restore point.
+    fn accept(&mut self, target: PromptTarget, text: &str) {
+        for (kept, restore) in &mut self.restore {
+            if *kept == target {
+                *restore = text.to_string();
+            }
+        }
+    }
+
+    fn last_good(&self, target: PromptTarget) -> Option<String> {
+        self.restore
+            .iter()
+            .find(|(kept, _)| *kept == target)
+            .map(|(_, text)| text.clone())
+    }
+}
+
+impl Drop for PromptGenomeGuard {
+    fn drop(&mut self) {
+        for (target, text) in &self.restore {
+            prompts::set_override(*target, Some(text.clone()));
+        }
+    }
+}
+
+/// Reinstalls the last accepted genome state (or the run's starting state)
+/// after a rejected or aborted candidate.
+fn restore_candidate(
+    candidate: &Candidate,
+    prompt_guard: &PromptGenomeGuard,
+    accepted_policy: &Option<MemoryPolicy>,
+    initial_policy: &Option<MemoryPolicy>,
+) {
+    match candidate {
+        Candidate::Prompt { target, .. } => {
+            prompts::set_override(*target, prompt_guard.last_good(*target));
+        }
+        Candidate::Policy { .. } => {
+            MemoryPolicy::set_eval_override(
+                accepted_policy.clone().or_else(|| initial_policy.clone()),
+            );
+        }
+    }
+}
+
+/// Attaches the accepted genomes to a (possibly partial) report.
+fn finish_report(
+    mut report: OptimizeReport,
+    accepted_prompts: Vec<(PromptTarget, String)>,
+    accepted_policy: Option<MemoryPolicy>,
+) -> OptimizeReport {
+    report.accepted_prompts = accepted_prompts
+        .into_iter()
+        .map(|(target, text)| AcceptedPrompt { target, text })
+        .collect();
+    report.accepted_policy = accepted_policy;
+    report
+}
+
 /// The generation loop. `fitness(generation)` must run the train eval suite
 /// against whatever genome overrides are currently installed and return its
-/// report; generation 0 is the baseline. Candidates install through
+/// report; generation 0 is the baseline (the caller's pre-installed
+/// overrides, when any, are snapshotted as generation 0's genome and the
+/// rejection restore point). Candidates install through
 /// `agents::prompts::set_override` (prompt genome) or
 /// `MemoryPolicy::set_eval_override` (policy genome) and are restored on
 /// rejection. When `holdout` is given, a train win must also keep the
 /// held-out suite within `holdout_epsilon` of its baseline — the
 /// anti-overfitting gate (plan M9).
+///
+/// Error handling: a proposal or parse failure only costs its own
+/// generation — it is recorded as rejected and the loop continues. A failed
+/// fitness or holdout evaluation aborts the run, but the returned
+/// [`OptimizeAbort`] carries the partial report so accepted generations
+/// (paid suite replays) are never lost.
 pub async fn run_optimize<C, F, Fut>(
     proposer: &C,
     config: &OptimizeConfig,
     mut fitness: F,
     mut holdout: Option<BoxedFitness>,
-) -> Result<OptimizeReport, BoxError>
+) -> Result<OptimizeReport, OptimizeAbort>
 where
     C: AssessContext + ?Sized,
     F: FnMut(usize) -> Fut,
     Fut: Future<Output = Result<EvalSuiteReport, BoxError>>,
 {
-    // Drop-time clear: a `?` return or panic anywhere below must not leak a
-    // candidate policy into later evals through the process-wide override.
+    // Drop-time clear: an early return or panic anywhere below must not leak
+    // a candidate policy into later evals through the process-wide override.
     let _policy_override_guard = matches!(config.genome, GenomeKind::Policy)
         .then(crate::types::EvalPolicyOverrideGuard::arm);
+    // Symmetric drop-time restore for the prompt genome: every touched
+    // target is rolled back to its last-known-good text.
+    let mut prompt_guard = PromptGenomeGuard::new();
+    // Snapshot the caller-installed policy override: it produced the
+    // baseline, so it is generation 0's genome and the rejection restore
+    // point — not the compiled defaults.
+    let initial_policy = MemoryPolicy::eval_override();
 
-    let mut baseline = fitness(0).await?;
+    let mut baseline = match fitness(0).await {
+        Ok(baseline) => baseline,
+        Err(error) => {
+            return Err(OptimizeAbort {
+                partial: None,
+                error,
+            });
+        }
+    };
     let baseline_total = baseline.score.total;
     if baseline.total_stddev.is_none() {
         // Without variance data the noise band collapses to `min_delta`
@@ -495,10 +626,6 @@ where
             config.min_delta
         );
     }
-    let mut holdout_baseline = match holdout.as_mut() {
-        Some(holdout) => Some(holdout(0).await?.score.total),
-        None => None,
-    };
     let mut report = OptimizeReport {
         baseline_total,
         final_total: baseline_total,
@@ -508,6 +635,23 @@ where
     let mut accepted_prompts: Vec<(PromptTarget, String)> = Vec::new();
     let mut accepted_policy: Option<MemoryPolicy> = None;
 
+    let mut holdout_baseline = match holdout.as_mut() {
+        Some(holdout) => match holdout(0).await {
+            Ok(suite) => Some(suite.score.total),
+            Err(error) => {
+                return Err(OptimizeAbort {
+                    partial: Some(Box::new(finish_report(
+                        report,
+                        accepted_prompts,
+                        accepted_policy,
+                    ))),
+                    error,
+                });
+            }
+        },
+        None => None,
+    };
+
     for generation in 1..=config.generations {
         let failure_summary = summarize_failures(&baseline);
         let mut record = GenerationReport {
@@ -516,7 +660,9 @@ where
             ..Default::default()
         };
 
-        // Propose and build the candidate genome.
+        // Propose and build the candidate genome. A proposal or parse
+        // failure costs nothing that must be preserved, so it is recorded as
+        // this generation's rejection and the loop continues.
         let candidate = match config.genome {
             GenomeKind::Prompt => {
                 let target = config
@@ -524,8 +670,19 @@ where
                     .unwrap_or_else(|| pick_target(&baseline.attribution));
                 record.target = Some(target);
                 let current_prompt = prompts::active_prompt(target);
-                let edits =
-                    propose_edits(proposer, target, &current_prompt, &failure_summary).await?;
+                let edits = match propose_edits(proposer, target, &current_prompt, &failure_summary)
+                    .await
+                {
+                    Ok(edits) => edits,
+                    Err(err) => {
+                        record.decision = GenerationDecision {
+                            accepted: false,
+                            reason: format!("optimizer proposal failed: {err}"),
+                        };
+                        report.generations.push(record);
+                        continue;
+                    }
+                };
                 if edits.is_empty() {
                     record.decision = GenerationDecision {
                         accepted: false,
@@ -557,8 +714,22 @@ where
                 Candidate::Prompt { target, text }
             }
             GenomeKind::Policy => {
-                let current = accepted_policy.clone().unwrap_or_default();
-                let patches = propose_policy_patches(proposer, &current, &failure_summary).await?;
+                let current = accepted_policy
+                    .clone()
+                    .or_else(|| initial_policy.clone())
+                    .unwrap_or_default();
+                let patches =
+                    match propose_policy_patches(proposer, &current, &failure_summary).await {
+                        Ok(patches) => patches,
+                        Err(err) => {
+                            record.decision = GenerationDecision {
+                                accepted: false,
+                                reason: format!("optimizer proposal failed: {err}"),
+                            };
+                            report.generations.push(record);
+                            continue;
+                        }
+                    };
                 if patches.is_empty() {
                     record.decision = GenerationDecision {
                         accepted: false,
@@ -602,6 +773,7 @@ where
         // Install the candidate genome.
         match &candidate {
             Candidate::Prompt { target, text } => {
+                prompt_guard.note_target(*target, &prompts::active_prompt(*target));
                 prompts::set_override(*target, Some(text.clone()));
             }
             Candidate::Policy { policy } => {
@@ -609,7 +781,27 @@ where
             }
         }
 
-        let candidate_suite = fitness(generation).await?;
+        let candidate_suite = match fitness(generation).await {
+            Ok(suite) => suite,
+            Err(error) => {
+                // Roll back the unvalidated candidate, then surface the
+                // partial report so the accepted generations survive.
+                restore_candidate(&candidate, &prompt_guard, &accepted_policy, &initial_policy);
+                record.decision = GenerationDecision {
+                    accepted: false,
+                    reason: format!("fitness evaluation failed: {error}"),
+                };
+                report.generations.push(record);
+                return Err(OptimizeAbort {
+                    partial: Some(Box::new(finish_report(
+                        report,
+                        accepted_prompts,
+                        accepted_policy,
+                    ))),
+                    error,
+                });
+            }
+        };
         record.candidate_total = Some(candidate_suite.score.total);
         let mut decision = decide(
             baseline.score.total,
@@ -625,7 +817,25 @@ where
         if decision.accepted
             && let Some(holdout) = holdout.as_mut()
         {
-            let hold_total = holdout(generation).await?.score.total;
+            let hold_total = match holdout(generation).await {
+                Ok(suite) => suite.score.total,
+                Err(error) => {
+                    restore_candidate(&candidate, &prompt_guard, &accepted_policy, &initial_policy);
+                    record.decision = GenerationDecision {
+                        accepted: false,
+                        reason: format!("holdout evaluation failed: {error}"),
+                    };
+                    report.generations.push(record);
+                    return Err(OptimizeAbort {
+                        partial: Some(Box::new(finish_report(
+                            report,
+                            accepted_prompts,
+                            accepted_policy,
+                        ))),
+                        error,
+                    });
+                }
+            };
             record.holdout_total = Some(hold_total);
             let base = holdout_baseline.unwrap_or_default();
             if hold_total < base - config.holdout_epsilon {
@@ -648,6 +858,7 @@ where
         if decision.accepted {
             match candidate {
                 Candidate::Prompt { target, text } => {
+                    prompt_guard.accept(target, &text);
                     accepted_prompts.retain(|(kept, _)| *kept != target);
                     accepted_prompts.push((target, text));
                 }
@@ -659,30 +870,15 @@ where
             report.accepted_generations += 1;
             baseline = candidate_suite;
         } else {
-            // Restore the last accepted genome state.
-            match &candidate {
-                Candidate::Prompt { target, .. } => {
-                    let restore = accepted_prompts
-                        .iter()
-                        .find(|(kept, _)| kept == target)
-                        .map(|(_, text)| text.clone());
-                    prompts::set_override(*target, restore);
-                }
-                Candidate::Policy { .. } => {
-                    MemoryPolicy::set_eval_override(accepted_policy.clone());
-                }
-            }
+            // Restore the last accepted genome state (or the run's starting
+            // state when nothing was accepted yet).
+            restore_candidate(&candidate, &prompt_guard, &accepted_policy, &initial_policy);
         }
         record.decision = decision;
         report.generations.push(record);
     }
 
-    report.accepted_prompts = accepted_prompts
-        .into_iter()
-        .map(|(target, text)| AcceptedPrompt { target, text })
-        .collect();
-    report.accepted_policy = accepted_policy;
-    Ok(report)
+    Ok(finish_report(report, accepted_prompts, accepted_policy))
 }
 
 #[cfg(test)]
@@ -697,14 +893,18 @@ mod tests {
     #[derive(Default)]
     struct FakeProposer {
         responses: Mutex<Vec<String>>,
+        /// Prompts of every `complete` call, for asserting what the
+        /// optimizer showed the proposal LLM.
+        requests: Mutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
     impl AssessContext for FakeProposer {
         async fn complete(
             &self,
-            _req: anda_core::CompletionRequest,
+            req: anda_core::CompletionRequest,
         ) -> Result<AgentOutput, anda_core::BoxError> {
+            self.requests.lock().unwrap().push(req.prompt);
             let mut responses = self.responses.lock().unwrap();
             if responses.is_empty() {
                 return Err("no canned response".into());
@@ -769,6 +969,7 @@ mod tests {
         // it, which must be reverted on rejection.
         let proposer = FakeProposer {
             responses: Mutex::new(vec![edit("UNIQUE_NEEDLE IMPROVED"), edit("REGRESSED")]),
+            ..Default::default()
         };
 
         // Fitness: baseline 0.5, gen1 0.9 (accept), gen2 0.3 (reject).
@@ -993,6 +1194,7 @@ mod tests {
         // override restored to the accepted 0.9).
         let proposer = FakeProposer {
             responses: Mutex::new(vec![patch(0.9), patch(0.85)]),
+            ..Default::default()
         };
         let totals = std::sync::Arc::new(Mutex::new(vec![0.5, 0.9, 0.3]));
         let totals_ref = totals.clone();
@@ -1057,6 +1259,7 @@ mod tests {
         .to_string();
         let proposer = FakeProposer {
             responses: Mutex::new(vec![edit]),
+            ..Default::default()
         };
         // Train improves (0.5 → 0.9) but holdout regresses (0.6 → 0.4).
         let train_totals = std::sync::Arc::new(Mutex::new(vec![0.5, 0.9]));
@@ -1097,11 +1300,227 @@ mod tests {
         assert_eq!(generation.holdout_total, Some(0.4));
         assert!(!generation.decision.accepted);
         assert!(generation.decision.reason.contains("holdout regressed"));
-        // The overfitting edit was reverted (back to the last accepted state
-        // — with no prior acceptance, the compiled default).
+        // The overfitting edit was reverted to the run's starting genome —
+        // the caller-installed override that produced the baseline — not to
+        // the compiled default.
         let active = prompts::active_prompt(PromptTarget::Recall);
         assert!(!active.contains("OVERFIT"));
+        assert!(active.contains("UNIQUE_NEEDLE"));
 
         prompts::clear_overrides();
+    }
+
+    #[tokio::test]
+    // Serializes tests that mutate process-wide override state.
+    #[allow(clippy::await_holding_lock)]
+    async fn run_optimize_records_proposal_failure_as_rejected_generation() {
+        let _guard = prompts::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        prompts::clear_overrides();
+        prompts::set_override(
+            PromptTarget::Recall,
+            Some("BASE PROMPT with UNIQUE_NEEDLE inside".to_string()),
+        );
+
+        // Gen 1: unparseable proposal output. Gen 2: a valid improving edit.
+        // The parse failure must cost only its own generation.
+        let good_edit = serde_json::json!({
+            "edits": [{
+                "target": "recall",
+                "find": "UNIQUE_NEEDLE",
+                "replace": "UNIQUE_NEEDLE IMPROVED",
+                "rationale": "test"
+            }]
+        })
+        .to_string();
+        let proposer = FakeProposer {
+            responses: Mutex::new(vec!["not json at all".to_string(), good_edit]),
+            ..Default::default()
+        };
+        // Baseline 0.5; gen 1 runs no fitness; gen 2 candidate 0.9.
+        let totals = std::sync::Arc::new(Mutex::new(vec![0.5, 0.9]));
+        let totals_ref = totals.clone();
+        let config = OptimizeConfig {
+            generations: 2,
+            target: Some(PromptTarget::Recall),
+            ..Default::default()
+        };
+
+        let report = run_optimize(
+            &proposer,
+            &config,
+            move |_generation| {
+                let totals = totals_ref.clone();
+                async move {
+                    let total = totals.lock().unwrap().remove(0);
+                    Ok(suite_with_total(total, None))
+                }
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.generations.len(), 2);
+        assert!(!report.generations[0].decision.accepted);
+        assert!(
+            report.generations[0]
+                .decision
+                .reason
+                .contains("proposal failed")
+        );
+        assert!(report.generations[1].decision.accepted);
+        assert_eq!(report.accepted_generations, 1);
+        assert_eq!(report.final_total, 0.9);
+
+        prompts::clear_overrides();
+    }
+
+    #[tokio::test]
+    // Serializes tests that mutate process-wide override state.
+    #[allow(clippy::await_holding_lock)]
+    async fn run_optimize_fitness_failure_preserves_accepted_generations() {
+        let _guard = prompts::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        prompts::clear_overrides();
+        prompts::set_override(
+            PromptTarget::Recall,
+            Some("BASE PROMPT with UNIQUE_NEEDLE inside".to_string()),
+        );
+
+        let edit = |replace: &str| {
+            serde_json::json!({
+                "edits": [{
+                    "target": "recall",
+                    "find": "UNIQUE_NEEDLE",
+                    "replace": replace,
+                    "rationale": "test"
+                }]
+            })
+            .to_string()
+        };
+        let proposer = FakeProposer {
+            responses: Mutex::new(vec![
+                edit("UNIQUE_NEEDLE IMPROVED"),
+                edit("UNIQUE_NEEDLE BROKEN"),
+            ]),
+            ..Default::default()
+        };
+        // Baseline 0.5; gen 1 accepted at 0.9; gen 2's suite errors out.
+        let totals = std::sync::Arc::new(Mutex::new(vec![Some(0.5), Some(0.9), None]));
+        let totals_ref = totals.clone();
+        let config = OptimizeConfig {
+            generations: 2,
+            target: Some(PromptTarget::Recall),
+            ..Default::default()
+        };
+
+        let abort = run_optimize(
+            &proposer,
+            &config,
+            move |_generation| {
+                let totals = totals_ref.clone();
+                async move {
+                    match totals.lock().unwrap().remove(0) {
+                        Some(total) => Ok(suite_with_total(total, None)),
+                        None => Err("suite transport failed".into()),
+                    }
+                }
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(abort.error.to_string().contains("suite transport failed"));
+        // The gen-1 win (a full paid suite replay) survives in the partial
+        // report instead of being discarded.
+        let partial = abort.partial.expect("partial report");
+        assert_eq!(partial.accepted_generations, 1);
+        assert_eq!(partial.final_total, 0.9);
+        assert_eq!(partial.accepted_prompts.len(), 1);
+        assert!(partial.accepted_prompts[0].text.contains("IMPROVED"));
+        assert_eq!(partial.generations.len(), 2);
+        assert!(
+            partial.generations[1]
+                .decision
+                .reason
+                .contains("fitness evaluation failed")
+        );
+        // The unvalidated gen-2 candidate was rolled back to the accepted
+        // gen-1 prompt, not left leaking in the process-wide override.
+        let active = prompts::active_prompt(PromptTarget::Recall);
+        assert!(active.contains("IMPROVED"));
+        assert!(!active.contains("BROKEN"));
+
+        prompts::clear_overrides();
+    }
+
+    #[tokio::test]
+    // Serializes tests that mutate process-wide override state.
+    #[allow(clippy::await_holding_lock)]
+    async fn run_optimize_policy_genome_starts_from_installed_override() {
+        let _guard = prompts::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        // The caller pre-installed a policy override; it produced the
+        // baseline, so it must be generation 0's genome and the rejection
+        // restore point — not the compiled default (0.95).
+        MemoryPolicy::set_eval_override(Some(MemoryPolicy {
+            confidence_decay_factor: 0.8,
+            ..Default::default()
+        }));
+
+        let patch = serde_json::json!({
+            "patches": [{
+                "field": "confidence_decay_factor",
+                "value": 0.9,
+                "rationale": "test"
+            }]
+        })
+        .to_string();
+        let none = serde_json::json!({ "patches": [] }).to_string();
+        let proposer = FakeProposer {
+            responses: Mutex::new(vec![patch, none]),
+            ..Default::default()
+        };
+        // Baseline 0.5; gen 1 candidate 0.3 (rejected); gen 2 proposes
+        // nothing, so its proposal prompt shows the restored policy.
+        let totals = std::sync::Arc::new(Mutex::new(vec![0.5, 0.3]));
+        let totals_ref = totals.clone();
+        let config = OptimizeConfig {
+            generations: 2,
+            genome: GenomeKind::Policy,
+            ..Default::default()
+        };
+
+        let report = run_optimize(
+            &proposer,
+            &config,
+            move |_generation| {
+                let totals = totals_ref.clone();
+                async move {
+                    let total = totals.lock().unwrap().remove(0);
+                    Ok(suite_with_total(total, None))
+                }
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.accepted_generations, 0);
+        let requests = proposer.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        // Gen 1's genome is the installed override…
+        assert!(requests[0].contains("\"confidence_decay_factor\": 0.8"));
+        // …and after the rejection, gen 2 still sees it (not the compiled
+        // default) because the restore point is the run-start snapshot.
+        assert!(requests[1].contains("\"confidence_decay_factor\": 0.8"));
+        assert!(!requests[1].contains("0.95"));
+        // The RAII guard cleared the process-wide override on return.
+        assert!(MemoryPolicy::eval_override().is_none());
     }
 }

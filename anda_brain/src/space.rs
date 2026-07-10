@@ -23,6 +23,7 @@ use anda_kip::{
     KipError, KipErrorCode, META_SELF_NAME, PERSON_SELF_KIP, PERSON_SYSTEM_KIP, PERSON_TYPE,
     parse_kml,
 };
+use futures::StreamExt;
 use ic_auth_types::ByteBufB64;
 use ic_cose_types::cose::{
     SIGN1_TAG, cwt::cwt_from, ed25519::VerifyingKey, sign1::cose_sign1_from, skip_prefix,
@@ -239,26 +240,28 @@ impl AppState {
             return Err("no completed recall conversations to replay".into());
         }
 
-        // Flush the live space so the forks see its latest persisted state,
-        // then fork twice: baseline keeps the current policy, candidate gets
-        // the proposed one. Settling both makes the comparison fair — same
-        // metabolism pass, different knobs.
-        space.db.flush_metadata(now_ms).await.ok();
-        let baseline = self.fork_space_for_shadow(space_id, None).await?;
-        let candidate = self
-            .fork_space_for_shadow(space_id, Some(input.policy.clone()))
-            .await?;
+        // Flush the live space (collections included, not just metadata) so
+        // the forks see its latest persisted state, then fork twice:
+        // baseline keeps the current policy, candidate gets the proposed
+        // one. The fork is still not a point-in-time snapshot — writes that
+        // land mid-fork may appear on one side — but both sides replay the
+        // same queries, so drift shows up as a tie, not a false win.
+        // Settling both makes the comparison fair — same metabolism pass,
+        // different knobs.
+        space.db.flush().await.ok();
+        let (baseline, candidate) = tokio::try_join!(
+            self.fork_space_for_shadow(space_id, None),
+            self.fork_space_for_shadow(space_id, Some(input.policy.clone())),
+        )?;
         // Interval 0 bypasses the weekly decay gate: the forks inherit the
         // live space's `decay_applied_at` stamps, and under the gate both
         // sides would settle identically whenever the live space decayed
         // recently — turning every decay-knob comparison into a tie. Forks
         // are throwaway copies, so over-decaying them has no consequence.
-        let _ = baseline
-            .settle_memory_metabolism_with(MaintenanceScope::Full, now_ms, 0)
-            .await;
-        let _ = candidate
-            .settle_memory_metabolism_with(MaintenanceScope::Full, now_ms, 0)
-            .await;
+        let _ = tokio::join!(
+            baseline.settle_memory_metabolism_with(MaintenanceScope::Full, now_ms, 0),
+            candidate.settle_memory_metabolism_with(MaintenanceScope::Full, now_ms, 0),
+        );
 
         let mut report = ShadowReport {
             compared_at: now_ms,
@@ -272,8 +275,10 @@ impl AppState {
                     context: None,
                 })
             };
-            let baseline_out = baseline.query(SELF_USER_ID, recall_input()).await;
-            let candidate_out = candidate.query(SELF_USER_ID, recall_input()).await;
+            let (baseline_out, candidate_out) = tokio::join!(
+                baseline.query(SELF_USER_ID, recall_input()),
+                candidate.query(SELF_USER_ID, recall_input()),
+            );
             let (baseline_answer, candidate_answer) = match (baseline_out, candidate_out) {
                 (Ok(baseline_out), Ok(candidate_out)) => {
                     report.usage.accumulate(&baseline_out.usage);
@@ -495,6 +500,10 @@ impl AppState {
     /// false` opens the space without resuming its formation backlog or wiki
     /// digest — required for shadow forks, which are throwaway copies whose
     /// backlog must not burn LLM tokens or mutate the fork mid-replay.
+    ///
+    /// Note: `pinned` and `autostart` take effect only on the load that
+    /// actually initializes the space; a cache hit returns the space as it
+    /// was first opened and ignores both parameters.
     pub async fn load_space_with(
         &self,
         space_id: &str,
@@ -638,7 +647,10 @@ impl AppState {
 
         match entry.cell.get() {
             Some(space) => {
-                if space.pinned || space.is_processing() {
+                // An in-flight wiki digest holds the DB too (it is kicked
+                // right after maintenance finishes, in the same window this
+                // check races against).
+                if space.pinned || space.is_processing() || space.wiki_digest.is_processing() {
                     return false;
                 }
                 // Map + background snapshot are the only expected SpaceEntry refs here;
@@ -686,6 +698,12 @@ pub struct Space {
     /// At most one shadow evaluation (plan M11) per space: each run holds
     /// two full in-memory copies, so stacking runs is an OOM vector.
     shadow_lock: tokio::sync::Mutex<()>,
+    /// Serializes token minting so the name-uniqueness and count-cap checks
+    /// in `add_space_token` cannot race two concurrent mints.
+    token_lock: tokio::sync::Mutex<()>,
+    /// Single-flights the first (uncached) graph census in `memory_status`,
+    /// which is a near-full scan reachable anonymously on public spaces.
+    census_lock: tokio::sync::Mutex<()>,
     /// Independent judge model for eval runs (plan M9); unset means judge
     /// completions share the space's default model (documented caveat).
     judge_model: std::sync::RwLock<Option<Arc<Model>>>,
@@ -723,6 +741,10 @@ impl Space {
         input: AddSpaceTokenInput,
         now_ms: u64,
     ) -> Result<SpaceToken, BoxError> {
+        // Serialize mints: the count cap and name-uniqueness checks below
+        // read shared extension state, and two concurrent mints must not
+        // both pass them.
+        let _guard = self.token_lock.lock().await;
         let count = self
             .db
             .extensions_with(|kv| kv.keys().filter(|k| k.starts_with("ST")).count());
@@ -730,14 +752,17 @@ impl Space {
             return Err("space token limit reached".into());
         }
 
-        // The token name is the audit identity (`st:{name}`): collisions
-        // would make two tokens indistinguishable in the event log.
+        // The token name is the audit identity (`st:{name}`): it is required
+        // and unique, or two tokens would be indistinguishable in the event
+        // log (and un-revokable by name).
         let name = input.name.trim().to_string();
-        if !name.is_empty()
-            && self
-                .list_space_tokens()?
-                .iter()
-                .any(|st| st.name.trim() == name)
+        if name.is_empty() {
+            return Err("space token name is required".into());
+        }
+        if self
+            .list_space_tokens()?
+            .iter()
+            .any(|st| st.name.trim() == name)
         {
             return Err(format!("space token name {name:?} already exists").into());
         }
@@ -823,6 +848,29 @@ impl Space {
         Ok(rt.is_some())
     }
 
+    /// Revokes a token by its (unique) name. This is the recovery path for
+    /// managers who did not save the token value at mint time —
+    /// `list_space_tokens` deliberately never echoes full token values.
+    pub async fn revoke_space_token_by_name(&self, name: &str) -> Result<bool, BoxError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("invalid space token name".into());
+        }
+        let key = self.db.extensions_with(|kvs| {
+            kvs.iter().find_map(|(k, v)| {
+                (k.starts_with("ST")
+                    && v.clone()
+                        .deserialized::<SpaceToken>()
+                        .is_ok_and(|st| st.name.trim() == name))
+                .then(|| k.clone())
+            })
+        });
+        match key {
+            Some(key) => Ok(self.db.remove_extension(&key).await?.is_some()),
+            None => Ok(false),
+        }
+    }
+
     pub fn list_space_tokens(&self) -> Result<Vec<SpaceToken>, BoxError> {
         let tokens: Vec<SpaceToken> = self.db.extensions_with(|kvs| {
             kvs.iter()
@@ -830,7 +878,14 @@ impl Space {
                     if k.starts_with("ST")
                         && let Ok(mut st) = v.clone().deserialized::<SpaceToken>()
                     {
-                        st.token = k.clone();
+                        // The map key *is* the bearer credential: expose only
+                        // a display prefix, or any Write-scoped manager could
+                        // harvest every other caller's token in plaintext.
+                        st.token = if k.len() > 8 {
+                            format!("{}…", k.chars().take(8).collect::<String>())
+                        } else {
+                            k.clone()
+                        };
                         Some(st)
                     } else {
                         None
@@ -850,6 +905,14 @@ impl Space {
         }
 
         let mut changed = false;
+        // The ACL-defaults write does real I/O and can fail; run it before
+        // any in-memory extension mutation, or an error response would leave
+        // part of the update (worst case `public: true`) silently applied
+        // and later persisted by the periodic flush.
+        if let Some(defaults) = input.wiki_acl_defaults {
+            changed = true;
+            self.wiki.set_acl_defaults(defaults).await?;
+        }
         if let Some(name) = input.name {
             changed = true;
             self.db.set_extension_from("name".to_string(), name);
@@ -873,10 +936,6 @@ impl Space {
             self.db
                 .set_extension_from("wiki_audit_reads".to_string(), audit_reads);
             self.wiki.set_audit_reads(audit_reads);
-        }
-        if let Some(defaults) = input.wiki_acl_defaults {
-            changed = true;
-            self.wiki.set_acl_defaults(defaults).await?;
         }
         if let Some(policy) = input.memory_policy {
             changed = true;
@@ -990,6 +1049,22 @@ impl Space {
         user: Principal,
         input: StringOr<FormationInput>,
     ) -> Result<AgentOutput, BoxError> {
+        // Reject empty input up front (both HTTP and MCP funnel through
+        // here): it would otherwise persist a garbage conversation and burn
+        // a full LLM encoding cycle on nothing.
+        let empty = match &input {
+            StringOr::String(text) => text.trim().is_empty(),
+            StringOr::Value(input) => {
+                input.messages.is_empty()
+                    || input
+                        .messages
+                        .iter()
+                        .all(|message| message.content.is_empty())
+            }
+        };
+        if empty {
+            return Err("formation input must not be empty".into());
+        }
         let nodes = self
             .memory
             .nexus
@@ -1024,6 +1099,16 @@ impl Space {
         user: Principal,
         input: StringOr<RecallInput>,
     ) -> Result<AgentOutput, BoxError> {
+        // Same guard as `probe_memory`: an empty query must not start a
+        // billed multi-turn LLM run (covers `query` and `query_structured`
+        // on both the HTTP and MCP channels).
+        let empty = match &input {
+            StringOr::String(text) => text.trim().is_empty(),
+            StringOr::Value(input) => input.query.trim().is_empty(),
+        };
+        if empty {
+            return Err("recall query must not be empty".into());
+        }
         self.engine
             .agent_run(
                 user,
@@ -1195,6 +1280,21 @@ impl Space {
         user: Principal,
         mut input: MaintenanceInput,
     ) -> Result<AgentOutput, BoxError> {
+        // Caller-supplied parameters feed the KIP-writing maintenance prompt;
+        // enforce the same bounds as `MemoryPolicy::validate` before anything
+        // runs (both HTTP and MCP channels funnel through here).
+        if let Some(parameters) = &input.parameters {
+            parameters.validate()?;
+        }
+        // Hold the maintenance slot across the whole entry path: the
+        // settlement below performs seconds of KIP writes, and without the
+        // claim a formation cycle could start inside that window and write
+        // the graph concurrently with the upcoming maintenance cycle. The
+        // claim is consumed (inherited) by `MaintenanceAgent::run`.
+        let _claim = self
+            .maintenance
+            .try_claim_processing()
+            .ok_or("Maintenance cycle is already in progress.")?;
         input.formation_id = self.formation.get_processed().unwrap_or_default();
         // Callers that pass explicit parameters keep them; everyone else runs
         // under the space's memory policy. Default policy values equal the
@@ -1279,10 +1379,21 @@ impl Space {
         {
             Some(graph) => graph,
             None => {
-                let graph = self.census_graph_counters(unix_ms()).await;
-                self.db
-                    .set_extension_from("memory_graph_counters".to_string(), graph.clone());
-                graph
+                // Single-flight the first census: concurrent (possibly
+                // anonymous) requests must not each run a near-full scan.
+                let _guard = self.census_lock.lock().await;
+                match self
+                    .db
+                    .get_extension_as::<MemoryGraphCounters>("memory_graph_counters")
+                {
+                    Some(graph) => graph,
+                    None => {
+                        let graph = self.census_graph_counters(unix_ms()).await;
+                        self.db
+                            .set_extension_from("memory_graph_counters".to_string(), graph.clone());
+                        graph
+                    }
+                }
             }
         };
         let maintenance_usage: Usage = self
@@ -1343,21 +1454,30 @@ impl Space {
             collect_string_leaves(result, &mut names);
         }
 
-        let mut predicates = BTreeMap::new();
-        for name in names.into_iter().take(50) {
-            // A failed count (typically the engine's full-scan cap on the
-            // busiest predicates) must be *absent*, not zero: reporting the
-            // most-used predicate as having zero links would point the
-            // Phase-6 merge guidance at exactly the wrong target.
-            match assess::kip_count(
+        // Bounded fan-out: each count is a scan, and this runs while the
+        // settlement lock is held — full parallelism would hammer the graph,
+        // strict serial ordering stalls settlement for minutes.
+        let counts = futures::stream::iter(names.into_iter().take(50).map(|name| async move {
+            let count = assess::kip_count(
                 self,
                 &format!(
                     "FIND(COUNT(?link)) WHERE {{ ?link (?s, {}, ?o) }}",
                     kip_string_literal(&name)
                 ),
             )
-            .await
-            {
+            .await;
+            (name, count)
+        }))
+        .buffer_unordered(4)
+        .collect::<Vec<_>>()
+        .await;
+        let mut predicates = BTreeMap::new();
+        for (name, count) in counts {
+            // A failed count (typically the engine's full-scan cap on the
+            // busiest predicates) must be *absent*, not zero: reporting the
+            // most-used predicate as having zero links would point the
+            // Phase-6 merge guidance at exactly the wrong target.
+            match count {
                 Some(count) => {
                     predicates.insert(name, count);
                 }
@@ -1388,18 +1508,21 @@ impl Space {
             .get_extension_as("source_reliability")
             .unwrap_or_default();
         if !sources.is_empty() {
-            let mut totals: BTreeMap<String, Option<u64>> = BTreeMap::new();
-            for source in sources.keys().take(20) {
-                let total = assess::kip_count(
-                    self,
-                    &format!(
-                        "FIND(COUNT(?link)) WHERE {{ ?link (?s, ?p, ?o) FILTER(?link.metadata.source == {}) }}",
-                        kip_string_literal(source)
-                    ),
-                )
+            let totals: BTreeMap<String, Option<u64>> =
+                futures::stream::iter(sources.keys().take(20).cloned().map(|source| async move {
+                    let total = assess::kip_count(
+                        self,
+                        &format!(
+                            "FIND(COUNT(?link)) WHERE {{ ?link (?s, ?p, ?o) FILTER(?link.metadata.source == {}) }}",
+                            kip_string_literal(&source)
+                        ),
+                    )
+                    .await;
+                    (source, total)
+                }))
+                .buffer_unordered(4)
+                .collect()
                 .await;
-                totals.insert(source.clone(), total);
-            }
             let _ = self
                 .db
                 .set_extension_from_with("source_reliability".to_string(), |value| {
@@ -1865,6 +1988,11 @@ impl Space {
                     .into(),
             );
         }
+        // Each entity costs an existence check plus a cascade enumeration;
+        // an unbounded batch would hold the graph busy for minutes.
+        if input.entities.len() > 100 {
+            return Err("too many entities in one forget request (max 100)".into());
+        }
         let mut report = MemoryForgetReport {
             dry_run: input.dry_run,
             ..Default::default()
@@ -1904,8 +2032,22 @@ impl Space {
                     ..Default::default()
                 })
                 .await?;
-            entry.existed = matches!(&response, anda_kip::Response::Ok { result, .. }
-                if assess::citations_from_json(result).iter().any(|hit| hit.entity == entity));
+            match &response {
+                anda_kip::Response::Ok { result, .. } => {
+                    entry.existed = assess::citations_from_json(result)
+                        .iter()
+                        .any(|hit| hit.entity == entity);
+                }
+                anda_kip::Response::Err { .. } => {
+                    // An errored/timed-out existence check means *unknown*,
+                    // never "absent": this is a privacy-grade deletion, and a
+                    // clean `existed: false` here would tell the caller the
+                    // data is gone while it may still be in the graph.
+                    entry.error = Some(format!("existence check failed, retry: {response:?}"));
+                    report.entities.push(entry);
+                    continue;
+                }
+            }
 
             if input.dry_run || !entry.existed {
                 report.entities.push(entry);
@@ -1974,31 +2116,50 @@ impl Space {
     async fn concept_proposition_ids(&self, concept_id: &str) -> Vec<String> {
         let id = kip_string_literal(concept_id);
         let mut ids = BTreeSet::new();
-        for command in [
+        for base_command in [
             format!("FIND(?link) WHERE {{ ?link ({{id: {id}}}, ?p, ?o) }} LIMIT 1000"),
             format!("FIND(?link) WHERE {{ ?link (?s, ?p, {{id: {id}}}) }} LIMIT 1000"),
         ] {
-            match self
-                .execute_kip_readonly(anda_kip::Request {
-                    command,
-                    readonly: true,
-                    ..Default::default()
-                })
-                .await
-            {
-                Ok(anda_kip::Response::Ok { result, .. }) => {
-                    assess::collect_entity_objects(&result, &mut |id, _| {
-                        if assess::is_proposition_entity_id(id) {
-                            ids.insert(id.to_string());
+            // Paginate with CURSOR: a concept with more than one page of
+            // propositions must still cascade all of its ledger rows.
+            let mut cursor: Option<String> = None;
+            loop {
+                let command = match &cursor {
+                    Some(cursor) => {
+                        format!("{base_command} CURSOR {}", kip_string_literal(cursor))
+                    }
+                    None => base_command.clone(),
+                };
+                match self
+                    .execute_kip_readonly(anda_kip::Request {
+                        command,
+                        readonly: true,
+                        ..Default::default()
+                    })
+                    .await
+                {
+                    Ok(anda_kip::Response::Ok {
+                        result,
+                        next_cursor,
+                    }) => {
+                        assess::collect_entity_objects(&result, &mut |id, _| {
+                            if assess::is_proposition_entity_id(id) {
+                                ids.insert(id.to_string());
+                            }
+                        });
+                        match next_cursor {
+                            Some(next) => cursor = Some(next),
+                            None => break,
                         }
-                    });
-                }
-                other => {
-                    log::warn!(
-                        target: "brain",
-                        space_id = self.id;
-                        "enumerating propositions of {concept_id} for forget cascade failed: {other:?}"
-                    );
+                    }
+                    other => {
+                        log::warn!(
+                            target: "brain",
+                            space_id = self.id;
+                            "enumerating propositions of {concept_id} for forget cascade failed: {other:?}"
+                        );
+                        break;
+                    }
                 }
             }
         }
@@ -2132,19 +2293,30 @@ impl Space {
             return Ok(None);
         }
 
-        // 2) Resolve subject/object names for query generation.
-        let mut concept_cache: BTreeMap<String, (String, String)> = BTreeMap::new();
+        // 2) Resolve subject/object names for query generation. A `None`
+        // resolution means the lookup itself errored (graph busy): that
+        // candidate is *unknown*, so it is skipped without a tested stamp
+        // and a later pass re-samples it — unlike a confirmed-missing
+        // concept, which resolves to empty strings below.
+        let mut concept_cache: BTreeMap<String, Option<(String, String)>> = BTreeMap::new();
+        let mut unknown: BTreeSet<String> = BTreeSet::new();
         for candidate in &mut candidates {
-            let (subject_type, subject_name) = self
+            let subject = self
                 .self_test_concept(&mut concept_cache, &candidate.subject)
                 .await;
-            let (_, object_name) = self
+            let object = self
                 .self_test_concept(&mut concept_cache, &candidate.object)
                 .await;
+            let (Some((subject_type, subject_name)), Some((_, object_name))) = (subject, object)
+            else {
+                unknown.insert(candidate.id.clone());
+                continue;
+            };
             candidate.subject_type = subject_type;
             candidate.subject_name = subject_name;
             candidate.object_name = object_name;
         }
+        candidates.retain(|candidate| !unknown.contains(&candidate.id));
         // Unresolvable candidates (their subject concept is gone) are marked
         // tested too, or they would occupy the sample window forever.
         let unresolved: Vec<String> = candidates
@@ -2202,6 +2374,10 @@ impl Space {
         // 4) Deterministic grounding check: does search surface the memory's
         // subject or object concept for the generated query?
         let mut tested_entities = BTreeSet::new();
+        // Candidates the LLM returned no query for consumed prompt budget and
+        // cannot be tested; stamp them anyway or they would occupy the
+        // sampling window's stable prefix forever.
+        let mut unqueried: Vec<String> = Vec::new();
         for candidate in &candidates {
             let Some(query) = queries
                 .queries
@@ -2210,6 +2386,7 @@ impl Space {
                 .map(|query| query.query.trim())
                 .filter(|query| !query.is_empty())
             else {
+                unqueried.push(candidate.id.clone());
                 continue;
             };
             let response = self
@@ -2220,10 +2397,26 @@ impl Space {
                 })
                 .await?;
             let mut hit_ids = BTreeSet::new();
-            if let anda_kip::Response::Ok { result, .. } = &response {
-                assess::collect_entity_objects(result, &mut |id, _| {
-                    hit_ids.insert(id.to_string());
-                });
+            match &response {
+                anda_kip::Response::Ok { result, .. } => {
+                    assess::collect_entity_objects(result, &mut |id, _| {
+                        hit_ids.insert(id.to_string());
+                    });
+                }
+                anda_kip::Response::Err { .. } => {
+                    // An errored/timed-out search is *unknown*, not
+                    // "ungroundable": counting it would fabricate a false
+                    // negative, lower the groundability metric, and burn a
+                    // re-encode task on a healthy memory. Skip without a
+                    // stamp so a later pass re-samples it.
+                    log::warn!(
+                        target: "brain",
+                        space_id = self.id;
+                        "self-test grounding search errored for {}; skipping: {response:?}",
+                        candidate.id
+                    );
+                    continue;
+                }
             }
             report.tested += 1;
             tested_entities.insert(candidate.id.clone());
@@ -2270,11 +2463,17 @@ impl Space {
         self.ledger
             .record_self_test(&tested_entities, now_ms)
             .await?;
-        // Stamp tested (and unresolvable) links on the graph so the next
-        // sampling pass moves past them — this is what keeps self-test
-        // coverage sliding across the whole graph.
-        self.mark_self_tested(tested_entities.iter().chain(unresolved.iter()), now_ms)
-            .await;
+        // Stamp tested (and unresolvable/unqueried) links on the graph so
+        // the next sampling pass moves past them — this is what keeps
+        // self-test coverage sliding across the whole graph.
+        self.mark_self_tested(
+            tested_entities
+                .iter()
+                .chain(unresolved.iter())
+                .chain(unqueried.iter()),
+            now_ms,
+        )
+        .await;
         self.bump_metrics(|metrics| {
             metrics.self_test_tested += report.tested;
             metrics.self_test_grounded += report.grounded;
@@ -2313,17 +2512,20 @@ impl Space {
         marked
     }
 
-    /// Resolves a concept id to `(type, name)`, memoized per pass.
+    /// Resolves a concept id to `(type, name)`, memoized per pass. `None`
+    /// means the lookup itself errored or timed out — *unknown*, as opposed
+    /// to a confirmed-missing concept, which resolves to empty strings.
+    /// Callers must skip (and not stamp) unknown candidates so they are
+    /// re-sampled once the graph is responsive again.
     async fn self_test_concept(
         &self,
-        cache: &mut BTreeMap<String, (String, String)>,
+        cache: &mut BTreeMap<String, Option<(String, String)>>,
         concept_id: &str,
-    ) -> (String, String) {
+    ) -> Option<(String, String)> {
         if let Some(found) = cache.get(concept_id) {
             return found.clone();
         }
-        let mut resolved = (String::new(), String::new());
-        if let Ok(anda_kip::Response::Ok { result, .. }) = self
+        let resolved = match self
             .execute_kip_readonly(anda_kip::Request {
                 command: format!(
                     "FIND(?c) WHERE {{ ?c {{id: {}}} }} LIMIT 1",
@@ -2334,23 +2536,28 @@ impl Space {
             })
             .await
         {
-            assess::collect_entity_objects(&result, &mut |id, object| {
-                if id == concept_id {
-                    resolved = (
-                        object
-                            .get("type")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                        object
-                            .get("name")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                    );
-                }
-            });
-        }
+            Ok(anda_kip::Response::Ok { result, .. }) => {
+                let mut resolved = (String::new(), String::new());
+                assess::collect_entity_objects(&result, &mut |id, object| {
+                    if id == concept_id {
+                        resolved = (
+                            object
+                                .get("type")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            object
+                                .get("name")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                        );
+                    }
+                });
+                Some(resolved)
+            }
+            _ => None,
+        };
         cache.insert(concept_id.to_string(), resolved.clone());
         resolved
     }
@@ -2557,14 +2764,19 @@ impl Space {
         collection: Option<String>,
         id: u64,
     ) -> Result<Conversation, BoxError> {
-        let rt = match collection {
-            Some(name) if name == "recall" => {
-                self.recall.conversations.get_conversation(id).await?
+        let rt = match collection.as_deref() {
+            Some("recall") => self.recall.conversations.get_conversation(id).await?,
+            Some("maintenance") => self.maintenance.conversations.get_conversation(id).await?,
+            None => self.memory.get_conversation(id).await?,
+            // A typo (e.g. "Recall") must not silently read the formation
+            // collection — the ids overlap, so it would return an unrelated
+            // conversation instead of an error.
+            Some(other) => {
+                return Err(format!(
+                    "unknown conversation collection {other:?} (expected \"recall\" or \"maintenance\")"
+                )
+                .into());
             }
-            Some(name) if name == "maintenance" => {
-                self.maintenance.conversations.get_conversation(id).await?
-            }
-            _ => self.memory.get_conversation(id).await?,
         };
 
         Ok(rt)
@@ -2578,12 +2790,18 @@ impl Space {
     ) -> Result<(Vec<Conversation>, Option<String>), BoxError> {
         use anda_db::query::{Filter, Query, RangeQuery};
 
-        let collection = match collection {
-            Some(name) if name == "recall" => self.recall.conversations.conversations.clone(),
-            Some(name) if name == "maintenance" => {
-                self.maintenance.conversations.conversations.clone()
+        let collection = match collection.as_deref() {
+            Some("recall") => self.recall.conversations.conversations.clone(),
+            Some("maintenance") => self.maintenance.conversations.conversations.clone(),
+            None => self.memory.conversations.clone(),
+            // Same strictness as `get_conversation`: unknown names error
+            // instead of silently listing the formation collection.
+            Some(other) => {
+                return Err(format!(
+                    "unknown conversation collection {other:?} (expected \"recall\" or \"maintenance\")"
+                )
+                .into());
             }
-            _ => self.memory.conversations.clone(),
         };
         // 0 means "no limit" to the database (an unbounded scan), and an empty
         // page would panic on `rt.first().unwrap()` below; clamp instead.
@@ -2826,6 +3044,8 @@ impl Space {
             settlement_lock: tokio::sync::Mutex::new(()),
             self_test_lock: tokio::sync::Mutex::new(()),
             shadow_lock: tokio::sync::Mutex::new(()),
+            token_lock: tokio::sync::Mutex::new(()),
+            census_lock: tokio::sync::Mutex::new(()),
             judge_model: std::sync::RwLock::new(None),
             memory,
             wiki,
@@ -3007,7 +3227,29 @@ impl BrainHook for Hooks {
         // A missing marker means nothing was processed yet; resume from the
         // beginning so conversations queued during maintenance are not stuck.
         let id = space.formation.get_processed().unwrap_or_default();
-        let _ = space.restart_formation(SELF_USER_ID, id + 1).await;
+        if let Err(err) = space.restart_formation(SELF_USER_ID, id + 1).await {
+            let reason = err.to_string();
+            // "No pending ..." simply means no backlog. Anything else is a
+            // transient handoff race — e.g. maintenance finished so fast
+            // that formation's loop had not yet released its processing slot
+            // — and the queued backlog would otherwise stall until the next
+            // external input. One delayed retry (holding the space alive so
+            // eviction cannot close the DB underneath it) covers the window.
+            if !reason.contains("No pending formation conversation") {
+                let space = space.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    let id = space.formation.get_processed().unwrap_or_default();
+                    if let Err(err) = space.restart_formation(SELF_USER_ID, id + 1).await {
+                        log::warn!(
+                            target: "brain",
+                            space_id = space.id;
+                            "formation resume retry failed: {err}"
+                        );
+                    }
+                });
+            }
+        }
         // Post-sleep digest: fold freshly committed wiki knowledge into the
         // graph while formation is quiet (PRD §7.3, Daydream cadence).
         space.kick_wiki_digest();
@@ -4129,9 +4371,28 @@ mod tests {
 
         let tokens = space.list_space_tokens().unwrap();
         assert_eq!(tokens.len(), 1);
-        assert_eq!(tokens[0].token, token);
+        // The listing redacts the credential to a display prefix.
+        assert_eq!(tokens[0].token, "STtest-t…");
         assert_eq!(tokens[0].usage, 1);
 
+        // Revocation works by name (the listing no longer echoes values)…
+        assert!(space.revoke_space_token_by_name("reader").await.unwrap());
+        assert!(!space.revoke_space_token_by_name("reader").await.unwrap());
+        // …and by full token value.
+        let st2 = space
+            .add_space_token(
+                "STtest-token".to_string(),
+                AddSpaceTokenInput {
+                    scope: TokenScope::Read,
+                    name: "reader".to_string(),
+                    expires_at: None,
+                    labels: None,
+                },
+                1300,
+            )
+            .await
+            .unwrap();
+        assert_eq!(st2.token, "STtest-token");
         assert!(space.revoke_space_token("STtest-token").await.unwrap());
         assert!(!space.revoke_space_token("STtest-token").await.unwrap());
 
@@ -5272,11 +5533,29 @@ mod tests {
                 .await
                 .unwrap();
         }
+        // Empty input is rejected before any other check…
         let err = space
             .ingest(
                 SELF_USER_ID,
                 StringOr::Value(FormationInput {
                     messages: vec![],
+                    context: None,
+                    timestamp: None,
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("must not be empty"));
+        // …while real input still hits the tier node limit.
+        let err = space
+            .ingest(
+                SELF_USER_ID,
+                StringOr::Value(FormationInput {
+                    messages: vec![Message {
+                        role: "user".into(),
+                        content: vec!["remember this".to_string().into()],
+                        ..Default::default()
+                    }],
                     context: None,
                     timestamp: None,
                 }),
@@ -5600,6 +5879,9 @@ mod tests {
             .unwrap();
         assert!(first.conversation.is_some());
 
+        // The maintenance slot is claimed before settlement (review P1-3),
+        // so a concurrent start fails the claim and errors out instead of
+        // returning a placeholder output.
         let second = space
             .maintenance(
                 SELF_USER_ID,
@@ -5609,9 +5891,13 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .await
-            .unwrap();
-        assert!(second.content.contains("already in progress"));
+            .await;
+        assert!(
+            second
+                .unwrap_err()
+                .to_string()
+                .contains("already in progress")
+        );
 
         wait_until_idle(&space).await;
     }

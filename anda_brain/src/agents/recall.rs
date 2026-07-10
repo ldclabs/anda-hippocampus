@@ -466,12 +466,18 @@ impl Agent<AgentCtx> for RecallAgent {
         let mut last_output: Option<AgentOutput> = None;
         let mut total_model_turns = 0usize;
         let mut accounted_runner_turns = 0usize;
+        let mut unpersisted_turns = 0usize;
         loop {
             if total_model_turns >= RECALL_MAX_MODEL_TURNS {
                 let reason = format!(
                     "recall exceeded model turn limit of {}",
                     RECALL_MAX_MODEL_TURNS
                 );
+                // Failure can strike after usage was accumulated but before it
+                // was copied from a runner output (e.g. right after a
+                // compaction handoff), so sync the runner total on every
+                // failure path to avoid undercounting token accounting.
+                conversation.usage = runner.total_usage().clone();
                 return Ok(self.failed_output(conversation, reason, last_output).await);
             }
 
@@ -480,6 +486,7 @@ impl Agent<AgentCtx> for RecallAgent {
                     "recall timed out after {} seconds",
                     RECALL_TOTAL_TIMEOUT.as_secs()
                 );
+                conversation.usage = runner.total_usage().clone();
                 return Ok(self.failed_output(conversation, reason, last_output).await);
             };
 
@@ -494,6 +501,7 @@ impl Agent<AgentCtx> for RecallAgent {
                             "recall exceeded model turn limit of {}",
                             RECALL_MAX_MODEL_TURNS
                         );
+                        conversation.usage = runner.total_usage().clone();
                         return Ok(self.failed_output(conversation, reason, last_output).await);
                     }
                 }
@@ -501,6 +509,7 @@ impl Agent<AgentCtx> for RecallAgent {
                 Ok(Err(err)) => {
                     conversation.status = ConversationStatus::Failed;
                     conversation.failed_reason = Some(err.to_string());
+                    conversation.usage = runner.total_usage().clone();
                     conversation.updated_at = unix_ms();
                     if let Ok(changes) = conversation.to_changes() {
                         let _ = self
@@ -518,6 +527,7 @@ impl Agent<AgentCtx> for RecallAgent {
                         "recall timed out after {} seconds",
                         RECALL_TOTAL_TIMEOUT.as_secs()
                     );
+                    conversation.usage = runner.total_usage().clone();
                     return Ok(self.failed_output(conversation, reason, last_output).await);
                 }
             }
@@ -527,6 +537,7 @@ impl Agent<AgentCtx> for RecallAgent {
                     "recall timed out after {} seconds",
                     RECALL_TOTAL_TIMEOUT.as_secs()
                 );
+                conversation.usage = runner.total_usage().clone();
                 return Ok(self.failed_output(conversation, reason, last_output).await);
             };
 
@@ -536,6 +547,7 @@ impl Agent<AgentCtx> for RecallAgent {
                         "recall timed out after {} seconds",
                         RECALL_TOTAL_TIMEOUT.as_secs()
                     );
+                    conversation.usage = runner.total_usage().clone();
                     return Ok(self.failed_output(conversation, reason, last_output).await);
                 }
                 Ok(Ok(None)) => break,
@@ -569,7 +581,17 @@ impl Agent<AgentCtx> for RecallAgent {
                         push_completed_history(&self.history, &conversation, RECALL_HISTORY_LIMIT);
                     }
 
-                    self.persist_conversation(&conversation).await;
+                    // Persisting rewrites the full message array (O(turns^2)
+                    // over a session), so intermediate Working turns are
+                    // throttled; terminal statuses always persist. See
+                    // PERSIST_EVERY_N_TURNS.
+                    unpersisted_turns = unpersisted_turns.saturating_add(1);
+                    if conversation.status != ConversationStatus::Working
+                        || unpersisted_turns >= super::PERSIST_EVERY_N_TURNS
+                    {
+                        self.persist_conversation(&conversation).await;
+                        unpersisted_turns = 0;
+                    }
                     output.conversation = Some(conversation._id);
                     last_output = Some(output);
 
@@ -582,6 +604,7 @@ impl Agent<AgentCtx> for RecallAgent {
                 Ok(Err(err)) => {
                     conversation.status = ConversationStatus::Failed;
                     conversation.failed_reason = Some(err.to_string());
+                    conversation.usage = runner.total_usage().clone();
                     conversation.updated_at = unix_ms();
                     self.persist_conversation(&conversation).await;
                     self.hook
@@ -590,6 +613,14 @@ impl Agent<AgentCtx> for RecallAgent {
                     return Err(err);
                 }
             }
+        }
+
+        // Terminal exits above always persist (any non-Working status forces
+        // a write) and failure paths return early after persisting, so only a
+        // Working exit — the runner returning `Ok(None)` — can still hold
+        // turns skipped by the throttle.
+        if unpersisted_turns > 0 && conversation.status == ConversationStatus::Working {
+            self.persist_conversation(&conversation).await;
         }
 
         self.hook
@@ -619,7 +650,13 @@ mod tests {
         model::{CompletionFeaturesDyn, Model, Models, reqwest},
     };
     use object_store::memory::InMemory;
-    use std::{collections::BTreeSet, sync::Arc};
+    use std::{
+        collections::BTreeSet,
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
+    };
 
     #[derive(Debug)]
     struct FinalCompleter;
@@ -734,6 +771,60 @@ mod tests {
                     usage,
                     ..Default::default()
                 })
+            })
+        }
+    }
+
+    /// First turn emits a tool call whose usage forces compaction on the next
+    /// loop iteration (with `context_window = 1`), the compaction handoff
+    /// succeeds, and the following model turn errors out.
+    #[derive(Debug)]
+    struct CompactionThenErrorCompleter {
+        calls: Arc<AtomicU64>,
+    }
+
+    impl CompletionFeaturesDyn for CompactionThenErrorCompleter {
+        fn model_name(&self) -> String {
+            "recall-compaction-then-error-test-model".to_string()
+        }
+
+        fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+            let calls = self.calls.clone();
+            Box::pin(async move {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    return Ok(AgentOutput {
+                        tool_calls: vec![ToolCall {
+                            name: "execute_kip_readonly".to_string(),
+                            args: serde_json::json!({"commands": []}),
+                            result: None,
+                            call_id: Some("t0".to_string()),
+                            remote_id: None,
+                        }],
+                        usage: Usage {
+                            input_tokens: 100_000,
+                            output_tokens: 1,
+                            cached_tokens: 0,
+                            requests: 1,
+                        },
+                        ..Default::default()
+                    });
+                }
+                if req.tools.is_empty() {
+                    // Compaction handoff turn: tools are cleared for the
+                    // summarization request.
+                    return Ok(AgentOutput {
+                        content: "compacted recall handoff".to_string(),
+                        usage: Usage {
+                            input_tokens: 5_000,
+                            output_tokens: 1,
+                            cached_tokens: 0,
+                            requests: 1,
+                        },
+                        ..Default::default()
+                    });
+                }
+                Err("model down".into())
             })
         }
     }
@@ -985,6 +1076,41 @@ mod tests {
 
         assert!(err.to_string().contains("Input too large"));
         assert_eq!(space.recall.conversations.conversations.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn recall_failure_after_compaction_backfills_runner_usage() {
+        let app = test_app_state_with_configured_completer(
+            "recall_usage_backfill",
+            CompactionThenErrorCompleter {
+                calls: Arc::new(AtomicU64::new(0)),
+            },
+            |model| {
+                model.context_window = 1;
+            },
+        );
+        let space = create_loaded_space(&app, "recall_usage_backfill").await;
+        let ctx = space.ctx_for_test(SELF_USER_ID, RecallAgent::NAME).unwrap();
+
+        let err = Agent::<AgentCtx>::run(
+            space.recall.as_ref(),
+            ctx,
+            recall_prompt("fail after compaction", None),
+            vec![],
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("model down"));
+
+        let stored = space
+            .get_conversation(Some("recall".to_string()), 1)
+            .await
+            .unwrap();
+        assert_eq!(stored.status, ConversationStatus::Failed);
+        // The failing turn came right after a successful compaction handoff.
+        // Without backfilling from runner.total_usage() the stored usage would
+        // miss the 5_000-token handoff turn and record only 100_000.
+        assert_eq!(stored.usage.input_tokens, 105_000);
     }
 
     #[tokio::test]

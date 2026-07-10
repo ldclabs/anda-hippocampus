@@ -55,21 +55,21 @@ export interface Message {
 }
 
 export interface FormationInput {
-  messages: Message[];
+  messages: Message[]; // must contain at least one non-empty message (400)
   context?: InputContext;
   timestamp: string; // ISO 8601
 }
 
 export interface RecallInput {
-  query: string;
+  query: string; // must not be empty/blank (400)
   context?: InputContext;
 }
 
 export interface MaintenanceParameters {
-  stale_event_threshold_days?: number;
-  confidence_decay_factor?: number;
-  unsorted_max_backlog?: number;
-  orphan_max_count?: number;
+  stale_event_threshold_days?: number; // [1, 365]
+  confidence_decay_factor?: number; // (0, 1]
+  unsorted_max_backlog?: number; // [1, 10000]
+  orphan_max_count?: number; // [1, 10000]
 }
 
 export interface MaintenanceInput {
@@ -80,14 +80,15 @@ export interface MaintenanceInput {
 }
 
 export interface AddSpaceTokenInput {
-  scope: TokenScope;
-  name: string;
+  scope: TokenScope; // minting "*" requires a "*"-scoped CWT
+  name: string; // required, unique per space
   expires_at?: number; // Unix timestamp in milliseconds
   labels?: string[]; // wiki ACL labels; omitted = unrestricted
 }
 
 export interface RevokeSpaceTokenInput {
-  token: string;
+  token?: string; // full token value…
+  name?: string; // …or the unique token name (one of the two is required)
 }
 
 export interface UpdateSpaceInput {
@@ -346,8 +347,8 @@ export interface SpaceTier {
 }
 
 export interface SpaceToken {
-  token: string;
-  name: string;
+  token: string; // full value only in the add_space_token response; redacted to a prefix elsewhere
+  name: string; // required, unique per space; audit identity and revocation handle
   scope: TokenScope;
   usage: number;
   created_at: number; // Unix timestamp in milliseconds
@@ -601,17 +602,17 @@ When `ED25519_PUBKEYS` is set, configure the remote MCP client with an `Authoriz
 ### GET `/v1/{space_id}/conversations/{conversation_id}?collection=<collection>`
 
 - Purpose: Get a single conversation detail
-- Auth: SpaceToken/CWT `read` (public spaces are unauthenticated; private spaces require a valid token)
+- Auth: SpaceToken/CWT `read` (public spaces are unauthenticated; private spaces require a valid token); tokens restricted by ACL labels are rejected with `403` — conversations persist the full agent runner history, which is not label-scoped
 - Query:
-  - `collection?: string` // use "recall" to distinguish recall vs memory conversations
+  - `collection?: string` // "recall" or "maintenance" for non-default conversation collections; unknown values are rejected with `400`
 - Response: `RpcResponse<Conversation>`
 
 ### GET `/v1/{space_id}/conversations/{conversation_id}/delta?collection=<collection>&messages_offset=<n>&artifacts_offset=<n>`
 
 - Purpose: Get incremental conversation updates after client-side offsets
-- Auth: SpaceToken/CWT `read` (public spaces are unauthenticated; private spaces require a valid token)
+- Auth: SpaceToken/CWT `read` (public spaces are unauthenticated; private spaces require a valid token); tokens restricted by ACL labels are rejected with `403`
 - Query:
-  - `collection?: string` // use "recall" or "maintenance" to distinguish non-default conversation collections
+  - `collection?: string` // "recall" or "maintenance" for non-default conversation collections; unknown values are rejected with `400`
   - `messages_offset?: number` // returns only messages after this offset, defaults to `0`
   - `artifacts_offset?: number` // returns only artifacts after this offset, defaults to `0`
 - Response: `RpcResponse<ConversationDelta>`
@@ -619,9 +620,9 @@ When `ED25519_PUBKEYS` is set, configure the remote MCP client with an `Authoriz
 ### GET `/v1/{space_id}/conversations?collection=<collection>&cursor=<cursor>&limit=<n>`
 
 - Purpose: List conversations with pagination
-- Auth: SpaceToken/CWT `read` (public spaces are unauthenticated; private spaces require a valid token)
+- Auth: SpaceToken/CWT `read` (public spaces are unauthenticated; private spaces require a valid token); tokens restricted by ACL labels are rejected with `403`
 - Query:
-  - `collection?: string` // use "recall" to distinguish recall vs memory conversations
+  - `collection?: string` // "recall" or "maintenance" for non-default conversation collections; unknown values are rejected with `400`
   - `cursor?: string`
   - `limit?: number`
 - Response: `RpcResponse<Conversation[]>` (next page cursor is returned via `next_cursor`)
@@ -723,21 +724,21 @@ Wiki-specific error semantics: `409` commit conflict (`error.data.current_versio
 ### GET `/v1/{space_id}/management/space_tokens`
 
 - Purpose: List Space Tokens
-- Auth: Must pass CWT `write` (user management-level auth; raw token values are secret material)
-- Response: `RpcResponse<SpaceToken[]>`
+- Auth: Must pass CWT `write` (user management-level auth)
+- Response: `RpcResponse<SpaceToken[]>` — the `token` field is redacted to a display prefix (e.g. `STabc123…`); full token values are only returned once, by `add_space_token`. Save them at mint time, or revoke by `name`.
 
 ### POST `/v1/{space_id}/management/add_space_token`
 
 - Purpose: Add a Space Token
-- Auth: Must pass CWT `write` (user management-level auth)
-- Request body: `AddSpaceTokenInput`
-- Response: `RpcResponse<SpaceToken>` (new token, always prefixed with `ST`)
+- Auth: Must pass CWT `write` (user management-level auth). Minting a `*` (full-scope) token requires a `*`-scoped CWT — a `write` CWT cannot mint tokens above its own scope.
+- Request body: `AddSpaceTokenInput` — `name` is required and must be unique within the space (it is the token's audit identity and its revocation handle)
+- Response: `RpcResponse<SpaceToken>` (new token, always prefixed with `ST`; this is the only response that carries the full token value)
 
 ### POST `/v1/{space_id}/management/revoke_space_token`
 
 - Purpose: Revoke a Space Token
 - Auth: Must pass CWT `write` (user management-level auth)
-- Request body: `RevokeSpaceTokenInput`
+- Request body: `RevokeSpaceTokenInput` — either `token` (the full token value) or `name` (the unique token name, for managers who did not save the value at mint time)
 - Response: `RpcResponse<boolean>` (whether revocation succeeded)
 
 ### PATCH `/v1/{space_id}/management/update_space`
