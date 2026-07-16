@@ -92,7 +92,7 @@ const andaBrainPlugin = {
   version: packageJson.version,
 
   register(api: OpenClawPluginApi) {
-    const config = (api.pluginConfig ?? {}) as any as BrainPluginConfig
+    const config = (api.pluginConfig ?? {}) as unknown as BrainPluginConfig
     if (config.spaceId == null || config.spaceToken == null) {
       api.logger.error(
         '[anda-brain] Invalid configuration: spaceId and spaceToken are required. You can obtain them at https://anda.ai/brain'
@@ -171,9 +171,7 @@ const andaBrainPlugin = {
 
         const res = await client.recall(query, callContext)
         if (res.error) {
-          api.logger.error(
-            `[anda-brain] Recall failed: ${res.error.message}`
-          )
+          api.logger.error(`[anda-brain] Recall failed: ${res.error.message}`)
           return {
             content: [
               {
@@ -217,7 +215,8 @@ const andaBrainPlugin = {
       if (messages.length === 0) return
       const context: InputContext = {
         ...defaultContext,
-        agent: ctx.agentId || defaultContext?.agent
+        agent: ctx.agentId || defaultContext?.agent,
+        source: ctx.sessionKey || ctx.channelId || defaultContext?.source
       }
       client
         .formation(messages, context)

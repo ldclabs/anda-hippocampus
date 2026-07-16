@@ -121,7 +121,7 @@ anda-cli --space-id my_space --token $TOKEN recall "What are the user's preferen
 
 # Recall with context
 anda-cli --space-id my_space --token $TOKEN recall \
-  --context-user u1 "What happened in the last meeting?"
+  --context-counterparty u1 "What happened in the last meeting?"
 
 # Trigger maintenance
 anda-cli --space-id my_space --token $TOKEN maintenance

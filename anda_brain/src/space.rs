@@ -1622,23 +1622,19 @@ impl Space {
         };
 
         // 1) Reinforcement flush: drain dirty ledger rows in batches. The
-        // dirty flag — not a time-window watermark — is the cursor, so a row
-        // whose KIP write fails (or that arrives past a batch limit) stays
-        // dirty and is retried by every later settlement; usage counts can
-        // no longer be lost. Rows already attempted this pass are skipped so
-        // persistent failures cannot spin the loop.
-        let mut attempted: BTreeSet<u64> = BTreeSet::new();
+        // dirty flag — not a time-window watermark — marks pending work, so
+        // a row whose KIP write fails (or that arrives past a batch limit)
+        // stays dirty and is retried by every later settlement; usage counts
+        // can no longer be lost. Within one pass the `_id` cursor advances
+        // strictly, so persistently-failing rows can neither spin the loop
+        // nor occupy every batch window and starve the rows behind them.
+        let mut cursor = 0u64;
         for _ in 0..SETTLEMENT_MAX_BATCHES {
-            let rows = self
+            let (rows, next_cursor) = self
                 .ledger
-                .unflushed_recalls(SETTLEMENT_BATCH_LIMIT)
+                .unflushed_recalls(cursor, SETTLEMENT_BATCH_LIMIT)
                 .await?;
-            let mut progressed = false;
             for row in &rows {
-                if !attempted.insert(row._id) {
-                    continue;
-                }
-                progressed = true;
                 if !crate::assess::is_proposition_entity_id(&row.entity) {
                     // Concept usage stays ledger-only: decay targets links, and
                     // marking the row flushed keeps it out of future scans.
@@ -1671,8 +1667,9 @@ impl Space {
                     }
                 }
             }
-            if !progressed || rows.len() < SETTLEMENT_BATCH_LIMIT {
-                break;
+            match next_cursor {
+                Some(next) => cursor = next,
+                None => break,
             }
         }
 
@@ -4542,6 +4539,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn usage_ledger_unflushed_recalls_pages_by_id_cursor() {
+        let app = test_app_state("usage_ledger_cursor");
+        let space = create_loaded_space(&app, "usage_ledger_cursor").await;
+
+        let entities = std::collections::BTreeSet::from([
+            "P:1:a".to_string(),
+            "P:2:b".to_string(),
+            "C:3".to_string(),
+        ]);
+        space.ledger.record_recall(&entities, 100).await.unwrap();
+
+        // Page through with limit 1: each page advances the cursor past the
+        // returned row, so a stuck (still-dirty) prefix row can never occupy
+        // the next window — the starvation shape this cursor exists for.
+        let mut cursor = 0u64;
+        let mut seen = Vec::new();
+        loop {
+            let (rows, next) = space.ledger.unflushed_recalls(cursor, 1).await.unwrap();
+            for row in &rows {
+                assert!(row._id > cursor, "pages must advance strictly by _id");
+                seen.push(row.entity.clone());
+            }
+            match next {
+                Some(next_cursor) => {
+                    assert!(next_cursor > cursor);
+                    cursor = next_cursor;
+                }
+                None => break,
+            }
+        }
+        seen.sort();
+        assert_eq!(seen, vec!["C:3", "P:1:a", "P:2:b"]);
+
+        // A cursor past every row scans nothing and reports exhaustion.
+        let (rows, next) = space.ledger.unflushed_recalls(u64::MAX, 1).await.unwrap();
+        assert!(rows.is_empty());
+        assert!(next.is_none());
+    }
+
+    #[tokio::test]
     async fn usage_ledger_counts_corrections_and_flush_state() {
         let app = test_app_state("usage_ledger");
         let space = create_loaded_space(&app, "usage_ledger").await;
@@ -4566,7 +4603,7 @@ mod tests {
             1
         );
 
-        let pending = space.ledger.unflushed_recalls(100).await.unwrap();
+        let pending = space.ledger.unflushed_recalls(0, 100).await.unwrap().0;
         assert_eq!(pending.len(), 2);
         assert!(pending.iter().all(|row| row.dirty == 1));
 
@@ -4595,7 +4632,7 @@ mod tests {
             .mark_flushed(row._id, row.recall_count, 500)
             .await
             .unwrap();
-        let pending = space.ledger.unflushed_recalls(100).await.unwrap();
+        let pending = space.ledger.unflushed_recalls(0, 100).await.unwrap().0;
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].entity, "C:9");
 
@@ -4610,7 +4647,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let pending = space.ledger.unflushed_recalls(100).await.unwrap();
+        let pending = space.ledger.unflushed_recalls(0, 100).await.unwrap().0;
         assert_eq!(pending.len(), 2);
     }
 

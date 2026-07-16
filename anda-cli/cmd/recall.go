@@ -13,10 +13,14 @@ what information you want to retrieve from memory.
 
 Example:
   anda-cli recall "What are the user's preferences?"
-  anda-cli recall --context-user u1 "What happened in the last meeting?"`,
+  anda-cli recall --context-counterparty u1 "What happened in the last meeting?"`,
 	Args: cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
-		contextUser, _ := cmd.Flags().GetString("context-user")
+		contextCounterparty, _ := cmd.Flags().GetString("context-counterparty")
+		if contextCounterparty == "" {
+			// Fall back to the deprecated alias.
+			contextCounterparty, _ = cmd.Flags().GetString("context-user")
+		}
 		contextAgent, _ := cmd.Flags().GetString("context-agent")
 		contextTopic, _ := cmd.Flags().GetString("context-topic")
 
@@ -24,7 +28,7 @@ Example:
 			Query: args[0],
 		}
 
-		ctx := buildInputContext(contextUser, contextAgent, "", contextTopic)
+		ctx := buildInputContext(contextCounterparty, contextAgent, "", contextTopic)
 		if ctx != nil {
 			input.Context = ctx
 		}
@@ -44,7 +48,9 @@ Example:
 }
 
 func init() {
-	recallCmd.Flags().String("context-user", "", "Context user")
+	recallCmd.Flags().String("context-counterparty", "", "Context counterparty (e.g. user ID)")
+	recallCmd.Flags().String("context-user", "", "Context counterparty (deprecated alias)")
+	_ = recallCmd.Flags().MarkDeprecated("context-user", "use --context-counterparty instead")
 	recallCmd.Flags().String("context-agent", "", "Context agent")
 	recallCmd.Flags().String("context-topic", "", "Context topic")
 	rootCmd.AddCommand(recallCmd)

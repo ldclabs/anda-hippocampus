@@ -99,7 +99,13 @@ struct Cli {
     #[arg(long, env = "MANAGERS", default_value = "")]
     managers: String,
 
-    /// CORS allowed origins, separated by comma. Use "*" to allow all origins.
+    /// CORS allowed origins, separated by comma. Use "*" to allow all
+    /// origins — note that "*" maps to CorsLayer::very_permissive(), which
+    /// answers any origin with Access-Control-Allow-Credentials: true, i.e.
+    /// any website may issue credentialed cross-site requests to this API.
+    /// The API carries credentials in Bearer headers (never cookies), so
+    /// browsers won't attach them automatically, but prefer an explicit
+    /// origin list on deployments that don't need fully open CORS.
     #[arg(long, env = "CORS_ORIGINS", default_value = "")]
     cors_origins: String,
 
@@ -1302,6 +1308,10 @@ async fn run_eval_command(cli: &Cli, config: EvalCommandConfig) -> Result<(), Bo
         }
     } else {
         let mut suites = Vec::with_capacity(profiles.len());
+        // Profiles run sequentially on purpose: each suite already keeps
+        // EVAL_SCENARIO_CONCURRENCY scenarios in flight, and stacking
+        // profile-level concurrency on top mostly buys provider rate-limit
+        // errors that would surface as zero-score fallback reports.
         for profile in &profiles {
             let suite = run_eval_suite(&env, &space_id, profile, &scenarios).await?;
             suites.push(suite);
@@ -1493,46 +1503,72 @@ fn append_gate_summary(out: &mut String, gate_report: &EvalGateReport) {
     }
 }
 
+/// Concurrent-scenario budget for one suite run. Scenarios are fully
+/// isolated (each in its own run-scoped space), so this only bounds how many
+/// model conversations are in flight at once — enough to hide LLM latency
+/// (the optimize loop re-runs the whole suite every generation) without
+/// driving provider rate limits into the zero-score fallback reports.
+const EVAL_SCENARIO_CONCURRENCY: usize = 4;
+
 async fn run_eval_suite(
     env: &EvalRunEnv,
     base_space_id: &str,
     profile: &NamedEvalProfile,
     scenarios: &[EvalScenario],
 ) -> Result<EvalSuiteReport, BoxError> {
-    let mut reports = Vec::with_capacity(scenarios.len());
-    for scenario in scenarios {
-        // Each scenario runs in its own run-scoped space (see `space_host`),
-        // so leftover memories from a previous run can never leak into
-        // scores; the default in-memory host vanishes when `state` drops.
-        let (state, scenario_space_id) =
-            env.space_host(&[base_space_id, &profile.id, &scenario.id]);
-        let result = match load_eval_space(env, &state, &scenario_space_id).await {
-            Ok(space) => {
-                // Close even when the scenario fails so `--keep-spaces`
-                // leaves a flushed, inspectable space. Close failures only
-                // warn: on the default path the store is dropped right
-                // after, so there is nothing durable to lose.
-                let result = run_scenario(space.as_ref(), scenario, &profile.profile).await;
-                if let Err(err) = space.db.close().await {
-                    eprintln!("warning: failed to close eval space {scenario_space_id}: {err}");
-                }
-                result
-            }
-            Err(err) => Err(err),
-        };
-        // One scenario's failure must not discard the other (paid) scenario
-        // reports: record it as a zero-score report with a finding so the
-        // suite mean is not silently inflated either, and keep going.
-        reports.push(match result {
-            Ok(report) => report,
-            Err(err) => {
-                eprintln!("warning: eval scenario `{}` aborted: {err}", scenario.id);
-                failed_scenario_report(scenario, &profile.id, err.as_ref())
-            }
-        });
-    }
+    use futures::StreamExt;
+
+    // Each scenario runs in its own run-scoped space (see `space_host`), so
+    // leftover memories from a previous run can never leak into scores and
+    // scenarios can run concurrently; the default in-memory host vanishes
+    // when `state` drops. `buffered` keeps the reports in scenario order.
+    // The futures are collected eagerly (futures are inert until polled): a
+    // lazy `map` closure inside the stream would poison this function's
+    // future with rustc's "implementation of FnOnce is not general enough"
+    // when it is later boxed 'static (the optimize loop does exactly that).
+    let scenario_futures: Vec<_> = scenarios
+        .iter()
+        .map(|scenario| run_suite_scenario(env, base_space_id, profile, scenario))
+        .collect();
+    let reports: Vec<EvalReport> = futures::stream::iter(scenario_futures)
+        .buffered(EVAL_SCENARIO_CONCURRENCY)
+        .collect()
+        .await;
 
     Ok(EvalSuiteReport::from_reports(profile.id.clone(), reports))
+}
+
+async fn run_suite_scenario(
+    env: &EvalRunEnv,
+    base_space_id: &str,
+    profile: &NamedEvalProfile,
+    scenario: &EvalScenario,
+) -> EvalReport {
+    let (state, scenario_space_id) = env.space_host(&[base_space_id, &profile.id, &scenario.id]);
+    let result = match load_eval_space(env, &state, &scenario_space_id).await {
+        Ok(space) => {
+            // Close even when the scenario fails so `--keep-spaces` leaves a
+            // flushed, inspectable space. Close failures only warn: on the
+            // default path the store is dropped right after, so there is
+            // nothing durable to lose.
+            let result = run_scenario(space.as_ref(), scenario, &profile.profile).await;
+            if let Err(err) = space.db.close().await {
+                eprintln!("warning: failed to close eval space {scenario_space_id}: {err}");
+            }
+            result
+        }
+        Err(err) => Err(err),
+    };
+    // One scenario's failure must not discard the other (paid) scenario
+    // reports: record it as a zero-score report with a finding so the suite
+    // mean is not silently inflated either, and keep going.
+    match result {
+        Ok(report) => report,
+        Err(err) => {
+            eprintln!("warning: eval scenario `{}` aborted: {err}", scenario.id);
+            failed_scenario_report(scenario, &profile.id, err.as_ref())
+        }
+    }
 }
 
 /// Zero-score stand-in for a scenario that aborted before producing a

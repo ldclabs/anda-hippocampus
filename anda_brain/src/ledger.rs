@@ -201,22 +201,52 @@ impl UsageLedger {
     /// Scans the `dirty` flag — not a time window — so a row whose flush
     /// failed, or that arrived past a batch limit, keeps showing up until it
     /// actually settles.
-    pub async fn unflushed_recalls(&self, limit: usize) -> Result<Vec<MemoryUsage>, DBError> {
-        let rows: Vec<MemoryUsage> = self
+    ///
+    /// Pages by `_id > after_id` so a prefix of persistently-failing rows
+    /// cannot occupy every batch window and starve the dirty rows behind
+    /// them. The id-set intersection is index-only; ids are sorted here
+    /// because `Filter::And` yields an unordered set, and only the page's
+    /// documents are fetched. Returns the page plus `Some(last_scanned_id)`
+    /// when more dirty rows remain past it (`None` = scan exhausted).
+    pub async fn unflushed_recalls(
+        &self,
+        after_id: u64,
+        limit: usize,
+    ) -> Result<(Vec<MemoryUsage>, Option<u64>), DBError> {
+        let mut ids = self
             .collection
-            .search_as(Query {
-                search: None,
-                filter: Some(Filter::Field((
-                    "dirty".to_string(),
-                    RangeQuery::Eq(Fv::U64(1)),
-                ))),
-                limit: Some(limit),
-            })
+            .query_ids(
+                Filter::And(vec![
+                    Box::new(Filter::Field((
+                        "dirty".to_string(),
+                        RangeQuery::Eq(Fv::U64(1)),
+                    ))),
+                    Box::new(Filter::Field((
+                        "_id".to_string(),
+                        RangeQuery::Gt(Fv::U64(after_id)),
+                    ))),
+                ]),
+                None,
+            )
             .await?;
-        Ok(rows
-            .into_iter()
-            .filter(|row| row.recall_count > row.flushed_recall_count)
-            .collect())
+        ids.sort_unstable();
+        let next_cursor = if ids.len() > limit {
+            ids.get(limit.saturating_sub(1)).copied()
+        } else {
+            None
+        };
+        ids.truncate(limit);
+
+        let mut rows = Vec::with_capacity(ids.len());
+        for id in ids {
+            match self.collection.get_as::<MemoryUsage>(id).await {
+                Ok(row) if row.recall_count > row.flushed_recall_count => rows.push(row),
+                // Dirty without a pending delta, or removed while paging
+                // (forget cascade): nothing to settle.
+                Ok(_) | Err(_) => {}
+            }
+        }
+        Ok((rows, next_cursor))
     }
 
     /// Marks a row's recall counter as settled onto graph metadata. Re-reads
@@ -494,25 +524,32 @@ impl MissCache {
     pub async fn clear(&self) -> Result<u64, DBError> {
         let _guard = self.write_lock.lock().await;
         let mut cleared = 0u64;
+        let mut cursor = 0u64;
         loop {
             // Filterless queries return nothing in AndaDB; scan by `_id`.
+            // The cursor advances past rows whose remove failed (same shape
+            // as purge_expired_locked), so a persistent storage error cannot
+            // spin this loop forever — clear() runs inline in the
+            // conversation-end hook. Skipped rows expire via the TTL purge.
             let rows: Vec<RecallMiss> = self
                 .collection
                 .search_as(Query {
                     search: None,
                     filter: Some(Filter::Field((
                         "_id".to_string(),
-                        RangeQuery::Gt(Fv::U64(0)),
+                        RangeQuery::Gt(Fv::U64(cursor)),
                     ))),
                     limit: Some(100),
                 })
                 .await?;
-            if rows.is_empty() {
+            let Some(max_id) = rows.iter().map(|row| row._id).max() else {
                 break;
-            }
+            };
+            cursor = cursor.max(max_id);
             for row in rows {
-                let _ = self.collection.remove(row._id).await;
-                cleared += 1;
+                if self.collection.remove(row._id).await.is_ok() {
+                    cleared += 1;
+                }
             }
         }
         Ok(cleared)

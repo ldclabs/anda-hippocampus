@@ -199,9 +199,10 @@ pub(super) async fn drive_runner_loop<H: RunnerHost>(
                         unpersisted_turns = 0;
                     }
 
-                    if conversation.status == ConversationStatus::Cancelled
-                        || conversation.status == ConversationStatus::Failed
-                    {
+                    // The assignment above only produces Failed/Completed/
+                    // Working; there is no in-flight cancellation path, so
+                    // Failed is the only terminal state to check here.
+                    if conversation.status == ConversationStatus::Failed {
                         break 'run None;
                     }
 
