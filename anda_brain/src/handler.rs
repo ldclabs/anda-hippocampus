@@ -1,4 +1,4 @@
-use anda_engine::unix_ms;
+use anda_engine::{memory::Conversation, unix_ms};
 use axum::{
     Json,
     body::Bytes,
@@ -13,11 +13,12 @@ use serde_json::json;
 
 use crate::{
     agents::SELF_USER_ID,
+    authz::{AuthzError, AuthzMode, authorize, check_cwt, ensure_sharding, load_space},
     payload::{Accept, AppError, ContentType, HeaderVals, PayloadFormat, RpcResponse, StringOr},
-    space::{AppState, Space},
+    space::AppState,
     types::*,
     wiki::{
-        WikiAccess, WikiCommitInput, WikiError, WikiImportInput, WikiListDocsInput, WikiReadInput,
+        WikiCommitInput, WikiError, WikiImportInput, WikiListDocsInput, WikiReadInput,
         WikiSearchInput, WikiSelector, WikiVerifyInput,
     },
 };
@@ -25,33 +26,6 @@ use crate::{
 const SKILL_MARKDOWN: &str = include_str!("../SKILL.md");
 const FAVICON: &[u8] = include_bytes!("../favicon.ico");
 const APPLE_TOUCH_ICON: &[u8] = include_bytes!("../apple-touch-icon.webp");
-
-/// Maps a space-load failure to an HTTP error: a nonexistent space is 404
-/// with a generic message, anything else 500. Either way the Debug detail
-/// stays in the log — AndaDB/object-store errors can embed storage paths,
-/// which must not leak into response bodies.
-fn space_load_error(space_id: &str, err: anda_core::BoxError) -> AppError {
-    let not_found = matches!(
-        err.downcast_ref::<anda_db::error::DBError>(),
-        Some(anda_db::error::DBError::NotFound { .. })
-    );
-    log::warn!(target: "brain", space_id; "failed to load space: {err:?}");
-    if not_found {
-        AppError::with_status(StatusCode::NOT_FOUND, "space not found")
-    } else {
-        AppError::with_status(StatusCode::INTERNAL_SERVER_ERROR, "failed to load space")
-    }
-}
-
-fn ensure_sharding(app: &AppState, sharding: u32) -> Result<(), AppError> {
-    if sharding != app.sharding {
-        return Err(AppError::bad_request(format!(
-            "space_id sharding {} does not match server sharding {}",
-            sharding, app.sharding
-        )));
-    }
-    Ok(())
-}
 
 pub async fn favicon() -> Response {
     Response::builder()
@@ -89,24 +63,16 @@ pub async fn get_info(
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
 ) -> Result<impl IntoResponse, AppError> {
-    ensure_sharding(&app, sharding)?;
-
-    let now_ms = unix_ms();
-    let t = app
-        .check_auth_if(&token, &space_id, TokenScope::Read, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
-
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
-
-    if !space.is_public() && t.is_none() {
-        // 如果空间不是公开的，且没有验证 CWToken，则验证 SpaceToken
-        space
-            .verify_space_token(token, TokenScope::Read, now_ms)
-            .map_err(|_| AppError::unauthorized())?;
-    }
+    let (space, _caller) = authorize(
+        &app,
+        &space_id,
+        &token,
+        Some(sharding),
+        TokenScope::Read,
+        AuthzMode::PublicReadLenient,
+        unix_ms(),
+    )
+    .await?;
 
     let rt = space.get_info();
     Ok(ct.response(RpcResponse::success(rt)))
@@ -119,24 +85,16 @@ pub async fn get_formation_status(
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
 ) -> Result<impl IntoResponse, AppError> {
-    ensure_sharding(&app, sharding)?;
-
-    let now_ms = unix_ms();
-    let t = app
-        .check_auth_if(&token, &space_id, TokenScope::Read, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
-
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
-
-    if !space.is_public() && t.is_none() {
-        // 如果空间不是公开的，且没有验证 CWToken，则验证 SpaceToken
-        space
-            .verify_space_token(token, TokenScope::Read, now_ms)
-            .map_err(|_| AppError::unauthorized())?;
-    }
+    let (space, _caller) = authorize(
+        &app,
+        &space_id,
+        &token,
+        Some(sharding),
+        TokenScope::Read,
+        AuthzMode::PublicReadLenient,
+        unix_ms(),
+    )
+    .await?;
 
     let rt = space.formation_status();
     Ok(ct.response(RpcResponse::success(rt)))
@@ -154,22 +112,16 @@ pub async fn post_formation(
 
     let input: StringOr<FormationInput> = ct.parse_body(&body).map_err(AppError::bad_request)?;
 
-    let now_ms = unix_ms();
-    let t = app
-        .check_auth_if(&token, &space_id, TokenScope::Write, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
-
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
-
-    if t.is_none() {
-        // 如果没有验证 CWToken，则验证 SpaceToken
-        space
-            .verify_space_token(token, TokenScope::Write, now_ms)
-            .map_err(|_| AppError::unauthorized())?;
-    }
+    let (space, _caller) = authorize(
+        &app,
+        &space_id,
+        &token,
+        Some(sharding),
+        TokenScope::Write,
+        AuthzMode::Credentialed,
+        unix_ms(),
+    )
+    .await?;
 
     // 使用匿名 caller 进行 ingestions 和 queries
     let rt = space
@@ -200,26 +152,20 @@ pub async fn post_recall(
 
     let input: StringOr<RecallInput> = ct.parse_body(&body).map_err(AppError::bad_request)?;
 
-    let now_ms = unix_ms();
-    let t = app
-        .check_auth_if(&token, &space_id, TokenScope::Read, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
-
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
-
-    // A supplied token is verified even on public spaces so its ACL
-    // restriction is honored rather than silently widened.
-    let st = wiki_read_token(&space, &t, token, now_ms)?;
-    if label_restricted(st.as_ref()) {
+    let (space, caller) = authorize(
+        &app,
+        &space_id,
+        &token,
+        Some(sharding),
+        TokenScope::Read,
+        AuthzMode::PublicRead,
+        unix_ms(),
+    )
+    .await?;
+    if caller.label_restricted() {
         // RecallAgent's wiki tools span all labels; a label-restricted token
         // cannot use agentic recall (mirrors the /wiki/events guard).
-        return Err(AppError::with_status(
-            StatusCode::FORBIDDEN,
-            "recall requires an unrestricted token",
-        ));
+        return Err(AuthzError::Forbidden("recall requires an unrestricted token").into());
     }
 
     // 使用固定的 caller 进行 ingestions 和 queries
@@ -251,23 +197,19 @@ pub async fn post_recall_structured(
 
     let input: StringOr<RecallInput> = ct.parse_body(&body).map_err(AppError::bad_request)?;
 
-    let now_ms = unix_ms();
-    let t = app
-        .check_auth_if(&token, &space_id, TokenScope::Read, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
-
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
-
-    let st = wiki_read_token(&space, &t, token, now_ms)?;
-    if label_restricted(st.as_ref()) {
+    let (space, caller) = authorize(
+        &app,
+        &space_id,
+        &token,
+        Some(sharding),
+        TokenScope::Read,
+        AuthzMode::PublicRead,
+        unix_ms(),
+    )
+    .await?;
+    if caller.label_restricted() {
         // Same guard as /recall: the agent's wiki tools span all labels.
-        return Err(AppError::with_status(
-            StatusCode::FORBIDDEN,
-            "recall requires an unrestricted token",
-        ));
+        return Err(AuthzError::Forbidden("recall requires an unrestricted token").into());
     }
 
     let rt = space
@@ -302,21 +244,16 @@ pub async fn post_probe(
         StringOr::Value(input) => input,
     };
 
-    let now_ms = unix_ms();
-    let t = app
-        .check_auth_if(&token, &space_id, TokenScope::Read, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
-
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
-
-    if !space.is_public() && t.is_none() {
-        space
-            .verify_space_token(token, TokenScope::Read, now_ms)
-            .map_err(|_| AppError::unauthorized())?;
-    }
+    let (space, _caller) = authorize(
+        &app,
+        &space_id,
+        &token,
+        Some(sharding),
+        TokenScope::Read,
+        AuthzMode::PublicReadLenient,
+        unix_ms(),
+    )
+    .await?;
 
     let rt = space
         .probe_memory(&input.query, input.limit)
@@ -343,21 +280,16 @@ pub async fn post_memory_pin(
         .value()
         .map_err(|_| AppError::bad_request("expected a JSON object body".to_string()))?;
 
-    let now_ms = unix_ms();
-    let t = app
-        .check_auth_if(&token, &space_id, TokenScope::Write, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
-
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
-
-    if t.is_none() {
-        space
-            .verify_space_token(token, TokenScope::Write, now_ms)
-            .map_err(|_| AppError::unauthorized())?;
-    }
+    let (space, _caller) = authorize(
+        &app,
+        &space_id,
+        &token,
+        Some(sharding),
+        TokenScope::Write,
+        AuthzMode::Credentialed,
+        unix_ms(),
+    )
+    .await?;
 
     let updated = space
         .pin_memory(&input.entity, input.pinned)
@@ -388,21 +320,16 @@ pub async fn post_memory_forget(
         .value()
         .map_err(|_| AppError::bad_request("expected a JSON object body".to_string()))?;
 
-    let now_ms = unix_ms();
-    let t = app
-        .check_auth_if(&token, &space_id, TokenScope::Write, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
-
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
-
-    if t.is_none() {
-        space
-            .verify_space_token(token, TokenScope::Write, now_ms)
-            .map_err(|_| AppError::unauthorized())?;
-    }
+    let (space, _caller) = authorize(
+        &app,
+        &space_id,
+        &token,
+        Some(sharding),
+        TokenScope::Write,
+        AuthzMode::Credentialed,
+        unix_ms(),
+    )
+    .await?;
 
     let rt = space
         .forget_memory(input)
@@ -422,23 +349,16 @@ pub async fn get_memory_status(
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
 ) -> Result<impl IntoResponse, AppError> {
-    ensure_sharding(&app, sharding)?;
-
-    let now_ms = unix_ms();
-    let t = app
-        .check_auth_if(&token, &space_id, TokenScope::Read, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
-
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
-
-    if !space.is_public() && t.is_none() {
-        space
-            .verify_space_token(token, TokenScope::Read, now_ms)
-            .map_err(|_| AppError::unauthorized())?;
-    }
+    let (space, _caller) = authorize(
+        &app,
+        &space_id,
+        &token,
+        Some(sharding),
+        TokenScope::Read,
+        AuthzMode::PublicReadLenient,
+        unix_ms(),
+    )
+    .await?;
 
     let rt = space.memory_status().await;
     Ok(ct.response(RpcResponse::success(rt)))
@@ -459,10 +379,10 @@ pub async fn post_shadow_eval(
 ) -> Result<impl IntoResponse, AppError> {
     ensure_sharding(&app, sharding)?;
 
-    let now_ms = unix_ms();
-    let _ = app
-        .check_auth(&token, &space_id, TokenScope::Write, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
+    // Deliberately not `authorize()`: shadow_eval never loads the space here
+    // (`run_shadow_eval` loads and forks it itself, with its own error
+    // mapping), so only the management CWT gate applies.
+    let _ = check_cwt(&app, &space_id, &token, TokenScope::Write, unix_ms())?;
 
     let input: ShadowEvalInput = ct
         .parse_body(&body)
@@ -504,70 +424,6 @@ fn wiki_error(err: WikiError) -> AppError {
         WikiError::Db(_) => {
             AppError::with_status(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
         }
-    }
-}
-
-/// Resolves the audit actor: the authenticated CWT user, else a stable
-/// space-token identity, else the anonymous marker (public-space readers
-/// with no credential must not be recorded as the space's own identity).
-/// Shared with the MCP channel so both audit trails name identical subjects.
-pub(crate) fn wiki_actor(t: &Option<CWToken>, st: Option<&SpaceToken>) -> String {
-    if let Some(t) = t {
-        return t.user.to_string();
-    }
-    match st {
-        Some(st) if !st.name.trim().is_empty() => format!("st:{}", st.name.trim()),
-        Some(_) => "st:unnamed".to_string(),
-        None => "anonymous".to_string(),
-    }
-}
-
-/// Verifies read access and returns the space token (for its ACL labels).
-/// A supplied token is verified even on public spaces so a labeled token
-/// keeps its granted labels instead of degrading to the anonymous view;
-/// only absent/invalid credentials fall back to anonymous there.
-fn wiki_read_token(
-    space: &Space,
-    t: &Option<CWToken>,
-    token: String,
-    now_ms: u64,
-) -> Result<Option<SpaceToken>, AppError> {
-    if t.is_some() {
-        return Ok(None);
-    }
-    match space.verify_space_token(token, TokenScope::Read, now_ms) {
-        Ok(st) => Ok(Some(st)),
-        Err(_) if space.is_public() => Ok(None),
-        Err(_) => Err(AppError::unauthorized()),
-    }
-}
-
-/// True when the space token is label-restricted (a read-only wiki viewer,
-/// PRD §8.2). Such tokens must not reach surfaces that span all labels:
-/// agentic recall (its wiki tools run unrestricted), the audit event log,
-/// and stored conversations — recall conversations persist the full runner
-/// history, including wiki tool output from behind any label. Shared with
-/// the MCP channel so the guards cannot drift apart.
-pub(crate) fn label_restricted(st: Option<&SpaceToken>) -> bool {
-    st.is_some_and(|st| st.labels.is_some())
-}
-
-/// Read scope resolution (PRD §8.2): CWT holders and label-less space
-/// tokens are unrestricted; labeled tokens see unlabeled content plus their
-/// labels; anonymous public-space readers see unlabeled content only.
-/// Shared with the MCP channel so the two never diverge (the launch review's
-/// P0-1 was exactly such a divergence).
-pub(crate) fn wiki_read_access(t: &Option<CWToken>, st: Option<&SpaceToken>) -> WikiAccess {
-    let labels = if t.is_some() {
-        None
-    } else if let Some(st) = st {
-        st.labels.clone()
-    } else {
-        Some(Vec::new())
-    };
-    WikiAccess {
-        actor: wiki_actor(t, st),
-        labels,
     }
 }
 
@@ -619,23 +475,18 @@ pub async fn post_wiki_commit(
     };
 
     let now_ms = unix_ms();
-    let t = app
-        .check_auth_if(&token, &space_id, TokenScope::Write, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
-    let st = match &t {
-        Some(_) => None,
-        None => Some(
-            space
-                .verify_space_token(token, TokenScope::Write, now_ms)
-                .map_err(|_| AppError::unauthorized())?,
-        ),
-    };
+    let (space, caller) = authorize(
+        &app,
+        &space_id,
+        &token,
+        Some(sharding),
+        TokenScope::Write,
+        AuthzMode::Credentialed,
+        now_ms,
+    )
+    .await?;
 
-    let actor = wiki_actor(&t, st.as_ref());
+    let actor = caller.actor();
     let rt = space
         .wiki
         .commit(actor, input, now_ms)
@@ -652,18 +503,17 @@ pub async fn list_wiki_docs(
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
 ) -> Result<impl IntoResponse, AppError> {
-    ensure_sharding(&app, sharding)?;
-
-    let now_ms = unix_ms();
-    let t = app
-        .check_auth_if(&token, &space_id, TokenScope::Read, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
-    let st = wiki_read_token(&space, &t, token, now_ms)?;
-    let access = wiki_read_access(&t, st.as_ref());
+    let (space, caller) = authorize(
+        &app,
+        &space_id,
+        &token,
+        Some(sharding),
+        TokenScope::Read,
+        AuthzMode::PublicRead,
+        unix_ms(),
+    )
+    .await?;
+    let access = caller.wiki_access();
 
     let rt = space
         .wiki
@@ -693,18 +543,18 @@ pub async fn get_wiki_doc(
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
 ) -> Result<impl IntoResponse, AppError> {
-    ensure_sharding(&app, sharding)?;
-
     let now_ms = unix_ms();
-    let t = app
-        .check_auth_if(&token, &space_id, TokenScope::Read, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
-    let st = wiki_read_token(&space, &t, token, now_ms)?;
-    let access = wiki_read_access(&t, st.as_ref());
+    let (space, caller) = authorize(
+        &app,
+        &space_id,
+        &token,
+        Some(sharding),
+        TokenScope::Read,
+        AuthzMode::PublicRead,
+        now_ms,
+    )
+    .await?;
+    let access = caller.wiki_access();
 
     let (doc, toc) = tokio::try_join!(
         space.wiki.get_doc_scoped(&access, doc_id),
@@ -736,33 +586,25 @@ pub async fn get_wiki_content(
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
 ) -> Result<impl IntoResponse, AppError> {
-    ensure_sharding(&app, sharding)?;
-
     let now_ms = unix_ms();
-    let t = app
-        .check_auth_if(&token, &space_id, TokenScope::Read, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
-    let st = wiki_read_token(&space, &t, token, now_ms)?;
-    let access = wiki_read_access(&t, st.as_ref());
+    let (space, caller) = authorize(
+        &app,
+        &space_id,
+        &token,
+        Some(sharding),
+        TokenScope::Read,
+        AuthzMode::PublicRead,
+        now_ms,
+    )
+    .await?;
+    let access = caller.wiki_access();
 
     let selector = if let Some(anchor) = q.anchor {
         WikiSelector::Section { anchor }
+    } else if let (Some(start), Some(end)) = (q.start, q.end) {
+        WikiSelector::Range { start, end }
     } else {
-        match (q.start, q.end) {
-            (Some(start), Some(end)) => WikiSelector::Range { start, end },
-            (None, None) => WikiSelector::Full,
-            // Half a range is a caller mistake; silently returning the full
-            // (possibly large) document would hide it.
-            _ => {
-                return Err(AppError::bad_request(
-                    "range read requires both `start` and `end`",
-                ));
-            }
-        }
+        WikiSelector::Full
     };
     let rt = space
         .wiki
@@ -788,18 +630,17 @@ pub async fn list_wiki_versions(
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
 ) -> Result<impl IntoResponse, AppError> {
-    ensure_sharding(&app, sharding)?;
-
-    let now_ms = unix_ms();
-    let t = app
-        .check_auth_if(&token, &space_id, TokenScope::Read, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
-    let st = wiki_read_token(&space, &t, token, now_ms)?;
-    let access = wiki_read_access(&t, st.as_ref());
+    let (space, caller) = authorize(
+        &app,
+        &space_id,
+        &token,
+        Some(sharding),
+        TokenScope::Read,
+        AuthzMode::PublicRead,
+        unix_ms(),
+    )
+    .await?;
+    let access = caller.wiki_access();
 
     let rt = space
         .wiki
@@ -842,26 +683,19 @@ async fn wiki_set_archived(
     sharding: u32,
     archive: bool,
 ) -> Result<Response, AppError> {
-    ensure_sharding(&app, sharding)?;
-
     let now_ms = unix_ms();
-    let t = app
-        .check_auth_if(&token, &space_id, TokenScope::Write, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
-    let st = match &t {
-        Some(_) => None,
-        None => Some(
-            space
-                .verify_space_token(token, TokenScope::Write, now_ms)
-                .map_err(|_| AppError::unauthorized())?,
-        ),
-    };
+    let (space, caller) = authorize(
+        &app,
+        &space_id,
+        &token,
+        Some(sharding),
+        TokenScope::Write,
+        AuthzMode::Credentialed,
+        now_ms,
+    )
+    .await?;
 
-    let actor = wiki_actor(&t, st.as_ref());
+    let actor = caller.actor();
     let rt = if archive {
         space.wiki.archive(actor, doc_id, now_ms).await
     } else {
@@ -888,15 +722,17 @@ pub async fn post_wiki_search(
     };
 
     let now_ms = unix_ms();
-    let t = app
-        .check_auth_if(&token, &space_id, TokenScope::Read, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
-    let st = wiki_read_token(&space, &t, token, now_ms)?;
-    let access = wiki_read_access(&t, st.as_ref());
+    let (space, caller) = authorize(
+        &app,
+        &space_id,
+        &token,
+        Some(sharding),
+        TokenScope::Read,
+        AuthzMode::PublicRead,
+        now_ms,
+    )
+    .await?;
+    let access = caller.wiki_access();
 
     let rt = space
         .wiki
@@ -926,15 +762,17 @@ pub async fn post_wiki_verify(
     };
 
     let now_ms = unix_ms();
-    let t = app
-        .check_auth_if(&token, &space_id, TokenScope::Read, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
-    let st = wiki_read_token(&space, &t, token, now_ms)?;
-    let access = wiki_read_access(&t, st.as_ref());
+    let (space, caller) = authorize(
+        &app,
+        &space_id,
+        &token,
+        Some(sharding),
+        TokenScope::Read,
+        AuthzMode::PublicRead,
+        now_ms,
+    )
+    .await?;
+    let access = caller.wiki_access();
     let rt = space
         .wiki
         .verify_scoped(&access, input, now_ms)
@@ -951,24 +789,20 @@ pub async fn list_wiki_events(
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
 ) -> Result<impl IntoResponse, AppError> {
-    ensure_sharding(&app, sharding)?;
-
-    let now_ms = unix_ms();
-    let t = app
-        .check_auth_if(&token, &space_id, TokenScope::Read, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
-    let st = wiki_read_token(&space, &t, token, now_ms)?;
-    let access = wiki_read_access(&t, st.as_ref());
+    let (space, caller) = authorize(
+        &app,
+        &space_id,
+        &token,
+        Some(sharding),
+        TokenScope::Read,
+        AuthzMode::PublicRead,
+        unix_ms(),
+    )
+    .await?;
+    let access = caller.wiki_access();
     if access.labels.is_some() {
         // The audit log spans all labels; restricted tokens cannot read it.
-        return Err(AppError::with_status(
-            StatusCode::FORBIDDEN,
-            "audit events require an unrestricted token",
-        ));
+        return Err(AuthzError::Forbidden("audit events require an unrestricted token").into());
     }
 
     let rt = space
@@ -1006,23 +840,18 @@ pub async fn post_wiki_import(
     };
 
     let now_ms = unix_ms();
-    let t = app
-        .check_auth_if(&token, &space_id, TokenScope::All, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
-    let st = match &t {
-        Some(_) => None,
-        None => Some(
-            space
-                .verify_space_token(token, TokenScope::All, now_ms)
-                .map_err(|_| AppError::unauthorized())?,
-        ),
-    };
+    let (space, caller) = authorize(
+        &app,
+        &space_id,
+        &token,
+        Some(sharding),
+        TokenScope::All,
+        AuthzMode::Credentialed,
+        now_ms,
+    )
+    .await?;
 
-    let actor = wiki_actor(&t, st.as_ref());
+    let actor = caller.actor();
     let rt = space
         .wiki
         .import_bundle(actor, input, now_ms)
@@ -1039,26 +868,19 @@ pub async fn get_wiki_export(
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
 ) -> Result<impl IntoResponse, AppError> {
-    ensure_sharding(&app, sharding)?;
-
     let now_ms = unix_ms();
-    let t = app
-        .check_auth_if(&token, &space_id, TokenScope::All, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
-    let st = match &t {
-        Some(_) => None,
-        None => Some(
-            space
-                .verify_space_token(token, TokenScope::All, now_ms)
-                .map_err(|_| AppError::unauthorized())?,
-        ),
-    };
+    let (space, caller) = authorize(
+        &app,
+        &space_id,
+        &token,
+        Some(sharding),
+        TokenScope::All,
+        AuthzMode::Credentialed,
+        now_ms,
+    )
+    .await?;
 
-    let actor = wiki_actor(&t, st.as_ref());
+    let actor = caller.actor();
     let rt = space
         .wiki
         .export_bundle(actor, q.namespace, now_ms)
@@ -1075,21 +897,16 @@ pub async fn post_wiki_digest(
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
 ) -> Result<impl IntoResponse, AppError> {
-    ensure_sharding(&app, sharding)?;
-
-    let now_ms = unix_ms();
-    let t = app
-        .check_auth_if(&token, &space_id, TokenScope::Write, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
-    if t.is_none() {
-        space
-            .verify_space_token(token, TokenScope::Write, now_ms)
-            .map_err(|_| AppError::unauthorized())?;
-    }
+    let (space, _caller) = authorize(
+        &app,
+        &space_id,
+        &token,
+        Some(sharding),
+        TokenScope::Write,
+        AuthzMode::Credentialed,
+        unix_ms(),
+    )
+    .await?;
 
     let rt = space
         .run_wiki_digest(SELF_USER_ID)
@@ -1113,22 +930,16 @@ pub async fn post_maintenance(
         .value()
         .map_err(|_| AppError::bad_request("invalid input"))?;
 
-    let now_ms = unix_ms();
-    let t = app
-        .check_auth_if(&token, &space_id, TokenScope::Write, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
-
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
-
-    if t.is_none() {
-        // 如果没有验证 CWToken，则验证 SpaceToken
-        space
-            .verify_space_token(token, TokenScope::Write, now_ms)
-            .map_err(|_| AppError::unauthorized())?;
-    }
+    let (space, _caller) = authorize(
+        &app,
+        &space_id,
+        &token,
+        Some(sharding),
+        TokenScope::Write,
+        AuthzMode::Credentialed,
+        unix_ms(),
+    )
+    .await?;
 
     if space.is_processing() {
         return Err(AppError::bad_request(
@@ -1159,22 +970,16 @@ pub async fn execute_kip_readonly(
         .value()
         .map_err(|_| AppError::bad_request("invalid input"))?;
 
-    let now_ms = unix_ms();
-    let t = app
-        .check_auth_if(&token, &space_id, TokenScope::Read, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
-
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
-
-    if !space.is_public() && t.is_none() {
-        // 如果没有验证 CWToken，则验证 SpaceToken
-        space
-            .verify_space_token(token, TokenScope::Read, now_ms)
-            .map_err(|_| AppError::unauthorized())?;
-    }
+    let (space, _caller) = authorize(
+        &app,
+        &space_id,
+        &token,
+        Some(sharding),
+        TokenScope::Read,
+        AuthzMode::PublicReadLenient,
+        unix_ms(),
+    )
+    .await?;
 
     let rt = space
         .execute_kip_readonly(input)
@@ -1200,22 +1005,16 @@ pub async fn get_or_init_user(
         .value()
         .map_err(|_| AppError::bad_request("invalid input"))?;
 
-    let now_ms = unix_ms();
-    let t = app
-        .check_auth_if(&token, &space_id, TokenScope::Write, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
-
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
-
-    if t.is_none() {
-        // 如果没有验证 CWToken，则验证 SpaceToken
-        space
-            .verify_space_token(token, TokenScope::Write, now_ms)
-            .map_err(|_| AppError::unauthorized())?;
-    }
+    let (space, _caller) = authorize(
+        &app,
+        &space_id,
+        &token,
+        Some(sharding),
+        TokenScope::Write,
+        AuthzMode::Credentialed,
+        unix_ms(),
+    )
+    .await?;
 
     // anda_cognitive_nexus::entity::Concept
     let concept = space
@@ -1227,6 +1026,43 @@ pub async fn get_or_init_user(
     Ok(ct.response(RpcResponse::success(concept)))
 }
 
+/// Shared implementation of the two conversation-read routes: identical
+/// sharding check, authorization, collection guard (the delta view exposes
+/// the same unrestricted runner history), and lookup — only the response
+/// shape differs at the call sites.
+async fn load_authorized_conversation(
+    app: &AppState,
+    space_id: &str,
+    conversation_id: &str,
+    collection: Option<String>,
+    token: &str,
+    sharding: u32,
+) -> Result<Conversation, AppError> {
+    ensure_sharding(app, sharding)?;
+    let conversation_id: u64 = conversation_id
+        .parse()
+        .map_err(|_| AppError::bad_request("invalid conversation_id"))?;
+
+    let (space, caller) = authorize(
+        app,
+        space_id,
+        token,
+        Some(sharding),
+        TokenScope::Read,
+        AuthzMode::PublicRead,
+        unix_ms(),
+    )
+    .await?;
+    if let Some(reason) = caller.conversation_read_forbidden(collection.as_deref()) {
+        return Err(AuthzError::Forbidden(reason).into());
+    }
+
+    space
+        .get_conversation(collection, conversation_id)
+        .await
+        .map_err(AppError::bad_request)
+}
+
 /// GET /v1/{space_id}/conversations/{conversation_id}
 pub async fn get_conversation(
     State(app): State<AppState>,
@@ -1235,36 +1071,15 @@ pub async fn get_conversation(
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
 ) -> Result<impl IntoResponse, AppError> {
-    ensure_sharding(&app, sharding)?;
-    let conversation_id: u64 = conversation_id
-        .parse()
-        .map_err(|_| AppError::bad_request("invalid conversation_id"))?;
-
-    let now_ms = unix_ms();
-    let t = app
-        .check_auth_if(&token, &space_id, TokenScope::Read, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
-
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
-
-    let st = wiki_read_token(&space, &t, token, now_ms)?;
-    if label_restricted(st.as_ref()) {
-        // Conversations persist the full runner history (recall's wiki tool
-        // output is unrestricted); a label-restricted token reading them
-        // would bypass its wiki ACL — same guard as /recall.
-        return Err(AppError::with_status(
-            StatusCode::FORBIDDEN,
-            "conversations require an unrestricted token",
-        ));
-    }
-
-    let rt = space
-        .get_conversation(dq.collection, conversation_id)
-        .await
-        .map_err(AppError::bad_request)?;
+    let rt = load_authorized_conversation(
+        &app,
+        &space_id,
+        &conversation_id,
+        dq.collection,
+        &token,
+        sharding,
+    )
+    .await?;
     Ok(ct.response(RpcResponse::success(rt)))
 }
 
@@ -1276,35 +1091,15 @@ pub async fn get_conversation_delta(
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
 ) -> Result<impl IntoResponse, AppError> {
-    ensure_sharding(&app, sharding)?;
-    let conversation_id: u64 = conversation_id
-        .parse()
-        .map_err(|_| AppError::bad_request("invalid conversation_id"))?;
-
-    let now_ms = unix_ms();
-    let t = app
-        .check_auth_if(&token, &space_id, TokenScope::Read, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
-
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
-
-    let st = wiki_read_token(&space, &t, token, now_ms)?;
-    if label_restricted(st.as_ref()) {
-        // Same guard as get_conversation: the delta view exposes the same
-        // unrestricted runner history.
-        return Err(AppError::with_status(
-            StatusCode::FORBIDDEN,
-            "conversations require an unrestricted token",
-        ));
-    }
-
-    let rt = space
-        .get_conversation(dq.collection, conversation_id)
-        .await
-        .map_err(AppError::bad_request)?;
+    let rt = load_authorized_conversation(
+        &app,
+        &space_id,
+        &conversation_id,
+        dq.collection,
+        &token,
+        sharding,
+    )
+    .await?;
     Ok(ct.response(RpcResponse::success(rt.into_delta(
         dq.messages_offset.unwrap_or_default(),
         dq.artifacts_offset.unwrap_or_default(),
@@ -1319,26 +1114,20 @@ pub async fn list_conversations(
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
 ) -> Result<impl IntoResponse, AppError> {
-    ensure_sharding(&app, sharding)?;
-
-    let now_ms = unix_ms();
-    let t = app
-        .check_auth_if(&token, &space_id, TokenScope::Read, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
-
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
-
-    let st = wiki_read_token(&space, &t, token, now_ms)?;
-    if label_restricted(st.as_ref()) {
-        // Same guard as get_conversation: listings expose the same
-        // unrestricted runner history.
-        return Err(AppError::with_status(
-            StatusCode::FORBIDDEN,
-            "conversations require an unrestricted token",
-        ));
+    let (space, caller) = authorize(
+        &app,
+        &space_id,
+        &token,
+        Some(sharding),
+        TokenScope::Read,
+        AuthzMode::PublicRead,
+        unix_ms(),
+    )
+    .await?;
+    // Same guard as get_conversation: listings expose the same
+    // unrestricted runner history.
+    if let Some(reason) = caller.conversation_read_forbidden(pg.collection.as_deref()) {
+        return Err(AuthzError::Forbidden(reason).into());
     }
 
     let rt = space
@@ -1362,17 +1151,16 @@ pub async fn list_space_tokens(
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
 ) -> Result<impl IntoResponse, AppError> {
-    ensure_sharding(&app, sharding)?;
-
-    let now_ms = unix_ms();
-    let _ = app
-        .check_auth(&token, &space_id, TokenScope::Write, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
-
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
+    let (space, _caller) = authorize(
+        &app,
+        &space_id,
+        &token,
+        Some(sharding),
+        TokenScope::Write,
+        AuthzMode::CwtOnly,
+        unix_ms(),
+    )
+    .await?;
 
     let rt = space.list_space_tokens().map_err(AppError::bad_request)?;
     Ok(ct.response(RpcResponse::success(rt)))
@@ -1403,14 +1191,16 @@ pub async fn add_space_token(
         TokenScope::Write
     };
     let now_ms = unix_ms();
-    let _ = app
-        .check_auth(&token, &space_id, required, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
-
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
+    let (space, _caller) = authorize(
+        &app,
+        &space_id,
+        &token,
+        Some(sharding),
+        required,
+        AuthzMode::CwtOnly,
+        now_ms,
+    )
+    .await?;
 
     let mut data: [u8; 20] = [0; 20];
     rand::rng().fill_bytes(&mut data);
@@ -1432,10 +1222,9 @@ pub async fn revoke_space_token(
 ) -> Result<impl IntoResponse, AppError> {
     ensure_sharding(&app, sharding)?;
 
-    let now_ms = unix_ms();
-    let _ = app
-        .check_auth(&token, &space_id, TokenScope::Write, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
+    // `check_cwt` + `load_space` instead of `authorize`: the body parse sits
+    // between them historically, and that error precedence must not change.
+    let _ = check_cwt(&app, &space_id, &token, TokenScope::Write, unix_ms())?;
 
     let input: RevokeSpaceTokenInput = ct
         .parse_body(&body)
@@ -1443,10 +1232,7 @@ pub async fn revoke_space_token(
         .value()
         .map_err(|_| AppError::bad_request("invalid input"))?;
 
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
+    let space = load_space(&app, &space_id).await?;
 
     // Revoke by full token value, or by unique name for managers who did
     // not save the value at mint time (list_space_tokens only shows a
@@ -1474,10 +1260,10 @@ pub async fn update_space(
 ) -> Result<impl IntoResponse, AppError> {
     ensure_sharding(&app, sharding)?;
 
+    // `check_cwt` + `load_space` instead of `authorize`: the body parse sits
+    // between them historically, and that error precedence must not change.
     let now_ms = unix_ms();
-    let _ = app
-        .check_auth(&token, &space_id, TokenScope::Write, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
+    let _ = check_cwt(&app, &space_id, &token, TokenScope::Write, now_ms)?;
 
     let input: UpdateSpaceInput = ct
         .parse_body(&body)
@@ -1485,10 +1271,7 @@ pub async fn update_space(
         .value()
         .map_err(|_| AppError::bad_request("invalid input"))?;
 
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
+    let space = load_space(&app, &space_id).await?;
 
     space
         .update(input, now_ms)
@@ -1507,10 +1290,9 @@ pub async fn restart_formation(
 ) -> Result<impl IntoResponse, AppError> {
     ensure_sharding(&app, sharding)?;
 
-    let now_ms = unix_ms();
-    let _ = app
-        .check_auth(&token, &space_id, TokenScope::Write, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
+    // `check_cwt` + `load_space` instead of `authorize`: the body parse sits
+    // between them historically, and that error precedence must not change.
+    let _ = check_cwt(&app, &space_id, &token, TokenScope::Write, unix_ms())?;
 
     let input: FormationRestartInput = ct
         .parse_body(&body)
@@ -1518,10 +1300,7 @@ pub async fn restart_formation(
         .value()
         .map_err(|_| AppError::bad_request("invalid input"))?;
 
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
+    let space = load_space(&app, &space_id).await?;
 
     space
         .restart_formation(SELF_USER_ID, input.conversation)
@@ -1537,17 +1316,16 @@ pub async fn get_byok(
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
 ) -> Result<impl IntoResponse, AppError> {
-    ensure_sharding(&app, sharding)?;
-
-    let now_ms = unix_ms();
-    let _ = app
-        .check_auth(&token, &space_id, TokenScope::Write, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
-
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
+    let (space, _caller) = authorize(
+        &app,
+        &space_id,
+        &token,
+        Some(sharding),
+        TokenScope::Write,
+        AuthzMode::CwtOnly,
+        unix_ms(),
+    )
+    .await?;
 
     let byok = space.get_byok();
     Ok(ct.response(RpcResponse::success(byok)))
@@ -1563,10 +1341,9 @@ pub async fn update_byok(
 ) -> Result<impl IntoResponse, AppError> {
     ensure_sharding(&app, sharding)?;
 
-    let now_ms = unix_ms();
-    let _ = app
-        .check_auth(&token, &space_id, TokenScope::Write, now_ms)
-        .map_err(|_| AppError::unauthorized())?;
+    // `check_cwt` + `load_space` instead of `authorize`: the body parse sits
+    // between them historically, and that error precedence must not change.
+    let _ = check_cwt(&app, &space_id, &token, TokenScope::Write, unix_ms())?;
 
     let input: ModelConfig = ct
         .parse_body(&body)
@@ -1574,10 +1351,7 @@ pub async fn update_byok(
         .value()
         .map_err(|_| AppError::bad_request("invalid input"))?;
 
-    let space = app
-        .load_space(&space_id, false)
-        .await
-        .map_err(|err| space_load_error(&space_id, err))?;
+    let space = load_space(&app, &space_id).await?;
 
     space
         .update_byok(input)
@@ -1666,10 +1440,10 @@ mod tests {
         post_memory_forget, post_memory_pin, post_probe, post_recall, post_recall_structured,
         post_shadow_eval, post_wiki_commit, post_wiki_import, post_wiki_search, post_wiki_verify,
         restart_formation, revoke_space_token, update_byok, update_space, update_space_tier,
-        wiki_read_access,
     };
     use crate::{
         agents::SELF_USER_ID,
+        authz::wiki_read_access,
         payload::{Accept, AppError, HeaderVals, PayloadFormat},
         space::{AppState, Space},
         types::{
@@ -3193,12 +2967,85 @@ mod tests {
                     collection: Some("Recall".to_string()),
                 }),
                 accept_json(),
-                HeaderVals(plain_token, 0),
+                HeaderVals(plain_token.clone(), 0),
             )
             .await,
             StatusCode::BAD_REQUEST,
         )
         .await;
+
+        // Anonymous readers on a public space must not reach recall
+        // conversations: runs from the private era may embed labeled wiki
+        // tool output verbatim, and flipping `public` cannot be allowed to
+        // hand that history to the world.
+        space
+            .update(
+                UpdateSpaceInput {
+                    public: Some(true),
+                    ..Default::default()
+                },
+                unix_ms(),
+            )
+            .await
+            .unwrap();
+        let _ = err_json(
+            get_conversation(
+                State(app.clone()),
+                Path((space_id.to_string(), conv_id.to_string())),
+                Query(recall_query()),
+                accept_json(),
+                HeaderVals(String::new(), 0),
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+        )
+        .await;
+        let _ = err_json(
+            list_conversations(
+                State(app.clone()),
+                Path(space_id.to_string()),
+                Query(Pagination {
+                    cursor: None,
+                    limit: None,
+                    collection: Some("recall".to_string()),
+                }),
+                accept_json(),
+                HeaderVals(String::new(), 0),
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+        )
+        .await;
+        // …while the default formation collection stays anonymously
+        // listable on public spaces, and real credentials keep reading
+        // recall conversations.
+        let _ = ok_json(
+            list_conversations(
+                State(app.clone()),
+                Path(space_id.to_string()),
+                Query(Pagination {
+                    cursor: None,
+                    limit: None,
+                    collection: None,
+                }),
+                accept_json(),
+                HeaderVals(String::new(), 0),
+            )
+            .await,
+        )
+        .await;
+        let read = ok_json(
+            get_conversation(
+                State(app.clone()),
+                Path((space_id.to_string(), conv_id.to_string())),
+                Query(recall_query()),
+                accept_json(),
+                HeaderVals(plain_token, 0),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(read["result"]["label"], "recall");
     }
 
     #[tokio::test]

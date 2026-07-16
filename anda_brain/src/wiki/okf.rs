@@ -59,24 +59,9 @@ impl WikiService {
             .to_string();
 
         let mut output = WikiImportOutput::default();
-        // Distinct bundle paths can slugify to the same document ("A.md" vs
-        // "a.md", "a b.md" vs "a-b.md"): silently last-write-wins would merge
-        // them into one two-version document, so later collisions are skipped
-        // loudly instead.
-        let mut seen_slugs = std::collections::BTreeSet::new();
+        // Distinct bundle paths that slugify to the same document ("A.md" vs
+        // "a.md") converge last-write-wins into one document.
         for entry in &input.entries {
-            if let Some(concept) = concept_path(&entry.path) {
-                let slug = slugify_path(&concept);
-                if !seen_slugs.insert(slug.clone()) {
-                    output.skipped.push(WikiImportSkip {
-                        path: entry.path.clone(),
-                        reason: format!(
-                            "path slugifies to {slug:?}, already used by an earlier bundle entry"
-                        ),
-                    });
-                    continue;
-                }
-            }
             match self.import_entry(&actor, &namespace, entry, now_ms).await {
                 Ok(Some(doc)) => {
                     match doc.status {
@@ -167,6 +152,8 @@ impl WikiService {
             // OKF cannot express enterprise ACLs (PRD §9): imported docs
             // keep their stored label or inherit the namespace default.
             acl_label: None,
+            // `None` keeps the stored source_uri: deleting a `resource:` key
+            // does not propagate through OKF (clear it via `wiki_commit`).
             source_uri: parsed.as_ref().and_then(|fm| fm.resource.clone()),
             message: Some(format!("okf import: {}", entry.path)),
             metadata: (!metadata.is_empty()).then_some(metadata),
@@ -178,35 +165,10 @@ impl WikiService {
         // instead of converging on one create + idempotent replays. The
         // lock is per entry, so large bundles do not starve other writers.
         let _guard = self.write_lock.lock().await;
-        let existing = match self.find_doc_id_by_slug(namespace, &slug).await? {
-            Some(id) => Some(self.doc_record(id).await?),
-            None => None,
-        };
-        if let Some(doc) = &existing {
+        if let Some(id) = self.find_doc_id_by_slug(namespace, &slug).await? {
+            let doc = self.doc_record(id).await?;
             prepared.input.doc_id = Some(doc._id);
             prepared.input.parent_version = Some(doc.current_version);
-        }
-        // A bundle exported from a commit-origin document carries
-        // synthesized frontmatter; storing it verbatim would mutate
-        // metadata and grow the version chain by one on the first
-        // replay. A block matching what export synthesizes for the
-        // current document state is therefore not persisted.
-        if let (Some(doc), Some(raw)) = (&existing, &frontmatter)
-            && !doc.metadata.contains_key(FRONTMATTER_KEY)
-            && *raw
-                == synthesized_frontmatter(
-                    doc.metadata.get(OKF_TYPE_KEY).and_then(|v| v.as_str()),
-                    &doc.title,
-                    &doc.tags,
-                    doc.source_uri.as_deref(),
-                )
-            && let Some(commit_metadata) = &mut prepared.input.metadata
-        {
-            commit_metadata.remove(FRONTMATTER_KEY);
-            commit_metadata.remove(OKF_TYPE_KEY);
-            if commit_metadata.is_empty() {
-                prepared.input.metadata = None;
-            }
         }
         let out = self
             .commit_prepared(actor.to_string(), prepared, now_ms)
@@ -535,8 +497,8 @@ fn tags_line(tags: &[String]) -> String {
 }
 
 /// The frontmatter block (no delimiters) synthesized for documents that
-/// never carried one. Import compares against this to keep replays of
-/// commit-origin documents version-stable.
+/// never carried one, or whose stored block drifted (see
+/// [`frontmatter_is_stale`]).
 fn synthesized_frontmatter(
     okf_type: Option<&str>,
     title: &str,
@@ -559,111 +521,37 @@ fn synthesized_frontmatter(
 /// Documents edited through `wiki_commit` after an OKF import drift from
 /// their stored frontmatter block. Exporting the stale block would make the
 /// bundle disagree with its own manifest and silently revert title/tags on
-/// replay, so the known keys are patched to the document's current state —
-/// every other line (unknown keys, comments, ordering) stays verbatim.
-fn sync_frontmatter(raw: &str, doc: &WikiDocInfo) -> String {
+/// replay, so a drifted block is discarded wholesale and export falls back
+/// to the synthesized form (unknown keys and comments are lost on drift;
+/// the no-drift path stays byte-stable so replays do not churn versions).
+/// A missing `title:` key falls back to the body heading exactly like
+/// import does, so such blocks are not spuriously treated as drifted.
+fn frontmatter_is_stale(raw: &str, doc: &WikiDocInfo, body: &str) -> bool {
     let parsed = parse_frontmatter(raw);
-    let title_stale = parsed.title.as_deref() != Some(doc.title.as_str());
-    let tags_stale = parsed.tags.clone().unwrap_or_default() != doc.tags;
-    let resource_stale = parsed.resource.as_deref() != doc.source_uri.as_deref();
-    if !title_stale && !tags_stale && !resource_stale {
-        return raw.to_string();
-    }
-
-    let mut out: Vec<String> = Vec::new();
-    let (mut saw_title, mut saw_tags, mut saw_resource) = (false, false, false);
-    let mut lines = raw.lines().peekable();
-    while let Some(line) = lines.next() {
-        let key = (!line.starts_with(char::is_whitespace))
-            .then(|| line.split_once(':').map(|(k, _)| k.trim()))
-            .flatten();
-        match key {
-            Some("title") => {
-                saw_title = true;
-                if title_stale {
-                    out.push(format!("title: {}", yaml_scalar(&doc.title)));
-                } else {
-                    out.push(line.to_string());
-                }
-            }
-            Some("tags") => {
-                saw_tags = true;
-                let block_form = line
-                    .split_once(':')
-                    .is_some_and(|(_, v)| v.trim().is_empty());
-                if tags_stale {
-                    if !doc.tags.is_empty() {
-                        out.push(tags_line(&doc.tags));
-                    }
-                    if block_form {
-                        while lines
-                            .peek()
-                            .is_some_and(|l| l.trim_start().starts_with("- "))
-                        {
-                            lines.next();
-                        }
-                    }
-                } else {
-                    out.push(line.to_string());
-                    if block_form {
-                        while lines
-                            .peek()
-                            .is_some_and(|l| l.trim_start().starts_with("- "))
-                        {
-                            out.push(lines.next().unwrap().to_string());
-                        }
-                    }
-                }
-            }
-            Some("resource") => {
-                saw_resource = true;
-                match (&resource_stale, &doc.source_uri) {
-                    (true, Some(resource)) => {
-                        out.push(format!("resource: {}", yaml_scalar(resource)));
-                    }
-                    (true, None) => {}
-                    (false, _) => out.push(line.to_string()),
-                }
-            }
-            _ => out.push(line.to_string()),
-        }
-    }
-    if title_stale && !saw_title {
-        out.push(format!("title: {}", yaml_scalar(&doc.title)));
-    }
-    if tags_stale && !saw_tags && !doc.tags.is_empty() {
-        out.push(tags_line(&doc.tags));
-    }
-    if resource_stale
-        && !saw_resource
-        && let Some(resource) = &doc.source_uri
-    {
-        out.push(format!("resource: {}", yaml_scalar(resource)));
-    }
-    out.join("\n")
+    let title = parsed.title.or_else(|| markdown_title(body));
+    title.as_deref() != Some(doc.title.as_str())
+        || parsed.tags.unwrap_or_default() != doc.tags
+        || parsed.resource.as_deref() != doc.source_uri.as_deref()
 }
 
-/// Assembles the exported frontmatter: the stored verbatim block (drifted
-/// known keys synced, everything else untouched, including trailing blank
-/// lines) or a minimal synthesized one, plus fresh `x_anda_*` provenance
-/// keys.
+/// Assembles the exported frontmatter: the stored verbatim block (when no
+/// known key drifted) or the synthesized one, plus fresh `x_anda_*`
+/// provenance keys.
 fn render_frontmatter(
     raw: Option<&str>,
     okf_type: Option<&str>,
     doc: &WikiDocInfo,
     version: &super::WikiVersionRecord,
 ) -> String {
-    let mut lines: Vec<String> = match raw {
-        Some(raw) => sync_frontmatter(raw, doc)
-            .lines()
-            .filter(|l| !is_x_anda_line(l))
-            .map(str::to_string)
-            .collect(),
-        None => synthesized_frontmatter(okf_type, &doc.title, &doc.tags, doc.source_uri.as_deref())
-            .lines()
-            .map(str::to_string)
-            .collect(),
+    let block = match raw {
+        Some(raw) if !frontmatter_is_stale(raw, doc, &version.content) => raw.to_string(),
+        _ => synthesized_frontmatter(okf_type, &doc.title, &doc.tags, doc.source_uri.as_deref()),
     };
+    let mut lines: Vec<String> = block
+        .lines()
+        .filter(|l| !is_x_anda_line(l))
+        .map(str::to_string)
+        .collect();
     lines.push(format!("x_anda_doc_id: {}", doc.id));
     lines.push(format!("x_anda_version_id: {}", doc.current_version));
     lines.push(format!("x_anda_checksum: {}", version.checksum));
@@ -732,28 +620,40 @@ mod tests {
     }
 
     #[test]
-    fn sync_frontmatter_patches_only_drifted_keys() {
+    fn frontmatter_staleness_detects_known_key_drift() {
         let raw = "type: Guide\n# keep this comment\ntitle: 旧标题\ntags: [old]\nunknown: kept";
 
-        // No drift: byte-identical.
-        let same = sync_frontmatter(raw, &doc_info("旧标题", &["old"], None));
-        assert_eq!(same, raw);
+        // No drift: the stored block exports verbatim (byte-stable replays).
+        assert!(!frontmatter_is_stale(
+            raw,
+            &doc_info("旧标题", &["old"], None),
+            ""
+        ));
 
-        // Title/tags drifted via wiki_commit: patched, everything else verbatim.
-        let synced = sync_frontmatter(raw, &doc_info("新标题", &["new"], None));
-        assert!(synced.contains("title: 新标题"));
-        assert!(synced.contains("tags: [new]"));
-        assert!(synced.contains("# keep this comment"));
-        assert!(synced.contains("unknown: kept"));
-        assert!(!synced.contains("旧标题"));
+        // Any known-key drift discards the block wholesale on export.
+        assert!(frontmatter_is_stale(
+            raw,
+            &doc_info("新标题", &["old"], None),
+            ""
+        ));
+        assert!(frontmatter_is_stale(
+            raw,
+            &doc_info("旧标题", &["new"], None),
+            ""
+        ));
+        assert!(frontmatter_is_stale(
+            raw,
+            &doc_info("旧标题", &["old"], Some("anda://x")),
+            ""
+        ));
 
-        // Missing keys are appended; emptied tags are removed.
-        let bare = sync_frontmatter("unknown: kept", &doc_info("补标题", &["t1"], None));
-        assert!(bare.contains("title: 补标题"));
-        assert!(bare.contains("tags: [t1]"));
-        let cleared = sync_frontmatter("tags:\n  - a\n  - b\ntitle: t", &doc_info("t", &[], None));
-        assert!(!cleared.contains("- a"));
-        assert!(!cleared.contains("tags"));
+        // A block without `title:` falls back to the body heading (the same
+        // derivation import uses): not drift.
+        assert!(!frontmatter_is_stale(
+            "type: Guide\nunknown: kept",
+            &doc_info("正文标题", &[], None),
+            "# 正文标题\n\n正文。\n"
+        ));
     }
 
     #[test]

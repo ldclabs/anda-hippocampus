@@ -7,7 +7,7 @@ use anda_db::{
     schema::{DocumentId, Json, Map},
 };
 use anda_engine::{
-    context::AgentCtx,
+    context::{AgentCtx, CompletionRunner},
     extension::note::{NoteTool, load_notes, load_notes_from_legacy},
     local_date_hour,
     memory::{Conversation, ConversationRef, ConversationStatus, MemoryManagement},
@@ -23,7 +23,7 @@ use std::{
     },
 };
 
-use super::{BrainHook, append_runner_history, compact_runner_if_needed, push_completed_history};
+use super::{BrainHook, RunnerFlow, RunnerHost, drive_runner_loop};
 use crate::types::FormationInput;
 
 // Kept for reference; the runtime prompt comes from `prompts::active_prompt`
@@ -32,19 +32,10 @@ use crate::types::FormationInput;
 const SELF_INSTRUCTIONS: &str = include_str!("../../assets/BrainFormation.md");
 const REVIEW_INSTRUCTIONS: &str = include_str!("../../assets/BrainFormationReview.md");
 
-/// Hard guardrails for the formation runner loop (review P2-3).
-///
-/// A model that keeps emitting tool calls without converging would otherwise
-/// run forever: the runner compacts every ~81 turns and simply continues, so
-/// `processing_conversation` stays non-zero and the formation queue freezes.
-/// Formation legitimately needs far more turns than recall
-/// (`RECALL_MAX_MODEL_TURNS` = 7 + 180s), so these caps are intentionally
-/// loose. Exceeding either budget marks the conversation Failed, which reuses
-/// the existing Failed retry path and releases the processing slot. Budgets
-/// are checked between turns so an in-flight KIP write turn is never
-/// cancelled halfway.
-const FORMATION_MAX_MODEL_TURNS: usize = 200;
-const FORMATION_MAX_WALL_CLOCK_MS: u64 = 30 * 60 * 1000;
+// The runner guardrails are shared with maintenance; see
+// `RUNNER_MAX_MODEL_TURNS` in agents.rs. Tests keep the historical name.
+#[cfg(test)]
+use super::RUNNER_MAX_MODEL_TURNS as FORMATION_MAX_MODEL_TURNS;
 
 /// Resets the AtomicU64 to 0 on drop (panic guard for processing_conversation).
 struct ProcessingGuard(Arc<AtomicU64>);
@@ -404,141 +395,64 @@ impl FormationAgent {
         );
         runner.set_unbound(true);
 
-        let started_at_ms = unix_ms();
-        let mut replace_initial_input = true;
-        let mut persisted_runner_history_len = 0;
-        let mut review_pending = should_review;
-        let mut total_model_turns = 0usize;
-        let mut accounted_runner_turns = 0usize;
-        let mut unpersisted_turns = 0usize;
-        loop {
-            // Guardrails against a non-converging tool loop; see
-            // FORMATION_MAX_MODEL_TURNS. Exceeding a budget takes the
-            // existing mark_conversation_failed -> Failed retry path.
-            if total_model_turns >= FORMATION_MAX_MODEL_TURNS {
-                self.mark_conversation_failed(
-                    conversation,
-                    format!(
-                        "formation exceeded model turn limit of {}",
-                        FORMATION_MAX_MODEL_TURNS
-                    ),
-                )
-                .await;
-                break;
-            }
-            if unix_ms().saturating_sub(started_at_ms) >= FORMATION_MAX_WALL_CLOCK_MS {
-                self.mark_conversation_failed(
-                    conversation,
-                    format!(
-                        "formation exceeded wall-clock budget of {} seconds",
-                        FORMATION_MAX_WALL_CLOCK_MS / 1000
-                    ),
-                )
-                .await;
-                break;
-            }
+        let mut host = FormationRunnerHost {
+            agent: self,
+            review_pending: should_review,
+        };
+        drive_runner_loop(&mut host, &mut runner, conversation).await;
+    }
+}
 
-            match compact_runner_if_needed(&mut runner, 0, true).await {
-                Ok(true) => {
-                    // The compaction handoff consumed one model turn, and the
-                    // replacement runner restarts its own turn counter.
-                    total_model_turns = total_model_turns.saturating_add(1);
-                    accounted_runner_turns = runner.turns();
-                    persisted_runner_history_len = 0;
-                    replace_initial_input = false;
-                }
-                Ok(false) => {}
-                Err(err) => {
-                    self.mark_conversation_failed(
-                        conversation,
-                        format!("CompletionRunner error: {err:?}"),
-                    )
-                    .await;
-                    break;
-                }
-            }
+/// Formation's seams of the shared runner loop (`drive_runner_loop`): the
+/// review pass for large inputs and the Failed-retry `failed_reason` reset.
+struct FormationRunnerHost<'a> {
+    agent: &'a FormationAgent,
+    /// Large inputs get a mandatory review pass (REVIEW_INSTRUCTIONS) before
+    /// an idle runner may count as done.
+    review_pending: bool,
+}
 
-            match runner.next().await {
-                Ok(None) => break,
-                Ok(Some(res)) => {
-                    let runner_turns = runner.turns();
-                    total_model_turns = total_model_turns
-                        .saturating_add(runner_turns.saturating_sub(accounted_runner_turns));
-                    accounted_runner_turns = runner_turns;
+impl RunnerHost for FormationRunnerHost<'_> {
+    fn label(&self) -> &'static str {
+        "formation"
+    }
 
-                    let now_ms = unix_ms();
-                    let is_done = runner.is_done() || runner.is_idle() && !review_pending;
+    fn history(&self) -> &RwLock<VecDeque<Document>> {
+        &self.agent.history
+    }
 
-                    append_runner_history(
-                        conversation,
-                        &res.chat_history,
-                        &mut persisted_runner_history_len,
-                        &mut replace_initial_input,
-                    );
+    async fn persist_snapshot(&self, conversation: &Conversation) {
+        self.agent.persist_conversation_snapshot(conversation).await;
+    }
 
-                    conversation.status = if res.failed_reason.is_some() {
-                        ConversationStatus::Failed
-                    } else if is_done {
-                        ConversationStatus::Completed
-                    } else {
-                        ConversationStatus::Working
-                    };
-                    conversation.usage = res.usage;
-                    conversation.updated_at = now_ms;
+    async fn mark_failed(&self, conversation: &mut Conversation, reason: String) {
+        self.agent
+            .mark_conversation_failed(conversation, reason)
+            .await;
+    }
 
-                    if let Some(failed_reason) = res.failed_reason {
-                        conversation.failed_reason = Some(failed_reason);
-                    } else {
-                        conversation.failed_reason = None;
-                        push_completed_history(&self.history, conversation, 2);
-                    }
+    fn turn_is_done(&self, runner: &CompletionRunner) -> bool {
+        runner.is_done() || runner.is_idle() && !self.review_pending
+    }
 
-                    // Persisting rewrites the full message array (O(turns^2)
-                    // over a session), so intermediate Working turns are
-                    // throttled; terminal statuses always persist. See
-                    // PERSIST_EVERY_N_TURNS.
-                    unpersisted_turns = unpersisted_turns.saturating_add(1);
-                    if conversation.status != ConversationStatus::Working
-                        || unpersisted_turns >= super::PERSIST_EVERY_N_TURNS
-                    {
-                        self.persist_conversation_snapshot(conversation).await;
-                        unpersisted_turns = 0;
-                    }
+    fn on_turn_success(&self, conversation: &mut Conversation) {
+        // Clears a previous attempt's failure so the process_loop Failed
+        // retry converges to a clean Completed snapshot.
+        conversation.failed_reason = None;
+    }
 
-                    if conversation.status == ConversationStatus::Cancelled
-                        || conversation.status == ConversationStatus::Failed
-                    {
-                        break;
-                    }
-
-                    if review_pending && runner.is_idle() {
-                        runner.prune_req_raw_history();
-                        runner.follow_up(REVIEW_INSTRUCTIONS.to_string());
-                        review_pending = false;
-                        continue;
-                    }
-
-                    if is_done {
-                        break;
-                    }
-                }
-                Err(err) => {
-                    self.mark_conversation_failed(
-                        conversation,
-                        format!("CompletionRunner error: {err:?}"),
-                    )
-                    .await;
-                    break;
-                }
-            }
+    fn after_turn(&mut self, runner: &mut CompletionRunner, is_done: bool) -> RunnerFlow {
+        if self.review_pending && runner.is_idle() {
+            runner.prune_req_raw_history();
+            runner.follow_up(REVIEW_INSTRUCTIONS.to_string());
+            self.review_pending = false;
+            return RunnerFlow::Continue;
         }
 
-        // Terminal and failure exits above always persist (any non-Working
-        // status forces a write, and mark_conversation_failed writes its own
-        // snapshot), so only a Working exit — e.g. the runner returning
-        // `Ok(None)` — can still hold turns skipped by the throttle.
-        if unpersisted_turns > 0 && conversation.status == ConversationStatus::Working {
-            self.persist_conversation_snapshot(conversation).await;
+        if is_done {
+            RunnerFlow::Break
+        } else {
+            RunnerFlow::Continue
         }
     }
 }

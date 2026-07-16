@@ -348,10 +348,6 @@ pub struct RecallMiss {
 pub struct MissCache {
     collection: Arc<Collection>,
     write_lock: tokio::sync::Mutex<()>,
-    /// When the cache was last cleared (unix ms, in-process). A miss whose
-    /// graph search *started* before a clear must not be recorded: the
-    /// clear means new memory arrived, which may answer that very query.
-    last_cleared_ms: std::sync::atomic::AtomicU64,
 }
 
 /// Backstop TTL for negative-knowledge entries.
@@ -385,7 +381,6 @@ impl MissCache {
         Ok(Self {
             collection,
             write_lock: tokio::sync::Mutex::new(()),
-            last_cleared_ms: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -427,39 +422,28 @@ impl MissCache {
         }
     }
 
-    /// Records a miss whose graph search started at `searched_at_ms`. A
-    /// search that started before the last cache clear is discarded: the
-    /// clear means new memory formed mid-search, and it may answer exactly
-    /// this query — caching the stale miss would mask it for up to the TTL.
-    pub async fn record_miss(&self, query: &str, searched_at_ms: u64) -> Result<(), DBError> {
+    /// Records a miss observed at `now_ms`. A cache clear racing an
+    /// in-flight probe may re-cache a query that just-formed memory can now
+    /// answer; that staleness only affects the probe channel and self-heals
+    /// on the next formation clear or the TTL.
+    pub async fn record_miss(&self, query: &str, now_ms: u64) -> Result<(), DBError> {
         let key = Self::cache_key(query);
         if key.is_empty() || key.chars().count() > MISS_QUERY_MAX_CHARS {
             return Ok(());
         }
         let _guard = self.write_lock.lock().await;
-        // Compare against the clear stamp only *after* taking the lock: a
-        // clear() that runs between an early check and the lock would
-        // otherwise let this stale miss be written back, masking a query the
-        // just-formed memory can now answer for up to the TTL.
-        if searched_at_ms
-            <= self
-                .last_cleared_ms
-                .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return Ok(());
-        }
         match self.get(&key).await? {
             Some(row) => {
                 self.collection
                     .update(
                         row._id,
-                        BTreeMap::from([("created_at".to_string(), Fv::U64(searched_at_ms))]),
+                        BTreeMap::from([("created_at".to_string(), Fv::U64(now_ms))]),
                     )
                     .await?;
             }
             None => {
                 if self.collection.len() >= MISS_CACHE_MAX_ROWS {
-                    self.purge_expired_locked(searched_at_ms).await?;
+                    self.purge_expired_locked(now_ms).await?;
                     if self.collection.len() >= MISS_CACHE_MAX_ROWS {
                         return Ok(());
                     }
@@ -467,7 +451,7 @@ impl MissCache {
                 self.collection
                     .add_from(&RecallMiss {
                         query: key,
-                        created_at: searched_at_ms,
+                        created_at: now_ms,
                         ..Default::default()
                     })
                     .await?;
@@ -509,10 +493,6 @@ impl MissCache {
     /// wrong.
     pub async fn clear(&self) -> Result<u64, DBError> {
         let _guard = self.write_lock.lock().await;
-        // Stamp before deleting: a probe racing this clear compares its
-        // search-start time against the stamp and drops its stale miss.
-        self.last_cleared_ms
-            .store(anda_engine::unix_ms(), std::sync::atomic::Ordering::Release);
         let mut cleared = 0u64;
         loop {
             // Filterless queries return nothing in AndaDB; scan by `_id`.

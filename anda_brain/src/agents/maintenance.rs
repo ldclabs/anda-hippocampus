@@ -4,7 +4,7 @@ use anda_core::{
 };
 use anda_db::schema::DocumentId;
 use anda_engine::{
-    context::AgentCtx,
+    context::{AgentCtx, CompletionRunner},
     extension::note::{NoteTool, load_notes, load_notes_from_legacy},
     local_date_hour,
     memory::{Conversation, ConversationRef, ConversationStatus, Conversations, MemoryManagement},
@@ -20,10 +20,7 @@ use std::{
     },
 };
 
-use super::{
-    BrainHook, SELF_USER_ID, append_runner_history, compact_runner_if_needed,
-    push_completed_history,
-};
+use super::{BrainHook, RunnerFlow, RunnerHost, SELF_USER_ID, drive_runner_loop};
 use crate::types::{MaintenanceAt, MaintenanceInput, MaintenanceScope};
 
 // Kept for reference; the runtime prompt comes from `prompts::active_prompt`
@@ -294,19 +291,10 @@ impl Agent<AgentCtx> for MaintenanceAgent {
     }
 }
 
-/// Hard guardrails for the maintenance runner loop (review P2-3).
-///
-/// A model that keeps emitting tool calls without converging would otherwise
-/// run forever: the runner compacts every ~81 turns and simply continues, so
-/// `processing` stays true and the whole space's memory system stalls
-/// (formation only resumes after maintenance completes). Maintenance
-/// legitimately needs far more turns than recall (`RECALL_MAX_MODEL_TURNS` =
-/// 7 + 180s), so these caps are intentionally loose. Exceeding either budget
-/// marks the conversation Failed, which releases the processing slot through
-/// the existing guard/hook flow. Budgets are checked between turns so an
-/// in-flight KIP write turn is never cancelled halfway.
-const MAINTENANCE_MAX_MODEL_TURNS: usize = 200;
-const MAINTENANCE_MAX_WALL_CLOCK_MS: u64 = 30 * 60 * 1000;
+// The runner guardrails are shared with formation; see
+// `RUNNER_MAX_MODEL_TURNS` in agents.rs. Tests keep the historical name.
+#[cfg(test)]
+use super::RUNNER_MAX_MODEL_TURNS as MAINTENANCE_MAX_MODEL_TURNS;
 
 impl MaintenanceAgent {
     async fn mark_conversation_failed(&self, conversation: &mut Conversation, reason: String) {
@@ -410,129 +398,47 @@ impl MaintenanceAgent {
             vec![],
         );
 
-        let started_at_ms = unix_ms();
-        let mut replace_initial_input = true;
-        let mut persisted_runner_history_len = 0;
-        let mut total_model_turns = 0usize;
-        let mut accounted_runner_turns = 0usize;
-        let mut unpersisted_turns = 0usize;
-        loop {
-            // Guardrails against a non-converging tool loop; see
-            // MAINTENANCE_MAX_MODEL_TURNS. Exceeding a budget takes the
-            // existing mark_conversation_failed path and releases the slot.
-            if total_model_turns >= MAINTENANCE_MAX_MODEL_TURNS {
-                self.mark_conversation_failed(
-                    conversation,
-                    format!(
-                        "maintenance exceeded model turn limit of {}",
-                        MAINTENANCE_MAX_MODEL_TURNS
-                    ),
-                )
-                .await;
-                break;
-            }
-            if unix_ms().saturating_sub(started_at_ms) >= MAINTENANCE_MAX_WALL_CLOCK_MS {
-                self.mark_conversation_failed(
-                    conversation,
-                    format!(
-                        "maintenance exceeded wall-clock budget of {} seconds",
-                        MAINTENANCE_MAX_WALL_CLOCK_MS / 1000
-                    ),
-                )
-                .await;
-                break;
-            }
+        let mut host = MaintenanceRunnerHost { agent: self };
+        drive_runner_loop(&mut host, &mut runner, conversation).await;
+    }
+}
 
-            match compact_runner_if_needed(&mut runner, 0, true).await {
-                Ok(true) => {
-                    // The compaction handoff consumed one model turn, and the
-                    // replacement runner restarts its own turn counter.
-                    total_model_turns = total_model_turns.saturating_add(1);
-                    accounted_runner_turns = runner.turns();
-                    persisted_runner_history_len = 0;
-                    replace_initial_input = false;
-                }
-                Ok(false) => {}
-                Err(err) => {
-                    self.mark_conversation_failed(
-                        conversation,
-                        format!("CompletionRunner error: {err:?}"),
-                    )
-                    .await;
-                    break;
-                }
-            }
+/// Maintenance's seams of the shared runner loop (`drive_runner_loop`).
+/// Unlike formation there is no review pass and no immediate break on a done
+/// turn: the loop terminates through the runner's own `Ok(None)` exit on the
+/// next iteration, and a successful turn never touches `failed_reason`
+/// (maintenance conversations are created fresh per cycle and never retried).
+struct MaintenanceRunnerHost<'a> {
+    agent: &'a MaintenanceAgent,
+}
 
-            match runner.next().await {
-                Ok(None) => break,
-                Ok(Some(res)) => {
-                    let runner_turns = runner.turns();
-                    total_model_turns = total_model_turns
-                        .saturating_add(runner_turns.saturating_sub(accounted_runner_turns));
-                    accounted_runner_turns = runner_turns;
+impl RunnerHost for MaintenanceRunnerHost<'_> {
+    fn label(&self) -> &'static str {
+        "maintenance"
+    }
 
-                    let now_ms = unix_ms();
-                    let is_done = runner.is_done();
+    fn history(&self) -> &RwLock<VecDeque<Document>> {
+        &self.agent.history
+    }
 
-                    append_runner_history(
-                        conversation,
-                        &res.chat_history,
-                        &mut persisted_runner_history_len,
-                        &mut replace_initial_input,
-                    );
+    async fn persist_snapshot(&self, conversation: &Conversation) {
+        self.agent.persist_conversation_snapshot(conversation).await;
+    }
 
-                    conversation.status = if res.failed_reason.is_some() {
-                        ConversationStatus::Failed
-                    } else if is_done {
-                        ConversationStatus::Completed
-                    } else {
-                        ConversationStatus::Working
-                    };
-                    conversation.usage = res.usage;
-                    conversation.updated_at = now_ms;
+    async fn mark_failed(&self, conversation: &mut Conversation, reason: String) {
+        self.agent
+            .mark_conversation_failed(conversation, reason)
+            .await;
+    }
 
-                    if let Some(failed_reason) = res.failed_reason {
-                        conversation.failed_reason = Some(failed_reason);
-                    } else {
-                        push_completed_history(&self.history, conversation, 2);
-                    }
+    fn turn_is_done(&self, runner: &CompletionRunner) -> bool {
+        runner.is_done()
+    }
 
-                    // Persisting rewrites the full message array (O(turns^2)
-                    // over a session), so intermediate Working turns are
-                    // throttled; terminal statuses always persist. See
-                    // PERSIST_EVERY_N_TURNS.
-                    unpersisted_turns = unpersisted_turns.saturating_add(1);
-                    if conversation.status != ConversationStatus::Working
-                        || unpersisted_turns >= super::PERSIST_EVERY_N_TURNS
-                    {
-                        self.persist_conversation_snapshot(conversation).await;
-                        unpersisted_turns = 0;
-                    }
+    fn on_turn_success(&self, _conversation: &mut Conversation) {}
 
-                    if conversation.status == ConversationStatus::Cancelled
-                        || conversation.status == ConversationStatus::Failed
-                    {
-                        break;
-                    }
-                }
-                Err(err) => {
-                    self.mark_conversation_failed(
-                        conversation,
-                        format!("CompletionRunner error: {err:?}"),
-                    )
-                    .await;
-                    break;
-                }
-            }
-        }
-
-        // Terminal and failure exits above always persist (any non-Working
-        // status forces a write, and mark_conversation_failed writes its own
-        // snapshot), so only a Working exit — e.g. the runner returning
-        // `Ok(None)` — can still hold turns skipped by the throttle.
-        if unpersisted_turns > 0 && conversation.status == ConversationStatus::Working {
-            self.persist_conversation_snapshot(conversation).await;
-        }
+    fn after_turn(&mut self, _runner: &mut CompletionRunner, _is_done: bool) -> RunnerFlow {
+        RunnerFlow::Continue
     }
 }
 

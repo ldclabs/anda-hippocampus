@@ -98,7 +98,9 @@ pub struct WikiCommitInput {
     /// default on create); `Some("")` clears it.
     #[serde(default)]
     pub acl_label: Option<String>,
-    /// `None` keeps the stored value on update.
+    /// `None` keeps the stored value on update; `Some("")` clears it (a
+    /// deleted `resource:` key must propagate on OKF re-import, mirroring
+    /// tags).
     #[serde(default)]
     pub source_uri: Option<String>,
     #[serde(default)]
@@ -130,7 +132,12 @@ impl WikiCommitInput {
         normalize_opt(&mut self.namespace);
         normalize_opt(&mut self.slug);
         normalize_opt(&mut self.message);
-        normalize_opt(&mut self.source_uri);
+        // Trim only — `Some("")` is the explicit "clear" marker (like
+        // `acl_label`), so it must survive normalization instead of
+        // collapsing into "keep the stored value".
+        if let Some(uri) = &mut self.source_uri {
+            *uri = uri.trim().to_string();
+        }
         if let Some(tags) = &self.tags {
             self.tags = Some(normalize_tags(tags));
         }
@@ -272,9 +279,9 @@ pub struct WikiSearchInput {
     #[serde(default)]
     pub mode: WikiSearchMode,
     /// Neighbor expansion: widen each hit by up to N adjacent chunks on both
-    /// sides (0–2, default 0). Overlapping expansions within one document
-    /// merge into a single hit; the citation range widens accordingly and
-    /// stays verifiable.
+    /// sides (0–2, default 0). Hits expand independently (nearby hits may
+    /// repeat overlapping context); each widened citation range stays
+    /// verifiable.
     #[serde(default)]
     pub expand: Option<u8>,
 }

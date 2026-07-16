@@ -2,6 +2,7 @@ use anda_core::{BoxError, ModelEffort, Principal, Usage, model::Message};
 use anda_db::storage::StorageStats;
 use anda_engine::model::ModelConfig as EngineModelConfig;
 use ic_cose_types::cose::cwt::{ClaimsSet, get_scope};
+use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, de};
 use std::{collections::BTreeMap, str::FromStr};
 
@@ -9,7 +10,7 @@ use std::{collections::BTreeMap, str::FromStr};
 pub struct Pagination {
     pub cursor: Option<String>,
     pub limit: Option<usize>,
-    /// Conversation collection: "recall", "maintenance".
+    /// Conversation collection: "formation" (default), "recall", "maintenance".
     pub collection: Option<String>,
 }
 
@@ -17,7 +18,7 @@ pub struct Pagination {
 pub struct ConversationDeltaQuery {
     pub messages_offset: Option<usize>,
     pub artifacts_offset: Option<usize>,
-    /// Conversation collection: "recall", "maintenance".
+    /// Conversation collection: "formation" (default), "recall", "maintenance".
     pub collection: Option<String>,
 }
 
@@ -380,7 +381,10 @@ pub struct UpdateSpaceInput {
     pub memory_policy: Option<MemoryPolicy>,
 }
 
-#[derive(Debug, Default, Serialize, Clone, PartialEq, Eq)]
+// `JsonSchema` (MCP tool schemas) documents the object form only; the custom
+// `Deserialize` below additionally accepts a JSON-string body on both the
+// HTTP and MCP channels (LLM callers frequently double-encode `context`).
+#[derive(Debug, Default, Serialize, Clone, PartialEq, Eq, JsonSchema)]
 pub struct InputContext {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub counterparty: Option<String>,
@@ -522,7 +526,7 @@ pub struct FormationRestartInput {
     pub conversation: u64,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default, JsonSchema)]
 pub enum MaintenanceScope {
     #[serde(rename = "daydream")]
     #[default]
@@ -592,7 +596,7 @@ fn default_trigger() -> String {
     "on_demand".to_string()
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, JsonSchema)]
 pub struct MaintenanceParameters {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stale_event_threshold_days: Option<u32>,
@@ -983,12 +987,6 @@ pub struct RecallOutput {
 pub struct SourceReliability {
     pub corrections: u64,
     pub last_corrected_at: u64,
-
-    /// Total links carrying this source, censused by full-scope settlements
-    /// — the denominator that turns `corrections` into a rate. `None` until
-    /// the first census (or when the census query failed).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub total_links: Option<u64>,
 }
 
 /// Outcome of one deterministic memory-metabolism settlement

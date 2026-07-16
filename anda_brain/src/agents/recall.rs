@@ -344,6 +344,14 @@ fn recall_time_remaining(started_at: u64) -> Option<Duration> {
     RECALL_TOTAL_TIMEOUT.checked_sub(elapsed)
 }
 
+/// Terminal failure modes of the recall runner loop, converted into a reason
+/// string or propagated error at the single post-loop exit in [`Agent::run`].
+enum RecallFailure {
+    TurnLimit,
+    Timeout,
+    Runner(BoxError),
+}
+
 /// Implementation of the [`Agent`] trait for RecallAgent.
 impl Agent<AgentCtx> for RecallAgent {
     /// Returns the agent's name identifier
@@ -467,152 +475,131 @@ impl Agent<AgentCtx> for RecallAgent {
         let mut total_model_turns = 0usize;
         let mut accounted_runner_turns = 0usize;
         let mut unpersisted_turns = 0usize;
-        loop {
-            if total_model_turns >= RECALL_MAX_MODEL_TURNS {
-                let reason = format!(
-                    "recall exceeded model turn limit of {}",
-                    RECALL_MAX_MODEL_TURNS
-                );
-                // Failure can strike after usage was accumulated but before it
-                // was copied from a runner output (e.g. right after a
-                // compaction handoff), so sync the runner total on every
-                // failure path to avoid undercounting token accounting.
-                conversation.usage = runner.total_usage().clone();
-                return Ok(self.failed_output(conversation, reason, last_output).await);
-            }
+        // Every failure exits through the labeled break so usage backfill and
+        // the failure handling live at exactly one place below the loop.
+        let failure: Option<RecallFailure> = 'run: {
+            loop {
+                if total_model_turns >= RECALL_MAX_MODEL_TURNS {
+                    break 'run Some(RecallFailure::TurnLimit);
+                }
 
-            let Some(remaining) = recall_time_remaining(started_at) else {
-                let reason = format!(
-                    "recall timed out after {} seconds",
-                    RECALL_TOTAL_TIMEOUT.as_secs()
-                );
-                conversation.usage = runner.total_usage().clone();
-                return Ok(self.failed_output(conversation, reason, last_output).await);
-            };
+                let Some(remaining) = recall_time_remaining(started_at) else {
+                    break 'run Some(RecallFailure::Timeout);
+                };
 
-            match timeout(remaining, compact_runner_if_needed(&mut runner, 0, true)).await {
-                Ok(Ok(true)) => {
-                    total_model_turns = total_model_turns.saturating_add(1);
-                    accounted_runner_turns = runner.turns();
-                    persisted_runner_history_len = 0;
-                    replace_initial_input = false;
-                    if total_model_turns >= RECALL_MAX_MODEL_TURNS {
-                        let reason = format!(
-                            "recall exceeded model turn limit of {}",
-                            RECALL_MAX_MODEL_TURNS
+                match timeout(remaining, compact_runner_if_needed(&mut runner)).await {
+                    Ok(Ok(true)) => {
+                        // A compaction that lands exactly on the turn limit is
+                        // caught by the check at the top of the next iteration.
+                        total_model_turns = total_model_turns.saturating_add(1);
+                        accounted_runner_turns = runner.turns();
+                        persisted_runner_history_len = 0;
+                        replace_initial_input = false;
+                    }
+                    Ok(Ok(false)) => {}
+                    Ok(Err(err)) => break 'run Some(RecallFailure::Runner(err)),
+                    Err(_) => break 'run Some(RecallFailure::Timeout),
+                }
+
+                let Some(remaining) = recall_time_remaining(started_at) else {
+                    break 'run Some(RecallFailure::Timeout);
+                };
+
+                match timeout(remaining, runner.next()).await {
+                    Err(_) => break 'run Some(RecallFailure::Timeout),
+                    Ok(Ok(None)) => break 'run None,
+                    Ok(Ok(Some(mut output))) => {
+                        let runner_turns = runner.turns();
+                        total_model_turns = total_model_turns
+                            .saturating_add(runner_turns.saturating_sub(accounted_runner_turns));
+                        accounted_runner_turns = runner_turns;
+
+                        let is_done = runner.is_done();
+                        append_runner_history(
+                            &mut conversation,
+                            &output.chat_history,
+                            &mut persisted_runner_history_len,
+                            &mut replace_initial_input,
                         );
-                        conversation.usage = runner.total_usage().clone();
-                        return Ok(self.failed_output(conversation, reason, last_output).await);
+                        conversation.status = if output.failed_reason.is_some() {
+                            ConversationStatus::Failed
+                        } else if is_done {
+                            ConversationStatus::Completed
+                        } else {
+                            ConversationStatus::Working
+                        };
+                        conversation.usage = output.usage.clone();
+                        conversation.updated_at = unix_ms();
+
+                        if let Some(ref failed_reason) = output.failed_reason {
+                            conversation.failed_reason = Some(failed_reason.clone());
+                        } else {
+                            conversation.failed_reason = None;
+                            push_completed_history(
+                                &self.history,
+                                &conversation,
+                                RECALL_HISTORY_LIMIT,
+                            );
+                        }
+
+                        // Persisting rewrites the full message array (O(turns^2)
+                        // over a session), so intermediate Working turns are
+                        // throttled; terminal statuses always persist. See
+                        // PERSIST_EVERY_N_TURNS.
+                        unpersisted_turns = unpersisted_turns.saturating_add(1);
+                        if conversation.status != ConversationStatus::Working
+                            || unpersisted_turns >= super::PERSIST_EVERY_N_TURNS
+                        {
+                            self.persist_conversation(&conversation).await;
+                            unpersisted_turns = 0;
+                        }
+                        output.conversation = Some(conversation._id);
+                        last_output = Some(output);
+
+                        if conversation.status == ConversationStatus::Failed
+                            || conversation.status == ConversationStatus::Completed
+                        {
+                            break 'run None;
+                        }
                     }
-                }
-                Ok(Ok(false)) => {}
-                Ok(Err(err)) => {
-                    conversation.status = ConversationStatus::Failed;
-                    conversation.failed_reason = Some(err.to_string());
-                    conversation.usage = runner.total_usage().clone();
-                    conversation.updated_at = unix_ms();
-                    if let Ok(changes) = conversation.to_changes() {
-                        let _ = self
-                            .conversations
-                            .update_conversation(conversation._id, changes)
-                            .await;
-                    }
-                    self.hook
-                        .on_conversation_end(Self::NAME, &conversation)
-                        .await;
-                    return Err(err);
-                }
-                Err(_) => {
-                    let reason = format!(
-                        "recall timed out after {} seconds",
-                        RECALL_TOTAL_TIMEOUT.as_secs()
-                    );
-                    conversation.usage = runner.total_usage().clone();
-                    return Ok(self.failed_output(conversation, reason, last_output).await);
+                    Ok(Err(err)) => break 'run Some(RecallFailure::Runner(err)),
                 }
             }
+        };
 
-            let Some(remaining) = recall_time_remaining(started_at) else {
-                let reason = format!(
-                    "recall timed out after {} seconds",
-                    RECALL_TOTAL_TIMEOUT.as_secs()
-                );
-                conversation.usage = runner.total_usage().clone();
-                return Ok(self.failed_output(conversation, reason, last_output).await);
-            };
-
-            match timeout(remaining, runner.next()).await {
-                Err(_) => {
+        // Single failure exit. The usage snapshot happens after the error
+        // occurred: failure can strike after usage was accumulated but before
+        // it was copied from a runner output (e.g. right after a compaction
+        // handoff), so the runner total is synced here on every failure path
+        // to avoid undercounting token accounting.
+        if let Some(failure) = failure {
+            conversation.usage = runner.total_usage().clone();
+            return match failure {
+                RecallFailure::TurnLimit => {
+                    let reason = format!(
+                        "recall exceeded model turn limit of {}",
+                        RECALL_MAX_MODEL_TURNS
+                    );
+                    Ok(self.failed_output(conversation, reason, last_output).await)
+                }
+                RecallFailure::Timeout => {
                     let reason = format!(
                         "recall timed out after {} seconds",
                         RECALL_TOTAL_TIMEOUT.as_secs()
                     );
-                    conversation.usage = runner.total_usage().clone();
-                    return Ok(self.failed_output(conversation, reason, last_output).await);
+                    Ok(self.failed_output(conversation, reason, last_output).await)
                 }
-                Ok(Ok(None)) => break,
-                Ok(Ok(Some(mut output))) => {
-                    let runner_turns = runner.turns();
-                    total_model_turns = total_model_turns
-                        .saturating_add(runner_turns.saturating_sub(accounted_runner_turns));
-                    accounted_runner_turns = runner_turns;
-
-                    let is_done = runner.is_done();
-                    append_runner_history(
-                        &mut conversation,
-                        &output.chat_history,
-                        &mut persisted_runner_history_len,
-                        &mut replace_initial_input,
-                    );
-                    conversation.status = if output.failed_reason.is_some() {
-                        ConversationStatus::Failed
-                    } else if is_done {
-                        ConversationStatus::Completed
-                    } else {
-                        ConversationStatus::Working
-                    };
-                    conversation.usage = output.usage.clone();
-                    conversation.updated_at = unix_ms();
-
-                    if let Some(ref failed_reason) = output.failed_reason {
-                        conversation.failed_reason = Some(failed_reason.clone());
-                    } else {
-                        conversation.failed_reason = None;
-                        push_completed_history(&self.history, &conversation, RECALL_HISTORY_LIMIT);
-                    }
-
-                    // Persisting rewrites the full message array (O(turns^2)
-                    // over a session), so intermediate Working turns are
-                    // throttled; terminal statuses always persist. See
-                    // PERSIST_EVERY_N_TURNS.
-                    unpersisted_turns = unpersisted_turns.saturating_add(1);
-                    if conversation.status != ConversationStatus::Working
-                        || unpersisted_turns >= super::PERSIST_EVERY_N_TURNS
-                    {
-                        self.persist_conversation(&conversation).await;
-                        unpersisted_turns = 0;
-                    }
-                    output.conversation = Some(conversation._id);
-                    last_output = Some(output);
-
-                    if conversation.status == ConversationStatus::Failed
-                        || conversation.status == ConversationStatus::Completed
-                    {
-                        break;
-                    }
-                }
-                Ok(Err(err)) => {
+                RecallFailure::Runner(err) => {
                     conversation.status = ConversationStatus::Failed;
                     conversation.failed_reason = Some(err.to_string());
-                    conversation.usage = runner.total_usage().clone();
                     conversation.updated_at = unix_ms();
                     self.persist_conversation(&conversation).await;
                     self.hook
                         .on_conversation_end(Self::NAME, &conversation)
                         .await;
-                    return Err(err);
+                    Err(err)
                 }
-            }
+            };
         }
 
         // Terminal exits above always persist (any non-Working status forces

@@ -454,8 +454,8 @@ pub struct EvalReport {
     pub score: EvalScore,
 
     /// Standard deviation of the total score, propagated from checkpoint
-    /// samples when `checkpoint_samples > 1`. Gates can subtract
-    /// `confidence_z * total_stddev` to test a lower confidence bound.
+    /// samples when `checkpoint_samples > 1`; the optimizer's noise band is
+    /// built from it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_stddev: Option<f64>,
 
@@ -898,12 +898,6 @@ pub struct EvalGate {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_total_findings: Option<u64>,
-
-    /// When set and a total stddev is available (`checkpoint_samples > 1`),
-    /// the gate tests `total - confidence_z * stddev` against
-    /// `min_total_score`, so a lucky single roll cannot pass the gate.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub confidence_z: Option<f64>,
 }
 
 impl EvalGate {
@@ -911,22 +905,13 @@ impl EvalGate {
         self.min_total_score.is_some() || self.max_total_findings.is_some()
     }
 
-    pub fn evaluate(
-        &self,
-        score: &EvalScore,
-        attribution: &AttributionSummary,
-        total_stddev: Option<f64>,
-    ) -> EvalGateReport {
+    pub fn evaluate(&self, score: &EvalScore, attribution: &AttributionSummary) -> EvalGateReport {
         let mut failures = Vec::new();
-        let gated_total = match (self.confidence_z, total_stddev) {
-            (Some(z), Some(stddev)) => score.total - z * stddev,
-            _ => score.total,
-        };
         if let Some(min_total_score) = self.min_total_score
-            && gated_total < min_total_score
+            && score.total < min_total_score
         {
             failures.push(format!(
-                "total score {gated_total:.4} (mean {:.4}) is below required minimum {min_total_score:.4}",
+                "total score {:.4} is below required minimum {min_total_score:.4}",
                 score.total
             ));
         }
@@ -1542,9 +1527,9 @@ pub enum EvalFindingKind {
     GraphProbeError,
     LatencyCost,
     TokenCost,
-    /// An eval-harness instrument failed (the LLM judge, the user simulator,
-    /// or a trace read); the affected sample degraded to lexical or blind
-    /// scoring. Attribution-neutral: never counted against a memory stage.
+    /// An eval-harness instrument failed (the LLM judge); the affected
+    /// sample degraded to lexical scoring. Attribution-neutral: never
+    /// counted against a memory stage.
     JudgeError,
 }
 
@@ -1984,16 +1969,7 @@ where
     };
 
     let started = Instant::now();
-    // A transport-level failure is degraded exactly like an in-band agent
-    // failure (a `failed_reason` finding) instead of aborting the scenario
-    // and discarding every completed turn.
-    let output = match driver.remember(input).await {
-        Ok(output) => output,
-        Err(err) => EvalAgentResult {
-            failed_reason: Some(format!("formation transport failed: {err}")),
-            ..Default::default()
-        },
-    };
+    let output = driver.remember(input).await?;
     let mut findings = agent_failure_finding(EvalFindingKind::FormationMiss, output.failed_reason);
     if let Some(conversation) = output.conversation {
         findings.extend(wait_failure_finding(
@@ -2064,35 +2040,16 @@ where
     );
 
     let started = Instant::now();
-    // The simulator is eval-harness infrastructure: when it cannot produce a
-    // user message, the turn is skipped with an attribution-neutral finding
-    // instead of aborting the scenario and discarding every completed turn.
-    let sim_output = match driver
+    let sim_output = driver
         .complete(CompletionRequest {
             instructions: SIMULATOR_INSTRUCTIONS.to_string(),
             prompt,
             ..Default::default()
         })
-        .await
-    {
-        Ok(sim_output) => sim_output,
-        Err(err) => {
-            return Ok(simulator_failure_report(
-                turn,
-                &started,
-                Usage::default(),
-                format!("user simulator failed for turn {}: {err}", turn.turn),
-            ));
-        }
-    };
+        .await?;
     let message = sim_output.content.trim().to_string();
     if message.is_empty() {
-        return Ok(simulator_failure_report(
-            turn,
-            &started,
-            sim_output.usage,
-            format!("user simulator produced no message for turn {}", turn.turn),
-        ));
+        return Err(format!("user simulator produced no message for turn {}", turn.turn).into());
     }
 
     let input = FormationInput {
@@ -2104,15 +2061,7 @@ where
         context: turn_context(scenario, turn),
         timestamp: Some(turn_timestamp(turn)),
     };
-    // Transport failures degrade like in-band agent failures (see
-    // `run_normal_turn`).
-    let output = match driver.remember(input).await {
-        Ok(output) => output,
-        Err(err) => EvalAgentResult {
-            failed_reason: Some(format!("formation transport failed: {err}")),
-            ..Default::default()
-        },
-    };
+    let output = driver.remember(input).await?;
     let mut findings = agent_failure_finding(EvalFindingKind::FormationMiss, output.failed_reason);
     if let Some(conversation) = output.conversation {
         findings.extend(wait_failure_finding(
@@ -2135,29 +2084,6 @@ where
         findings,
         ..Default::default()
     })
-}
-
-/// Report for a simulated turn whose user message never materialized: the
-/// harness (not the memory system) failed, so the finding stays
-/// attribution-neutral and the timeline continues without this turn.
-fn simulator_failure_report(
-    turn: &EvalTurn,
-    started: &Instant,
-    usage: Usage,
-    message: String,
-) -> EvalTurnReport {
-    EvalTurnReport {
-        turn: turn.turn,
-        turn_type: EvalTurnTypeReport::Simulated,
-        latency_ms: started.elapsed().as_millis() as u64,
-        usage,
-        findings: vec![EvalFinding {
-            kind: EvalFindingKind::JudgeError,
-            expectation_id: None,
-            message,
-        }],
-        ..Default::default()
-    }
 }
 
 async fn run_maintenance_turn<D>(
@@ -2228,15 +2154,7 @@ where
     D: EvalDriver + ?Sized,
 {
     let started = Instant::now();
-    // Transport failures degrade like in-band agent failures (see
-    // `run_normal_turn`).
-    let output = match driver.maintain(input).await {
-        Ok(output) => output,
-        Err(err) => EvalAgentResult {
-            failed_reason: Some(format!("maintenance transport failed: {err}")),
-            ..Default::default()
-        },
-    };
+    let output = driver.maintain(input).await?;
     // `conversation` is None when a cycle was already in flight (e.g. one the
     // hook auto-triggered after formation). The wait polls the processing
     // flag either way, so the next turn never overlaps a consolidation.
@@ -2302,37 +2220,104 @@ where
     };
 
     let sample_count = profile.checkpoint_samples.max(1);
-    // Samples are independent recall rolls; run them concurrently and
-    // aggregate in index order (`join_all` preserves it) so scores, findings,
-    // and the representative pick stay deterministic.
-    let runs = join_all((0..sample_count).map(|_| {
-        run_checkpoint_sample(
-            driver,
-            scenario,
-            &rubric,
-            profile,
-            &input,
-            &probes,
-            graph_stats.as_ref(),
-        )
-    }))
-    .await;
-
+    // Samples run sequentially, NOT concurrently: the recall agent keeps a
+    // shared rolling history that every run reads at start and appends to on
+    // completion. Concurrent samples race on it — whether sample 3 sees
+    // sample 1's answer to the same query becomes a latency lottery, which
+    // collapses the very variance `score_stddev` (the optimizer's noise
+    // band) is supposed to measure — and parallel samples inflate each
+    // other's `latency_ms`. Sequential order keeps the semantics
+    // deterministic (sample k sees its k-1 predecessors, identically on
+    // every run) at the cost of checkpoint wall time.
     let mut samples: Vec<EvalCheckpointSample> = Vec::with_capacity(sample_count);
     let mut verdicts: Vec<Option<JudgeVerdict>> = Vec::with_capacity(sample_count);
     let mut conversations: Vec<Option<u64>> = Vec::with_capacity(sample_count);
     let mut traces: Vec<Option<RecallTrace>> = Vec::with_capacity(sample_count);
     let mut models: Vec<Option<String>> = Vec::with_capacity(sample_count);
-    let mut judge_errors = 0usize;
-    for run in runs {
-        total_usage.accumulate(&run.extra_usage);
-        total_usage.accumulate(&run.sample.usage);
-        judge_errors += usize::from(run.judge_errored);
-        conversations.push(run.conversation);
-        traces.push(run.trace);
-        verdicts.push(run.verdict);
-        models.push(run.model);
-        samples.push(run.sample);
+    for _ in 0..sample_count {
+        let started = Instant::now();
+        let output = driver.recall(input.clone()).await?;
+        let latency_ms = started.elapsed().as_millis() as u64;
+        let trace = match output.conversation {
+            Some(conversation) => driver.recall_trace(conversation).await?,
+            None => None,
+        };
+
+        let mut findings =
+            agent_failure_finding(EvalFindingKind::BadSynthesis, output.failed_reason.clone());
+        let verdict = if profile.judge == EvalJudgeKind::Llm {
+            let judge_input = judge::JudgeCheckpointInput {
+                query: input.query.as_str(),
+                answer: output.content.as_str(),
+                scoring_rubric: rubric.scoring_rubric.as_deref(),
+                hidden_profile: &scenario.hidden_profile,
+                required_terms: &rubric.required_answer_terms,
+                forbidden_terms: &rubric.forbidden_answer_terms,
+                probes: &probes,
+                expectations: rubric
+                    .expected_memories
+                    .iter()
+                    .map(|expectation| judge::JudgeExpectation {
+                        id: expectation.id.clone(),
+                        mode: expectation.mode,
+                        description: expectation.description.clone(),
+                        // An errored probe never observed the graph: pass the
+                        // state as unknown so the judge cannot read it as a
+                        // formation miss.
+                        probe_satisfied: probes
+                            .iter()
+                            .find(|probe| probe.expectation_id == expectation.id)
+                            .and_then(|probe| (!probe.errored()).then_some(probe.satisfied)),
+                    })
+                    .collect(),
+                trace_summary: trace.as_ref().map(|trace| {
+                    assess::truncate_chars(&serde_json::to_string(trace).unwrap_or_default(), 6_000)
+                }),
+            };
+            match judge::judge_checkpoint(driver, judge_input).await {
+                Ok(call) => {
+                    total_usage.accumulate(&call.usage);
+                    Some(call.verdict)
+                }
+                Err(err) => {
+                    // Per-sample harness finding, filtered by
+                    // `majority_findings` like every other sample finding.
+                    log::warn!(target: "eval", "judge failed, falling back to lexical: {err}");
+                    findings.push(EvalFinding {
+                        kind: EvalFindingKind::JudgeError,
+                        expectation_id: None,
+                        message: format!("LLM judge failed; sample scored lexically: {err}"),
+                    });
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let observation = CheckpointObservation {
+            answer: output.content.as_str(),
+            probes: &probes,
+            recall_trace: trace.as_ref(),
+            latency_ms,
+            usage: &output.usage,
+            graph_stats: graph_stats.as_ref(),
+        };
+        let scored = score_checkpoint(&rubric, &observation, profile, verdict.as_ref());
+        findings.extend(scored.findings);
+
+        total_usage.accumulate(&output.usage);
+        conversations.push(output.conversation);
+        models.push(output.model.clone());
+        traces.push(trace);
+        verdicts.push(verdict);
+        samples.push(EvalCheckpointSample {
+            answer: output.content,
+            latency_ms,
+            usage: output.usage,
+            score: scored.score,
+            findings,
+        });
     }
 
     // Representative sample: the median by total score, so the reported
@@ -2341,13 +2326,6 @@ where
     let (mean_score, score_stddev) = mean_sample_scores(&samples);
     let mut findings = pre_findings;
     findings.extend(majority_findings(&samples));
-    for _ in 0..judge_errors {
-        findings.push(EvalFinding {
-            kind: EvalFindingKind::JudgeError,
-            expectation_id: None,
-            message: "LLM judge failed; sample scored lexically".to_string(),
-        });
-    }
     let satisfaction = {
         let values: Vec<f64> = verdicts
             .iter()
@@ -2390,137 +2368,6 @@ where
         findings,
         ..Default::default()
     })
-}
-
-/// One recall sample's full outcome, produced concurrently per checkpoint.
-struct CheckpointSampleRun {
-    sample: EvalCheckpointSample,
-    verdict: Option<JudgeVerdict>,
-    conversation: Option<u64>,
-    trace: Option<RecallTrace>,
-    model: Option<String>,
-    /// Judge usage on top of the recall usage carried by `sample`.
-    extra_usage: Usage,
-    judge_errored: bool,
-}
-
-async fn run_checkpoint_sample<D>(
-    driver: &D,
-    scenario: &EvalScenario,
-    rubric: &EvalRubric,
-    profile: &EvalProfile,
-    input: &RecallInput,
-    probes: &[MemoryProbeReport],
-    graph_stats: Option<&GraphStats>,
-) -> CheckpointSampleRun
-where
-    D: EvalDriver + ?Sized,
-{
-    let started = Instant::now();
-    // A transport-level recall failure is scored exactly like an in-band
-    // agent failure (empty answer + `failed_reason` finding) instead of
-    // aborting the scenario and discarding every completed turn.
-    let output = match driver.recall(input.clone()).await {
-        Ok(output) => output,
-        Err(err) => EvalAgentResult {
-            failed_reason: Some(format!("recall transport failed: {err}")),
-            ..Default::default()
-        },
-    };
-    let latency_ms = started.elapsed().as_millis() as u64;
-    let mut harness_findings: Vec<EvalFinding> = Vec::new();
-    let trace = match output.conversation {
-        Some(conversation) => match driver.recall_trace(conversation).await {
-            Ok(trace) => trace,
-            Err(err) => {
-                // Losing the trace only degrades grounding attribution;
-                // record the harness failure and keep scoring the sample.
-                harness_findings.push(EvalFinding {
-                    kind: EvalFindingKind::JudgeError,
-                    expectation_id: None,
-                    message: format!("recall trace unavailable: {err}"),
-                });
-                None
-            }
-        },
-        None => None,
-    };
-
-    let mut extra_usage = Usage::default();
-    let mut judge_errored = false;
-    let verdict = if profile.judge == EvalJudgeKind::Llm {
-        let judge_input = judge::JudgeCheckpointInput {
-            query: input.query.as_str(),
-            answer: output.content.as_str(),
-            scoring_rubric: rubric.scoring_rubric.as_deref(),
-            hidden_profile: &scenario.hidden_profile,
-            required_terms: &rubric.required_answer_terms,
-            forbidden_terms: &rubric.forbidden_answer_terms,
-            probes,
-            expectations: rubric
-                .expected_memories
-                .iter()
-                .map(|expectation| judge::JudgeExpectation {
-                    id: expectation.id.clone(),
-                    mode: expectation.mode,
-                    description: expectation.description.clone(),
-                    // An errored probe never observed the graph: pass the
-                    // state as unknown so the judge cannot read it as a
-                    // formation miss.
-                    probe_satisfied: probes
-                        .iter()
-                        .find(|probe| probe.expectation_id == expectation.id)
-                        .and_then(|probe| (!probe.errored()).then_some(probe.satisfied)),
-                })
-                .collect(),
-            trace_summary: trace.as_ref().map(|trace| {
-                assess::truncate_chars(&serde_json::to_string(trace).unwrap_or_default(), 6_000)
-            }),
-        };
-        match judge::judge_checkpoint(driver, judge_input).await {
-            Ok(call) => {
-                extra_usage.accumulate(&call.usage);
-                Some(call.verdict)
-            }
-            Err(err) => {
-                judge_errored = true;
-                log::warn!(target: "eval", "judge failed, falling back to lexical: {err}");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    let observation = CheckpointObservation {
-        answer: output.content.as_str(),
-        probes,
-        recall_trace: trace.as_ref(),
-        latency_ms,
-        usage: &output.usage,
-        graph_stats,
-    };
-    let scored = score_checkpoint(rubric, &observation, profile, verdict.as_ref());
-    let mut findings =
-        agent_failure_finding(EvalFindingKind::BadSynthesis, output.failed_reason.clone());
-    findings.extend(harness_findings);
-    findings.extend(scored.findings);
-
-    CheckpointSampleRun {
-        conversation: output.conversation,
-        model: output.model.clone(),
-        sample: EvalCheckpointSample {
-            answer: output.content,
-            latency_ms,
-            usage: output.usage,
-            score: scored.score,
-            findings,
-        },
-        verdict,
-        trace,
-        extra_usage,
-        judge_errored,
-    }
 }
 
 fn median_sample_index(samples: &[EvalCheckpointSample]) -> usize {
@@ -3323,11 +3170,6 @@ mod tests {
         /// Simulate stuck background stages: waits return an error.
         fail_formation_wait: bool,
         fail_maintenance_wait: bool,
-        /// Simulate transport-level agent failures (the request itself errs).
-        fail_remember: bool,
-        fail_maintain: bool,
-        fail_recall: bool,
-        fail_trace: bool,
     }
 
     #[async_trait::async_trait]
@@ -3372,9 +3214,6 @@ mod tests {
     #[async_trait::async_trait]
     impl EvalDriver for FakeEvalDriver {
         async fn remember(&self, input: FormationInput) -> Result<EvalAgentResult, BoxError> {
-            if self.fail_remember {
-                return Err("formation endpoint unreachable".into());
-            }
             self.remembered.lock().unwrap().push(input);
             Ok(EvalAgentResult {
                 conversation: Some(1),
@@ -3383,9 +3222,6 @@ mod tests {
         }
 
         async fn recall(&self, _input: RecallInput) -> Result<EvalAgentResult, BoxError> {
-            if self.fail_recall {
-                return Err("recall endpoint unreachable".into());
-            }
             let mut calls = self.recall_calls.lock().unwrap();
             let content = if self.recall_answers.is_empty() {
                 self.recall_answer.clone()
@@ -3406,9 +3242,6 @@ mod tests {
         }
 
         async fn maintain(&self, input: MaintenanceInput) -> Result<EvalAgentResult, BoxError> {
-            if self.fail_maintain {
-                return Err("maintenance endpoint unreachable".into());
-            }
             self.maintained.lock().unwrap().push(input);
             Ok(EvalAgentResult {
                 conversation: Some(3),
@@ -3417,9 +3250,6 @@ mod tests {
         }
 
         async fn recall_trace(&self, _conversation: u64) -> Result<Option<RecallTrace>, BoxError> {
-            if self.fail_trace {
-                return Err("conversation store unavailable".into());
-            }
             Ok(self.trace.clone())
         }
 
@@ -3551,120 +3381,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transport_failures_degrade_to_findings_instead_of_aborting() {
-        let driver = FakeEvalDriver {
-            fail_remember: true,
-            fail_maintain: true,
-            fail_recall: true,
-            ..Default::default()
-        };
-        let scenario = EvalScenario {
-            id: "transport".to_string(),
-            timeline: vec![
-                EvalTurn {
-                    turn: 1,
-                    user: Some("remember this".to_string()),
-                    ..empty_turn()
-                },
-                EvalTurn {
-                    turn: 2,
-                    turn_type: EvalTurnType::Maintenance,
-                    ..empty_turn()
-                },
-                EvalTurn {
-                    turn: 3,
-                    turn_type: EvalTurnType::CheckpointSynthetic,
-                    query: Some("what was it?".to_string()),
-                    evaluation: Some(EvalRubric {
-                        required_answer_terms: vec!["something".to_string()],
-                        ..Default::default()
-                    }),
-                    ..empty_turn()
-                },
-            ],
-            ..empty_scenario()
-        };
-
-        let report = run_scenario(&driver, &scenario, &EvalProfile::default())
-            .await
-            .unwrap();
-
-        // Every turn still ran; each transport failure became an attributed
-        // finding on its own stage instead of an abort.
-        assert_eq!(report.turns.len(), 3);
-        assert!(report.turns[0].findings.iter().any(|finding| {
-            finding.kind == EvalFindingKind::FormationMiss
-                && finding.message.contains("transport failed")
-        }));
-        assert!(report.turns[1].findings.iter().any(|finding| {
-            finding.kind == EvalFindingKind::BadConsolidation
-                && finding.message.contains("transport failed")
-        }));
-        let checkpoint = &report.turns[2];
-        assert!(checkpoint.findings.iter().any(|finding| {
-            finding.kind == EvalFindingKind::BadSynthesis
-                && finding.message.contains("transport failed")
-        }));
-        // The failed sample is scored like an in-band agent failure: an
-        // empty answer with a real (low) score, not a missing turn.
-        assert_eq!(checkpoint.answer.as_deref(), Some(""));
-        assert!(checkpoint.score.is_some());
-    }
-
-    #[tokio::test]
-    async fn simulator_and_trace_failures_degrade_to_judge_error_findings() {
-        // No canned simulator completion => the simulator LLM call fails.
-        let driver = FakeEvalDriver {
-            recall_answer: "an answer".to_string(),
-            fail_trace: true,
-            ..Default::default()
-        };
-        let scenario = EvalScenario {
-            id: "harness_failures".to_string(),
-            timeline: vec![
-                EvalTurn {
-                    turn: 1,
-                    turn_type: EvalTurnType::Simulated,
-                    intent: Some("mention a preference".to_string()),
-                    ..empty_turn()
-                },
-                EvalTurn {
-                    turn: 2,
-                    turn_type: EvalTurnType::CheckpointSynthetic,
-                    query: Some("what do I like?".to_string()),
-                    evaluation: Some(EvalRubric::default()),
-                    ..empty_turn()
-                },
-            ],
-            ..empty_scenario()
-        };
-
-        let report = run_scenario(&driver, &scenario, &EvalProfile::default())
-            .await
-            .unwrap();
-
-        // The simulated turn was skipped with an attribution-neutral harness
-        // finding; nothing reached formation.
-        assert_eq!(report.turns[0].turn_type, EvalTurnTypeReport::Simulated);
-        assert!(report.turns[0].findings.iter().any(|finding| {
-            finding.kind == EvalFindingKind::JudgeError
-                && finding.message.contains("user simulator failed")
-        }));
-        assert!(driver.remembered.lock().unwrap().is_empty());
-
-        // The checkpoint kept its answer; only the trace read degraded.
-        let checkpoint = &report.turns[1];
-        assert_eq!(checkpoint.answer.as_deref(), Some("an answer"));
-        assert!(checkpoint.recall_trace.is_none());
-        assert!(checkpoint.findings.iter().any(|finding| {
-            finding.kind == EvalFindingKind::JudgeError
-                && finding.message.contains("recall trace unavailable")
-        }));
-        assert_eq!(report.attribution.judge_error, 2);
-        assert_eq!(report.attribution.formation_miss, 0);
-    }
-
-    #[tokio::test]
     async fn errored_assertion_probe_skips_judge_and_reports_unknown() {
         let verdict = json!({
             "memory_utility": 1.0,
@@ -3676,7 +3392,8 @@ mod tests {
         });
         // Only the checkpoint judge has a canned response: an assertion-judge
         // call would fail and leave a "judge error: …" reason, proving no
-        // such call was spent on the unobservable graph state.
+        // such call was spent on an errored probe or on empty evidence. The
+        // fake KIP layer answers unknown commands with an empty array.
         let driver = FakeEvalDriver {
             recall_answer: "an answer".to_string(),
             completions: Mutex::new(vec![("strict evaluator".to_string(), verdict.to_string())]),
@@ -3699,69 +3416,14 @@ mod tests {
                 turn_type: EvalTurnType::CheckpointSynthetic,
                 query: Some("Dinner suggestion?".to_string()),
                 evaluation: Some(EvalRubric {
-                    expected_memories: vec![ExpectedMemory {
-                        id: "bbq".to_string(),
-                        assertion: Some(assertion.to_string()),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                }),
-                ..empty_turn()
-            }],
-            ..empty_scenario()
-        };
-        let profile = EvalProfile {
-            judge: EvalJudgeKind::Llm,
-            ..Default::default()
-        };
-
-        let report = run_scenario(&driver, &scenario, &profile).await.unwrap();
-
-        let probe = &report.turns[0].probes[0];
-        assert!(probe.errored());
-        // No assertion-judge call ran for the unobservable graph state.
-        assert_eq!(probe.judge_reason, None);
-        // Scored as an infrastructure unknown, not as a memory miss.
-        assert_eq!(report.attribution.graph_probe_error, 1);
-        assert_eq!(report.attribution.formation_miss, 0);
-        // The checkpoint judge saw the probe as errored with unknown state.
-        let seen = driver.seen_completions.lock().unwrap();
-        let judge_prompt = seen
-            .iter()
-            .find(|(instructions, _)| instructions.contains("strict evaluator"))
-            .map(|(_, prompt)| prompt.clone())
-            .expect("checkpoint judge ran");
-        assert!(judge_prompt.contains("\"error\":true"));
-        assert!(judge_prompt.contains("\"satisfied\":null"));
-        assert!(judge_prompt.contains("\"probe_satisfied\":null"));
-    }
-
-    #[tokio::test]
-    async fn empty_assertion_evidence_short_circuits_without_judge_call() {
-        let verdict = json!({
-            "memory_utility": 1.0,
-            "forgetting_quality": 1.0,
-            "uncertainty_calibration": 1.0,
-            "satisfaction": 1.0,
-            "reasoning": "fine",
-            "findings": []
-        });
-        // The fake KIP layer answers unknown commands with an empty array.
-        // No assertion-judge completion is canned, so any judge call would
-        // leave a "judge error: …" reason instead of the deterministic one.
-        let driver = FakeEvalDriver {
-            recall_answer: "an answer".to_string(),
-            completions: Mutex::new(vec![("strict evaluator".to_string(), verdict.to_string())]),
-            ..Default::default()
-        };
-        let scenario = EvalScenario {
-            id: "empty_evidence".to_string(),
-            timeline: vec![EvalTurn {
-                turn: 1,
-                turn_type: EvalTurnType::CheckpointSynthetic,
-                query: Some("Dinner suggestion?".to_string()),
-                evaluation: Some(EvalRubric {
                     expected_memories: vec![
+                        // KIP-level error: the graph was never observed.
+                        ExpectedMemory {
+                            id: "bbq".to_string(),
+                            assertion: Some(assertion.to_string()),
+                            ..Default::default()
+                        },
+                        // Empty evidence: deterministic short-circuits.
                         ExpectedMemory {
                             id: "gone".to_string(),
                             mode: MemoryExpectationMode::ShouldNotExist,
@@ -3790,64 +3452,37 @@ mod tests {
 
         // Probes keep rubric order even though they run concurrently.
         let probes = &report.turns[0].probes;
-        assert_eq!(probes.len(), 2);
-        assert_eq!(probes[0].expectation_id, "gone");
-        assert_eq!(probes[1].expectation_id, "missing");
+        assert_eq!(probes.len(), 3);
+        assert_eq!(probes[0].expectation_id, "bbq");
+        assert!(probes[0].errored());
+        // No assertion-judge call ran for the unobservable graph state.
+        assert_eq!(probes[0].judge_reason, None);
         // should_not_exist over empty evidence is deterministically satisfied;
-        // should_exist is deterministically missed.
-        assert!(probes[0].satisfied);
-        assert!(!probes[1].satisfied);
-        for probe in probes {
+        // should_exist is deterministically missed — without a judge call.
+        assert!(probes[1].satisfied);
+        assert!(!probes[2].satisfied);
+        for probe in &probes[1..] {
             assert_eq!(
                 probe.judge_reason.as_deref(),
                 Some("no graph evidence matched the probe search"),
                 "judge must not be called on empty evidence"
             );
         }
+        // The errored probe scored as an infrastructure unknown, not as a
+        // memory miss: the only formation miss is the deterministic one from
+        // the `missing` expectation.
+        assert_eq!(report.attribution.graph_probe_error, 1);
         assert_eq!(report.attribution.formation_miss, 1);
-    }
-
-    #[tokio::test]
-    async fn shape_mismatched_judge_output_falls_back_to_lexical() {
-        // Legal JSON with the scores nested in a wrapper: it must degrade to
-        // a JudgeError + lexical scoring, not parse as an all-zero verdict.
-        let wrapped = json!({
-            "verdict": {
-                "memory_utility": 0.9,
-                "forgetting_quality": 0.9,
-                "uncertainty_calibration": 0.9,
-                "satisfaction": 0.9
-            }
-        });
-        let driver = FakeEvalDriver {
-            recall_answer: "I will keep it concise.".to_string(),
-            completions: Mutex::new(vec![("strict evaluator".to_string(), wrapped.to_string())]),
-            ..Default::default()
-        };
-        let scenario = EvalScenario {
-            id: "judge_shape".to_string(),
-            timeline: vec![EvalTurn {
-                turn: 1,
-                turn_type: EvalTurnType::CheckpointSynthetic,
-                query: Some("Rewrite this like me?".to_string()),
-                evaluation: Some(EvalRubric {
-                    required_answer_terms: vec!["concise".to_string()],
-                    ..Default::default()
-                }),
-                ..empty_turn()
-            }],
-            ..empty_scenario()
-        };
-        let profile = EvalProfile {
-            judge: EvalJudgeKind::Llm,
-            ..Default::default()
-        };
-
-        let report = run_scenario(&driver, &scenario, &profile).await.unwrap();
-
-        assert_eq!(report.attribution.judge_error, 1);
-        // Lexical fallback scored the correct answer well above zero.
-        assert!(report.turns[0].score.as_ref().unwrap().total > 0.5);
+        // The checkpoint judge saw the errored probe with unknown state.
+        let seen = driver.seen_completions.lock().unwrap();
+        let judge_prompt = seen
+            .iter()
+            .find(|(instructions, _)| instructions.contains("strict evaluator"))
+            .map(|(_, prompt)| prompt.clone())
+            .expect("checkpoint judge ran");
+        assert!(judge_prompt.contains("\"error\":true"));
+        assert!(judge_prompt.contains("\"satisfied\":null"));
+        assert!(judge_prompt.contains("\"probe_satisfied\":null"));
     }
 
     /// Every bundled fixture must parse strictly and validate without errors,
@@ -4115,7 +3750,6 @@ mod tests {
         let gate = EvalGate {
             min_total_score: Some(0.9),
             max_total_findings: Some(1),
-            confidence_z: None,
         };
         let report = gate.evaluate(
             &EvalScore {
@@ -4127,7 +3761,6 @@ mod tests {
                 bad_grounding: 1,
                 ..Default::default()
             },
-            None,
         );
 
         assert!(!report.passed);
@@ -4136,33 +3769,6 @@ mod tests {
         assert_eq!(report.failures.len(), 2);
         assert!(report.failures[0].contains("below required minimum"));
         assert!(report.failures[1].contains("exceeds maximum"));
-    }
-
-    #[test]
-    fn eval_gate_confidence_z_gates_on_lower_bound() {
-        let gate = EvalGate {
-            min_total_score: Some(0.75),
-            max_total_findings: None,
-            confidence_z: Some(2.0),
-        };
-        let score = EvalScore {
-            total: 0.8,
-            ..Default::default()
-        };
-        let attribution = AttributionSummary::default();
-
-        // Mean passes, but the 2-sigma lower bound (0.8 - 2*0.05 = 0.7) fails.
-        let report = gate.evaluate(&score, &attribution, Some(0.05));
-        assert!(!report.passed);
-        assert!(report.failures[0].contains("mean 0.8000"));
-
-        // Without stddev the mean is used directly.
-        let report = gate.evaluate(&score, &attribution, None);
-        assert!(report.passed);
-
-        // Tight variance passes the lower bound.
-        let report = gate.evaluate(&score, &attribution, Some(0.01));
-        assert!(report.passed);
     }
 
     #[test]

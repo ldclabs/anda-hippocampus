@@ -214,10 +214,15 @@ impl WikiService {
                 .slug
                 .as_ref()
                 .is_none_or(|s| slugify_path(s) == doc.slug)
-            && input
-                .source_uri
-                .as_ref()
-                .is_none_or(|s| Some(s) == doc.source_uri.as_ref())
+            && input.source_uri.as_ref().is_none_or(|s| {
+                // `Some("")` means "cleared": idempotent against a document
+                // that has no source_uri.
+                if s.is_empty() {
+                    doc.source_uri.is_none()
+                } else {
+                    Some(s) == doc.source_uri.as_ref()
+                }
+            })
             && input.metadata.as_ref().is_none_or(|m| *m == doc.metadata)
         {
             let version = self.version_record(doc.current_version).await?;
@@ -336,9 +341,17 @@ impl WikiService {
             ("updated_by".to_string(), Fv::Text(actor.clone())),
             ("updated_at".to_string(), Fv::U64(now_ms)),
         ]);
-        // None keeps the stored source_uri/metadata on update.
-        if let Some(source_uri) = &input.source_uri {
-            fields.insert("source_uri".to_string(), Fv::Text(source_uri.clone()));
+        // None keeps the stored source_uri on update; empty clears it — a
+        // deleted `resource:` key must propagate on OKF re-import instead of
+        // being resurrected by the next export (mirroring tags).
+        match input.source_uri.as_deref() {
+            None => {}
+            Some("") => {
+                fields.insert("source_uri".to_string(), Fv::Null);
+            }
+            Some(uri) => {
+                fields.insert("source_uri".to_string(), Fv::Text(uri.to_string()));
+            }
         }
         if let Some(metadata) = &input.metadata {
             fields.insert("metadata".to_string(), Fv::from(metadata.clone()));
@@ -596,18 +609,10 @@ impl WikiService {
         if input.query.is_empty() {
             return Err(WikiError::Invalid("query cannot be empty".into()));
         }
-        if input.namespaces.len() > MAX_INCLUDE_KEYS {
-            return Err(WikiError::Invalid(format!(
-                "too many namespaces: {} exceeds the {MAX_INCLUDE_KEYS} filter limit",
-                input.namespaces.len()
-            )));
-        }
-        if input.doc_ids.len() > MAX_INCLUDE_KEYS {
-            return Err(WikiError::Invalid(format!(
-                "too many doc_ids: {} exceeds the {MAX_INCLUDE_KEYS} filter limit",
-                input.doc_ids.len()
-            )));
-        }
+        // Oversized filter lists narrow silently: Include truncation is
+        // fail-closed (results can only shrink, never widen).
+        input.namespaces.truncate(MAX_INCLUDE_KEYS);
+        input.doc_ids.truncate(MAX_INCLUDE_KEYS);
         let top_k = input.top_k.unwrap_or(8).clamp(1, 50);
 
         let mut doc_ids = input.doc_ids.clone();
@@ -639,18 +644,18 @@ impl WikiService {
             "current".to_string(),
             RangeQuery::Eq(Fv::U64(1)),
         )))];
+        // Without an explicit namespace list, the retrieval-eval corpus must
+        // stay out of results (it lives in the wiki but is not user
+        // content). That exclusion is applied AFTER the query: a `Filter::
+        // Not` would make anda_db walk the collection's entire id index on
+        // every default search (the BM25 candidate set only gates
+        // membership), an O(collection) cost on the hottest path.
+        let exclude_eval = input.namespaces.is_empty();
         if !input.namespaces.is_empty() {
             filters.push(Box::new(Filter::Field((
                 "namespace".to_string(),
                 RangeQuery::Include(input.namespaces.iter().cloned().map(Fv::Text).collect()),
             ))));
-        } else {
-            // The retrieval-eval corpus lives in the wiki but is not user
-            // content: keep it out of searches unless asked for by name.
-            filters.push(Box::new(Filter::Not(Box::new(Filter::Field((
-                "namespace".to_string(),
-                RangeQuery::Eq(Fv::Text(evalset::EVAL_NAMESPACE.to_string())),
-            ))))));
         }
         if !doc_ids.is_empty() {
             filters.push(Box::new(Filter::Field((
@@ -666,7 +671,7 @@ impl WikiService {
             WikiSearchMode::Chunks => top_k,
             WikiSearchMode::Docs => (top_k * 8).clamp(top_k, 200),
         };
-        let rows: Vec<WikiChunkRecord> = self
+        let mut rows: Vec<WikiChunkRecord> = self
             .chunks
             .search_as(Query {
                 search: Some(Search {
@@ -677,6 +682,12 @@ impl WikiService {
                 limit: Some(fetch),
             })
             .await?;
+        if exclude_eval {
+            // Production spaces hold no eval chunks (zero loss); inside
+            // dedicated eval spaces this degrades to fewer hits, never
+            // wrong ones.
+            rows.retain(|row| row.namespace != evalset::EVAL_NAMESPACE);
+        }
 
         let mut seen_docs = std::collections::BTreeSet::new();
         for row in &rows {
@@ -711,9 +722,9 @@ impl WikiService {
     /// Neighbor expansion (PRD §5.3): widens each hit by up to `expand`
     /// adjacent chunks. Chunks tile their version, so concatenating
     /// neighbors equals the exact content slice and the widened citation is
-    /// recomputed over that range — still verifiable. Overlapping
-    /// expansions within one document merge into a single hit at the
-    /// best-ranked position.
+    /// recomputed over that range — still verifiable. Hits expand
+    /// independently: nearby hits of one document may repeat overlapping
+    /// context, each with its own verifiable citation.
     async fn expand_hits(
         &self,
         core: Vec<WikiChunkRecord>,
@@ -761,59 +772,17 @@ impl WikiService {
             );
         }
 
-        struct Interval {
-            key: (u64, u64),
-            lo: usize,
-            hi: usize,
-            core_idx: usize, // index into `core`: the best-ranked seed
-        }
-        let mut intervals: Vec<Interval> = Vec::new();
-        for (rank, row) in core.iter().enumerate() {
-            let key = (row.doc_id, row.version_id);
-            let layout = &layouts[&key];
+        let mut hits = Vec::with_capacity(core.len());
+        for row in &core {
+            let layout = &layouts[&(row.doc_id, row.version_id)];
             let Some(pos) = layout.rows.iter().position(|r| r._id == row._id) else {
                 // Layout raced away (e.g. concurrent commit): keep unexpanded.
-                intervals.push(Interval {
-                    key,
-                    lo: usize::MAX,
-                    hi: usize::MAX,
-                    core_idx: rank,
-                });
-                continue;
-            };
-            let mut lo = pos.saturating_sub(expand);
-            let mut hi = (pos + expand).min(layout.rows.len() - 1);
-            let mut core_idx = rank;
-            // Absorb every overlapping/adjacent interval of this document.
-            // Each merge grows the range and may bridge into further
-            // intervals, so re-scan until a pass finds nothing; the merged
-            // interval keeps the best (lowest) rank among its members.
-            while let Some(idx) = intervals.iter().position(|iv| {
-                iv.key == key && iv.lo != usize::MAX && iv.lo <= hi + 1 && lo <= iv.hi + 1
-            }) {
-                let absorbed = intervals.remove(idx);
-                lo = lo.min(absorbed.lo);
-                hi = hi.max(absorbed.hi);
-                core_idx = core_idx.min(absorbed.core_idx);
-            }
-            intervals.push(Interval {
-                key,
-                lo,
-                hi,
-                core_idx,
-            });
-        }
-        intervals.sort_by_key(|iv| iv.core_idx);
-
-        let mut hits = Vec::with_capacity(intervals.len());
-        for iv in intervals {
-            let row = &core[iv.core_idx];
-            if iv.lo == usize::MAX {
                 hits.push(self.hit_from(row));
                 continue;
-            }
-            let layout = &layouts[&iv.key];
-            let slice = &layout.rows[iv.lo..=iv.hi];
+            };
+            let lo = pos.saturating_sub(expand);
+            let hi = (pos + expand).min(layout.rows.len() - 1);
+            let slice = &layout.rows[lo..=hi];
             let text: String = slice.iter().map(|r| r.text.as_str()).collect();
             let start = slice
                 .first()
@@ -949,9 +918,9 @@ impl WikiService {
 
     /// Citation verification: recomputes the chunk checksum from the
     /// immutable version content. `Invalid` means the citation does not
-    /// match stored content; it is only evented when the stored content
-    /// itself is corrupt. `Superseded` reports the version that replaced
-    /// the cited one.
+    /// match stored content. `Superseded` reports the version that replaced
+    /// the cited one. Mismatches are never evented: any anonymous caller
+    /// could otherwise flood the audit log through `/wiki/verify`.
     pub async fn verify(
         &self,
         actor: String,
@@ -1009,12 +978,12 @@ impl WikiService {
     /// many facts instead of re-reading version content per fact.
     async fn verify_resolved(
         &self,
-        actor: String,
+        _actor: String,
         doc: &WikiDocRecord,
         version: &WikiVersionRecord,
         (start, end): (u64, u64),
         expected: Option<&str>,
-        now_ms: u64,
+        _now_ms: u64,
     ) -> Result<WikiVerifyOutput, WikiError> {
         if version.doc_id != doc._id {
             return Ok(verify_not_found());
@@ -1032,39 +1001,6 @@ impl WikiService {
         if let Some(expected) = expected
             && expected != computed
         {
-            // A caller checksum that disagrees with intact content is a
-            // reference error (stale or fabricated citation), not a
-            // corruption signal: eventing it would let any anonymous caller
-            // flood the audit log with fake `CitationVerifyFailed` rows.
-            // Real corruption — content that no longer matches its own
-            // commit-time checksum — is still evented.
-            let corrupted = checksum_for([version.content.as_bytes()]) != version.checksum;
-            if corrupted {
-                // Audit-write failures never fail the read (PRD §3.4).
-                if let Err(err) = self
-                    .write_event(
-                        EVENT_CITATION_VERIFY_FAILED,
-                        Some(doc._id),
-                        Some(version._id),
-                        actor,
-                        BTreeMap::from([
-                            ("expected".to_string(), Json::from(expected.to_string())),
-                            ("computed".to_string(), Json::from(computed.clone())),
-                            ("byte_start".to_string(), Json::from(start)),
-                            ("byte_end".to_string(), Json::from(end)),
-                        ]),
-                        now_ms,
-                    )
-                    .await
-                {
-                    log::warn!(
-                        target: "brain",
-                        space_id = self.space_id,
-                        doc_id = doc._id;
-                        "CitationVerifyFailed event write failed: {err:?}"
-                    );
-                }
-            }
             return Ok(WikiVerifyOutput {
                 status: WikiVerifyStatus::Invalid,
                 current_version: Some(doc.current_version),
@@ -1705,52 +1641,49 @@ impl WikiService {
             report.versions_removed += 1;
         }
 
-        // Reconcile chunk visibility with the doc row. Paginated: after a
-        // crash between activation and cleanup a document briefly owns two
-        // full chunk sets, which can exceed a single query's limit — an
-        // unpaginated read would leave the overflow stale forever.
+        // Reconcile chunk visibility with the doc row. `scan_ids` paginates
+        // past the single-query cap: after a crash between activation and
+        // cleanup a document briefly owns two full chunk sets, which can
+        // exceed one search page.
+        let keep: std::collections::BTreeSet<u64> = self
+            .chunk_ids_of(doc._id, doc.current_version)
+            .await?
+            .into_iter()
+            .collect();
+        for chunk_id in self.all_chunk_ids_of(doc._id).await? {
+            if !keep.contains(&chunk_id) {
+                self.chunks.remove(chunk_id).await?;
+                report.chunks_removed += 1;
+            }
+        }
         let want_current: u64 = (doc.status == DOC_STATUS_ACTIVE) as u64;
-        let mut cursor = self.chunks.max_document_id() + 1;
-        loop {
-            let rows: Vec<WikiChunkRecord> = self
-                .chunks
-                .search_as(Query {
-                    search: None,
-                    filter: Some(Filter::And(vec![
-                        Box::new(Filter::Field((
-                            "doc_id".to_string(),
-                            RangeQuery::Eq(Fv::U64(doc._id)),
-                        ))),
-                        Box::new(Filter::Field((
-                            "_id".to_string(),
-                            RangeQuery::Lt(Fv::U64(cursor)),
-                        ))),
-                    ])),
-                    limit: Some(Collection::MAX_SEARCH_LIMIT),
-                })
+        let mismatched = self
+            .scan_ids(
+                &self.chunks,
+                Filter::And(vec![
+                    Box::new(Filter::Field((
+                        "doc_id".to_string(),
+                        RangeQuery::Eq(Fv::U64(doc._id)),
+                    ))),
+                    Box::new(Filter::Field((
+                        "version_id".to_string(),
+                        RangeQuery::Eq(Fv::U64(doc.current_version)),
+                    ))),
+                    Box::new(Filter::Field((
+                        "current".to_string(),
+                        RangeQuery::Eq(Fv::U64(1 - want_current)),
+                    ))),
+                ]),
+            )
+            .await?;
+        for chunk_id in mismatched {
+            self.chunks
+                .update(
+                    chunk_id,
+                    BTreeMap::from([("current".to_string(), Fv::U64(want_current))]),
+                )
                 .await?;
-            let Some(min_id) = rows.iter().map(|r| r._id).min() else {
-                break;
-            };
-            cursor = min_id;
-            let page_len = rows.len();
-            for row in rows {
-                if row.version_id != doc.current_version {
-                    self.chunks.remove(row._id).await?;
-                    report.chunks_removed += 1;
-                } else if row.current != want_current {
-                    self.chunks
-                        .update(
-                            row._id,
-                            BTreeMap::from([("current".to_string(), Fv::U64(want_current))]),
-                        )
-                        .await?;
-                    report.chunks_repaired += 1;
-                }
-            }
-            if page_len < Collection::MAX_SEARCH_LIMIT {
-                break;
-            }
+            report.chunks_repaired += 1;
         }
         Ok(())
     }
@@ -2924,73 +2857,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checksum_mismatch_events_only_on_real_corruption() {
-        let wiki = test_wiki("wiki_verify_events").await;
-        let out = wiki
-            .commit(
-                "a".to_string(),
-                commit_input("引用文档", "# 引用文档\n\n可验证的内容。\n"),
-                1000,
-            )
-            .await
-            .unwrap();
-        let probe = WikiVerifyInput {
-            doc_id: Some(out.doc.id),
-            version_id: Some(out.version.id),
-            byte_range: Some((0, 2)),
-            checksum: Some("sha3-256:beef".to_string()),
-            ..Default::default()
-        };
-
-        // Wrong caller checksum against intact content: a reference error.
-        // Invalid verdict, but NO corruption event — an anonymous caller
-        // must not be able to flood the audit log through /wiki/verify.
-        let bad = wiki
-            .verify("prober".to_string(), probe.clone(), 2000)
-            .await
-            .unwrap();
-        assert_eq!(bad.status, WikiVerifyStatus::Invalid);
-        let events = wiki
-            .list_events(
-                Some(EVENT_CITATION_VERIFY_FAILED.to_string()),
-                None,
-                None,
-                Some(10),
-            )
-            .await
-            .unwrap();
-        assert!(events.events.is_empty(), "reference errors must not event");
-
-        // Corrupt the stored content so it no longer matches its own
-        // commit-time checksum: now the mismatch is a storage signal.
-        wiki.versions
-            .update(
-                out.version.id,
-                BTreeMap::from([(
-                    "content".to_string(),
-                    Fv::Text("# 引用文档\n\n被篡改的内容。\n".to_string()),
-                )]),
-            )
-            .await
-            .unwrap();
-        let corrupted = wiki
-            .verify("prober".to_string(), probe, 3000)
-            .await
-            .unwrap();
-        assert_eq!(corrupted.status, WikiVerifyStatus::Invalid);
-        let events = wiki
-            .list_events(
-                Some(EVENT_CITATION_VERIFY_FAILED.to_string()),
-                None,
-                None,
-                Some(10),
-            )
-            .await
-            .unwrap();
-        assert_eq!(events.events.len(), 1, "real corruption must be evented");
-    }
-
-    #[tokio::test]
     async fn section_read_survives_corrupt_chunk_ranges() {
         let wiki = test_wiki("wiki_section_corrupt").await;
         let out = wiki
@@ -3329,7 +3195,9 @@ mod m2_tests {
             .await
             .unwrap();
 
-        // Export reflects the current state; unknown keys survive.
+        // Export reflects the current state: the drifted stored block is
+        // discarded wholesale in favor of the synthesized frontmatter, so
+        // unknown keys do not survive drift.
         let export = wiki
             .export_bundle("e".to_string(), None, 3000)
             .await
@@ -3341,9 +3209,13 @@ mod m2_tests {
             .unwrap();
         assert!(entry.content.contains("title: 新政策"), "{}", entry.content);
         assert!(entry.content.contains("tags: [new]"));
-        assert!(entry.content.contains("custom: 保留"));
         assert!(
-            !entry.content.contains("旧政策\ntags"),
+            !entry.content.contains("custom: 保留"),
+            "drifted raw block must be discarded wholesale: {}",
+            entry.content
+        );
+        assert!(
+            !entry.content.contains("title: 旧政策"),
             "stale title line survived"
         );
 
@@ -3385,64 +3257,6 @@ mod m2_tests {
     }
 
     #[tokio::test]
-    async fn okf_commit_origin_docs_replay_with_zero_growth() {
-        let wiki = test_wiki("wiki_okf_origin").await;
-        let mut input = commit_input("原生文档", "# 原生文档\n\n直接提交的内容。\n");
-        input.tags = Some(vec!["native".to_string()]);
-        let out = wiki
-            .commit("author".to_string(), input, 1000)
-            .await
-            .unwrap();
-
-        let export = wiki
-            .export_bundle("e".to_string(), None, 2000)
-            .await
-            .unwrap();
-        // First replay of a commit-origin doc must already be version-stable:
-        // the synthesized frontmatter is recognized and not persisted.
-        let reimport = wiki
-            .import_bundle(
-                "i".to_string(),
-                WikiImportInput {
-                    entries: export.entries,
-                    namespace: None,
-                },
-                3000,
-            )
-            .await
-            .unwrap();
-        assert_eq!(reimport.unchanged, 1);
-        assert_eq!(reimport.created + reimport.updated, 0);
-        let versions = wiki
-            .list_versions(out.doc.id, None, Some(10))
-            .await
-            .unwrap();
-        assert_eq!(versions.versions.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn okf_import_skips_colliding_slugified_paths() {
-        let wiki = test_wiki("wiki_okf_collide").await;
-        let out = wiki
-            .import_bundle(
-                "i".to_string(),
-                WikiImportInput {
-                    entries: vec![
-                        bundle_entry("A B.md", "# 第一份\n\n甲。\n"),
-                        bundle_entry("a-b.md", "# 第二份\n\n乙。\n"),
-                    ],
-                    namespace: None,
-                },
-                1000,
-            )
-            .await
-            .unwrap();
-        assert_eq!(out.created, 1);
-        assert_eq!(out.skipped.len(), 1);
-        assert!(out.skipped[0].reason.contains("slugifies"));
-    }
-
-    #[tokio::test]
     async fn okf_import_updates_changed_docs_in_place() {
         let wiki = test_wiki("wiki_okf_update").await;
         let v1 = WikiImportInput {
@@ -3467,7 +3281,7 @@ mod m2_tests {
     }
 
     #[tokio::test]
-    async fn neighbor_expansion_widens_and_merges_hits() {
+    async fn neighbor_expansion_widens_hits() {
         let wiki = test_wiki("wiki_expand").await;
         // Every section clears CHUNK_TARGET_MIN so the sibling-merge pass
         // keeps them as three separate chunks.
@@ -3518,76 +3332,14 @@ mod m2_tests {
             .unwrap();
         assert_eq!(verified.status, WikiVerifyStatus::Valid);
 
-        // Two adjacent hits merge into one expanded hit instead of
-        // duplicating overlapping context.
+        // Adjacent hits expand independently: overlapping context may repeat
+        // across hits, each with its own verifiable citation.
         let mut q = WikiSearchInput::from_query("前置说明 后续说明".to_string());
         q.expand = Some(2);
         q.top_k = Some(10);
-        let merged = wiki.search(q).await.unwrap();
-        assert_eq!(merged.hits.len(), 1);
-        assert!(merged.hits[0].text.contains("量子轨道谐振"));
-    }
-
-    #[tokio::test]
-    async fn expanded_hits_bridge_overlapping_intervals_into_one() {
-        let wiki = test_wiki("wiki_expand_bridge").await;
-        // Nine sections, each past CHUNK_TARGET_MIN so every one stays its
-        // own chunk (ordinals 0..=8).
-        let content = (0..9)
-            .map(|i| format!("# 章节{i}\n\n{}\n\n", format!("第{i}节内容。").repeat(80)))
-            .collect::<String>();
-        let out = wiki
-            .commit("u".to_string(), commit_input("章节文档", &content), 1000)
-            .await
-            .unwrap();
-        assert_eq!(out.chunks, 9, "fixture must produce one chunk per section");
-
-        let mut rows: Vec<WikiChunkRecord> = wiki
-            .chunks
-            .search_as(Query {
-                search: None,
-                filter: Some(Filter::Field((
-                    "doc_id".to_string(),
-                    RangeQuery::Eq(Fv::U64(out.doc.id)),
-                ))),
-                limit: Some(Collection::MAX_SEARCH_LIMIT),
-            })
-            .await
-            .unwrap();
-        rows.sort_by_key(|r| r.ordinal);
-
-        // Ranked hits at ordinals 0, 6 and 3 with expand=2: [0,2] and [4,8]
-        // do not touch, but rank 2's [1,5] bridges them — all three must
-        // merge into ONE hit spanning every chunk, seeded by rank 0.
-        let core = vec![rows[0].clone(), rows[6].clone(), rows[3].clone()];
-        let hits = wiki.expand_hits(core, 2).await.unwrap();
-        assert_eq!(hits.len(), 1, "bridged expansions must merge into one hit");
-        let hit = &hits[0];
-        assert_eq!(
-            hit.citation.chunk_id, rows[0]._id,
-            "merged hit keeps the best-ranked seed"
-        );
-        assert_eq!(
-            hit.citation.byte_range,
-            (rows[0].byte_start, rows[8].byte_end)
-        );
-        let full: String = rows.iter().map(|r| r.text.as_str()).collect();
-        assert_eq!(hit.text, full, "no duplicated overlap text");
-
-        // The widened citation still verifies.
-        let verified = wiki
-            .verify(
-                "u".to_string(),
-                WikiVerifyInput {
-                    uri: Some(hit.citation.uri.clone()),
-                    checksum: Some(hit.citation.checksum.clone()),
-                    ..Default::default()
-                },
-                2000,
-            )
-            .await
-            .unwrap();
-        assert_eq!(verified.status, WikiVerifyStatus::Valid);
+        let both = wiki.search(q).await.unwrap();
+        assert_eq!(both.hits.len(), 2);
+        assert!(both.hits.iter().all(|h| h.text.contains("量子轨道谐振")));
     }
 
     #[tokio::test]

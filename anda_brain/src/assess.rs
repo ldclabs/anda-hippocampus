@@ -425,64 +425,38 @@ pub struct RecallMeta {
 }
 
 /// Splits the `<memory_meta>{...}</memory_meta>` self-report off a recall
-/// answer. Every tag occurrence is stripped (a model echoing the prompt's
-/// example block must not leak markup to plain `/recall` clients); the last
-/// parseable payload wins. An absent or malformed payload degrades to
-/// `None` — the footer is an enhancement, never a failure mode.
+/// answer, tail-anchored: the LAST closing tag and its nearest preceding
+/// opening tag delimit the one block that is stripped and parsed; trailing
+/// prose after the block is joined back onto the answer. Everything else —
+/// earlier echoed example blocks, prose mentions, unclosed opens — stays in
+/// the answer as literal text: marker leakage is accepted, content loss
+/// never is. An absent or malformed payload degrades to `None` — the footer
+/// is an enhancement, never a failure mode.
 pub fn split_recall_meta(content: &str) -> (String, Option<RecallMeta>) {
-    fn parse_meta(payload: &str) -> Option<RecallMeta> {
-        parse_json_payload::<RecallMeta>(payload)
-            .ok()
-            .map(|meta| RecallMeta {
-                uncertainty: meta
-                    .uncertainty
-                    .filter(|value| value.is_finite())
-                    .map(|value| value.clamp(0.0, 1.0)),
-                ..meta
-            })
-    }
-
-    if !content.contains(RECALL_META_TAG_OPEN) {
+    let Some(close) = content.rfind(RECALL_META_TAG_CLOSE) else {
         return (content.trim_end().to_string(), None);
-    }
+    };
+    let Some(open) = content[..close].rfind(RECALL_META_TAG_OPEN) else {
+        return (content.trim_end().to_string(), None);
+    };
 
-    let mut segments: Vec<&str> = Vec::new();
-    let mut meta: Option<RecallMeta> = None;
-    let mut rest = content;
-    while let Some(start) = rest.find(RECALL_META_TAG_OPEN) {
-        segments.push(&rest[..start]);
-        let after = &rest[start + RECALL_META_TAG_OPEN.len()..];
-        match after.find(RECALL_META_TAG_CLOSE) {
-            Some(end) => {
-                if let Some(parsed) = parse_meta(&after[..end]) {
-                    meta = Some(parsed);
-                }
-                rest = &after[end + RECALL_META_TAG_CLOSE.len()..];
-            }
-            None => {
-                // Unclosed opening tag. A JSON-looking tail is a footer the
-                // model truncated mid-write (drop it, salvage what parses);
-                // anything else is prose that merely mentioned the tag —
-                // keep it, stripping must never lose content.
-                if after.trim_start().starts_with('{') {
-                    if let Some(parsed) = parse_meta(after) {
-                        meta = Some(parsed);
-                    }
-                } else {
-                    segments.push(after);
-                }
-                rest = "";
-            }
-        }
-    }
-    segments.push(rest);
+    let meta = parse_json_payload::<RecallMeta>(&content[open + RECALL_META_TAG_OPEN.len()..close])
+        .ok()
+        .map(|meta| RecallMeta {
+            uncertainty: meta
+                .uncertainty
+                .filter(|value| value.is_finite())
+                .map(|value| value.clamp(0.0, 1.0)),
+            ..meta
+        });
 
-    let answer = segments
-        .iter()
-        .map(|segment| segment.trim())
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let before = content[..open].trim();
+    let after = content[close + RECALL_META_TAG_CLOSE.len()..].trim();
+    let answer = match (before.is_empty(), after.is_empty()) {
+        (false, false) => format!("{before}\n{after}"),
+        (false, true) => before.to_string(),
+        (true, _) => after.to_string(),
+    };
     (answer, meta)
 }
 
@@ -684,28 +658,47 @@ mod tests {
         assert_eq!(answer, "Answer.\ntail");
         assert_eq!(meta.unwrap().uncertainty, Some(1.0));
 
-        // Every occurrence is stripped (e.g. an echoed prompt example); the
-        // last parseable payload wins.
+        // Tail-anchored: only the LAST closed block is stripped. An earlier
+        // echoed example block stays in the answer as literal text — marker
+        // leakage is accepted, content loss never is.
         let (answer, meta) = split_recall_meta(
             "<memory_meta>{\"uncertainty\": 0.9}</memory_meta>\nAnswer.\n\
              <memory_meta>{\"found\": true, \"uncertainty\": 0.1}</memory_meta>",
         );
-        assert_eq!(answer, "Answer.");
+        assert_eq!(
+            answer,
+            "<memory_meta>{\"uncertainty\": 0.9}</memory_meta>\nAnswer."
+        );
         let meta = meta.unwrap();
         assert_eq!(meta.found, Some(true));
         assert_eq!(meta.uncertainty, Some(0.1));
 
-        // Unclosed tag followed by prose: the tag goes, the prose stays —
-        // stripping must never lose content.
+        // No closing tag anywhere: nothing is stripped and nothing is
+        // salvaged — an unclosed open (prose mention or truncated footer)
+        // stays in the answer verbatim.
         let (answer, meta) = split_recall_meta("The <memory_meta> tag marks the footer, see docs.");
-        assert_eq!(answer, "The\ntag marks the footer, see docs.");
+        assert_eq!(answer, "The <memory_meta> tag marks the footer, see docs.");
+        assert!(meta.is_none());
+        let (answer, meta) = split_recall_meta("Answer.\n<memory_meta>{\"found\": false}");
+        assert_eq!(answer, "Answer.\n<memory_meta>{\"found\": false}");
         assert!(meta.is_none());
 
-        // Unclosed tag with a JSON tail: a footer truncated mid-write is
-        // dropped, and whatever parses is salvaged.
-        let (answer, meta) = split_recall_meta("Answer.\n<memory_meta>{\"found\": false}");
-        assert_eq!(answer, "Answer.");
-        assert_eq!(meta.unwrap().found, Some(false));
+        // A prose mention followed by the real footer: the close pairs with
+        // its NEAREST preceding open, so all answer content survives — the
+        // mentioned tag is kept as literal text.
+        let (answer, meta) = split_recall_meta(
+            "I found it. As instructed, the <memory_meta> footer follows.\n\
+             Your meeting is on Friday at 3pm.\n\
+             <memory_meta>{\"found\": true, \"uncertainty\": 0.1}</memory_meta>",
+        );
+        assert_eq!(
+            answer,
+            "I found it. As instructed, the <memory_meta> footer follows.\n\
+             Your meeting is on Friday at 3pm."
+        );
+        let meta = meta.unwrap();
+        assert_eq!(meta.found, Some(true));
+        assert_eq!(meta.uncertainty, Some(0.1));
     }
 
     #[test]

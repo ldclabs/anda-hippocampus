@@ -6,6 +6,9 @@
 //! - `Content-Type: application/json` (default) for JSON request bodies
 //! - `Accept: application/cbor` for CBOR responses
 //! - `Accept: application/json` (default) for JSON responses
+//!
+//! Content negotiation applies to success bodies only: error response
+//! bodies are always JSON regardless of the `Accept` header.
 
 use axum::{
     Json,
@@ -284,50 +287,52 @@ impl RpcError {
     }
 }
 
+/// Extract the bearer token from the `Authorization` header.
+///
+/// Strips exactly one leading `Bearer ` prefix: `trim_start_matches` would
+/// strip a repeated prefix out of the credential itself. Returns an empty
+/// string when the header is absent. Shared by the HTTP handlers and the
+/// MCP channel so both extract credentials identically.
+pub fn extract_bearer_token(headers: &HeaderMap) -> String {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .map(|s| {
+            let s = s.trim();
+            s.strip_prefix("Bearer ").unwrap_or(s)
+        })
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Extract the shard id from the `Shard-Id`/`X-Shard` header.
+///
+/// Lenient: an absent or unparseable header falls back to shard 0. Shared
+/// by the HTTP handlers and the MCP channel.
+pub fn extract_shard_id(headers: &HeaderMap) -> u32 {
+    headers
+        .get("Shard-Id")
+        .or_else(|| headers.get("X-Shard"))
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
 /// Extracts a bearer token from the `Authorization` header and sharding id from the `X-Shard` header.
 #[derive(Debug)]
 pub struct HeaderVals(pub String, pub u32);
 
 impl<S: Send + Sync> axum::extract::FromRequestParts<S> for HeaderVals {
-    type Rejection = AppError;
+    type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
         _state: &S,
     ) -> Result<Self, Self::Rejection> {
-        let token = parts
-            .headers
-            .get(header::AUTHORIZATION)
-            .and_then(|h| h.to_str().ok())
-            .map(|s| {
-                // Strip exactly one leading "Bearer " prefix,
-                // case-insensitively: `trim_start_matches` would strip a
-                // repeated prefix out of the credential itself, and a
-                // case-sensitive match would reject a valid `bearer <cwt>`.
-                let s = s.trim();
-                match s.get(..7) {
-                    Some(prefix) if prefix.eq_ignore_ascii_case("bearer ") => s[7..].trim_start(),
-                    _ => s,
-                }
-            })
-            .unwrap_or("")
-            .to_string();
-        // A present-but-unparseable shard header is a routing mistake; the
-        // old silent fallback to shard 0 sent such requests to the wrong
-        // shard's error path instead of telling the caller.
-        let shard_id = match parts
-            .headers
-            .get("Shard-Id")
-            .or_else(|| parts.headers.get("X-Shard"))
-        {
-            Some(value) => value
-                .to_str()
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok())
-                .ok_or_else(|| AppError::bad_request("invalid Shard-Id/X-Shard header"))?,
-            None => 0,
-        };
-        Ok(HeaderVals(token, shard_id))
+        Ok(HeaderVals(
+            extract_bearer_token(&parts.headers),
+            extract_shard_id(&parts.headers),
+        ))
     }
 }
 
@@ -369,58 +374,12 @@ impl AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let marker = NegotiatedError {
-            status: self.status,
-            message: self.message.clone(),
-            data: self.data.clone(),
-        };
+        // Error bodies are always JSON, regardless of the request's Accept
+        // header; only success bodies participate in content negotiation.
         let mut err = RpcError::new(self.message);
         err.data = self.data;
-        let mut res = err.into_response(Some(self.status));
-        // `IntoResponse` has no access to the request's Accept header; the
-        // `negotiate_error_encoding` middleware picks this marker up and
-        // re-encodes the body for CBOR clients.
-        res.extensions_mut().insert(marker);
-        res
+        err.into_response(Some(self.status))
     }
-}
-
-/// Marker attached by [`AppError::into_response`] so
-/// [`negotiate_error_encoding`] can rebuild the error body in the format
-/// the client asked for.
-#[derive(Clone)]
-pub struct NegotiatedError {
-    pub status: StatusCode,
-    pub message: String,
-    pub data: Option<Value>,
-}
-
-/// Axum middleware: re-encodes error bodies as CBOR when the request asked
-/// for `Accept: application/cbor`. Success bodies already negotiate in
-/// [`AppResponse`], but error bodies are produced by `AppError`'s
-/// `IntoResponse`, which cannot see the request headers — without this a
-/// pure-CBOR client cannot decode `error.message`/`error.data` (including
-/// the wiki 409 conflict payload its read-merge-retry flow depends on).
-pub async fn negotiate_error_encoding(
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
-    let wants_cbor = ContentType::from_accept(req.headers()) == ContentType::Cbor;
-    let mut res = next.run(req).await;
-    if wants_cbor && let Some(err) = res.extensions_mut().remove::<NegotiatedError>() {
-        let mut rpc = RpcError::new(err.message);
-        rpc.data = err.data;
-        let mut buf = Vec::new();
-        if cbor2::to_writer(&RpcResponse::<()>::error(rpc), &mut buf).is_ok() {
-            return (
-                err.status,
-                [(header::CONTENT_TYPE, ContentType::Cbor.header_value())],
-                buf,
-            )
-                .into_response();
-        }
-    }
-    res
 }
 
 // ─── Response Encoding ────────────────────────────────────────────────────────
@@ -810,7 +769,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn header_vals_accepts_x_shard_and_rejects_invalid_values() {
+    async fn header_vals_accepts_x_shard_and_defaults_invalid_values() {
         let req = Request::builder()
             .header(header::AUTHORIZATION, "Bearer token")
             .header("X-Shard", "9")
@@ -824,19 +783,19 @@ mod tests {
         assert_eq!(token, "token");
         assert_eq!(sharding, 9);
 
-        // A present-but-garbage shard header is a caller error, not shard 0.
+        // A present-but-unparseable shard header falls back to shard 0,
+        // matching the lenient MCP channel.
         let req = Request::builder()
             .header("Shard-Id", "not-a-number")
             .body(())
             .unwrap();
         let (mut parts, _) = req.into_parts();
-
-        let err = HeaderVals::from_request_parts(&mut parts, &())
+        let HeaderVals(_, sharding) = HeaderVals::from_request_parts(&mut parts, &())
             .await
-            .unwrap_err();
-        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+            .unwrap();
+        assert_eq!(sharding, 0);
 
-        // Absent header still defaults to shard 0.
+        // Absent header defaults to shard 0.
         let req = Request::builder().body(()).unwrap();
         let (mut parts, _) = req.into_parts();
         let HeaderVals(token, sharding) = HeaderVals::from_request_parts(&mut parts, &())
@@ -847,11 +806,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn header_vals_strips_bearer_prefix_once_case_insensitively() {
+    async fn header_vals_strips_bearer_prefix_once() {
         for (input, expected) in [
             ("Bearer secret", "secret"),
-            ("bearer secret", "secret"),
-            ("BEARER secret", "secret"),
             // Only one prefix is stripped; the rest is the credential.
             ("Bearer Bearer secret", "Bearer secret"),
             ("secret", "secret"),
@@ -866,60 +823,5 @@ mod tests {
                 .unwrap();
             assert_eq!(token, expected, "input: {input:?}");
         }
-    }
-
-    #[tokio::test]
-    async fn negotiate_error_encoding_returns_cbor_for_cbor_clients() {
-        use axum::{Router, routing::get};
-        use tower::ServiceExt;
-
-        async fn failing() -> Result<String, AppError> {
-            Err(AppError::with_status(
-                StatusCode::CONFLICT,
-                "version conflict",
-            ))
-        }
-        let app = Router::new()
-            .route("/fail", get(failing))
-            .layer(axum::middleware::from_fn(super::negotiate_error_encoding));
-
-        // CBOR client gets a CBOR error body.
-        let res = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/fail")
-                    .header(header::ACCEPT, "application/cbor")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::CONFLICT);
-        assert_eq!(
-            res.headers().get(header::CONTENT_TYPE).unwrap(),
-            "application/cbor"
-        );
-        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
-        let decoded: super::RpcResponse<()> = cbor2::from_slice(body.as_ref()).unwrap();
-        assert_eq!(decoded.error.unwrap().message, "version conflict");
-
-        // JSON (default) client keeps the JSON error body.
-        let res = app
-            .oneshot(
-                Request::builder()
-                    .uri("/fail")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::CONFLICT);
-        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            v.pointer("/error/message").and_then(|v| v.as_str()),
-            Some("version conflict")
-        );
     }
 }

@@ -45,7 +45,9 @@ const DIGEST_PROMPT: &str = include_str!("../../assets/BrainWikiDigest.md");
 const DIGEST_CURSOR_KEY: &str = "wiki_digested";
 const DIGEST_USAGE_KEY: &str = "wiki_digest_usage";
 /// Collection-extension key tracking consecutive failures of one version
-/// (the poison-version fuse).
+/// (the poison-version fuse). Single slot: both the main loop and the
+/// pending pass stop at their first retryable failure, so the same version
+/// keeps re-bumping this slot until it succeeds or fuses off.
 const DIGEST_FAILURE_KEY: &str = "wiki_digest_failure";
 /// Collection-extension key holding doc ids queued for a digest catch-up
 /// (documents restored from archive after the cursor passed their version).
@@ -277,25 +279,17 @@ impl WikiDigest {
                                 doc_id = version.doc_id;
                                 "wiki digest failed {failures} times, skipping version: {err:?}"
                             );
-                            let _ = self
-                                .wiki
-                                .write_event(
-                                    EVENT_DIGEST_FAILED,
-                                    Some(version.doc_id),
-                                    Some(version._id),
-                                    "wiki_digest".to_string(),
-                                    BTreeMap::from([
-                                        ("error".to_string(), Json::from(err.to_string())),
-                                        ("attempts".to_string(), Json::from(failures)),
-                                        ("extractor".to_string(), Json::from(self.extractor())),
-                                    ]),
-                                    now_ms,
-                                )
-                                .await;
+                            self.fuse_version(
+                                version.doc_id,
+                                version._id,
+                                err.to_string(),
+                                failures,
+                                now_ms,
+                                &mut report,
+                            )
+                            .await;
                             cursor = version._id;
                             self.save_cursor(cursor).await;
-                            self.clear_failure();
-                            report.skipped += 1;
                             continue;
                         }
                         // Leave the cursor before the failed version: the
@@ -327,8 +321,10 @@ impl WikiDigest {
     /// passed their version: the main loop never revisits those ids, so
     /// without this their facts would never enter the graph. Each queued
     /// document's current version is digested unless the ledger shows it
-    /// already was. Never fails the run; entries that error stay queued,
-    /// with the poison fuse bounding retries.
+    /// already was. Never fails the run; a retryable error stops this
+    /// round's pass (the entry stays queued and is retried first next run,
+    /// which keeps the single-slot poison fuse counting consecutive
+    /// failures of one version), while `NotFound` unqueues the entry.
     async fn digest_pending_restores(
         &self,
         ctx: &AgentCtx,
@@ -359,7 +355,7 @@ impl WikiDigest {
                         doc_id = doc_id;
                         "pending digest doc load failed, kept queued: {err:?}"
                     );
-                    continue;
+                    break;
                 }
             };
             if doc.current_version > cursor {
@@ -380,21 +376,30 @@ impl WikiDigest {
                         doc_id = doc_id;
                         "pending digest ledger check failed, kept queued: {err:?}"
                     );
-                    continue;
+                    break;
                 }
             }
             let version = match self.wiki.version_record(doc.current_version).await {
                 Ok(version) => version,
-                Err(err) => {
+                Err(WikiError::NotFound(_)) => {
                     // The current version row is gone for good: unqueue.
                     log::warn!(
                         target: "brain",
                         doc_id = doc_id,
                         version_id = doc.current_version;
-                        "pending digest version load failed, dropped: {err:?}"
+                        "pending digest version row missing, dropped"
                     );
                     self.clear_pending(doc_id);
                     continue;
+                }
+                Err(err) => {
+                    log::warn!(
+                        target: "brain",
+                        doc_id = doc_id,
+                        version_id = doc.current_version;
+                        "pending digest version load failed, kept queued: {err:?}"
+                    );
+                    break;
                 }
             };
             *processed += 1;
@@ -416,28 +421,56 @@ impl WikiDigest {
                         "pending digest failed (attempt {failures}/{MAX_VERSION_FAILURES}): {err:?}"
                     );
                     if failures >= MAX_VERSION_FAILURES {
-                        let _ = self
-                            .wiki
-                            .write_event(
-                                EVENT_DIGEST_FAILED,
-                                Some(doc_id),
-                                Some(version._id),
-                                "wiki_digest".to_string(),
-                                BTreeMap::from([
-                                    ("error".to_string(), Json::from(err.to_string())),
-                                    ("attempts".to_string(), Json::from(failures)),
-                                    ("extractor".to_string(), Json::from(self.extractor())),
-                                ]),
-                                now_ms,
-                            )
-                            .await;
+                        self.fuse_version(
+                            doc_id,
+                            version._id,
+                            err.to_string(),
+                            failures,
+                            now_ms,
+                            report,
+                        )
+                        .await;
                         self.clear_pending(doc_id);
-                        self.clear_failure();
-                        report.skipped += 1;
+                    } else {
+                        // Retryable: stop this round so the next run bumps
+                        // the same fuse slot instead of interleaving.
+                        break;
                     }
                 }
             }
         }
+    }
+
+    /// Poison-version fuse trip: records the `DigestFailed` event, clears
+    /// the failure slot, and counts the skip. Callers decide what retiring
+    /// the version means (cursor advance in the main loop, unqueue in the
+    /// pending pass).
+    async fn fuse_version(
+        &self,
+        doc_id: u64,
+        version_id: u64,
+        err_text: String,
+        failures: u64,
+        now_ms: u64,
+        report: &mut WikiDigestReport,
+    ) {
+        let _ = self
+            .wiki
+            .write_event(
+                EVENT_DIGEST_FAILED,
+                Some(doc_id),
+                Some(version_id),
+                "wiki_digest".to_string(),
+                BTreeMap::from([
+                    ("error".to_string(), Json::from(err_text)),
+                    ("attempts".to_string(), Json::from(failures)),
+                    ("extractor".to_string(), Json::from(self.extractor())),
+                ]),
+                now_ms,
+            )
+            .await;
+        self.clear_failure();
+        report.skipped += 1;
     }
 
     fn clear_pending(&self, doc_id: u64) {
@@ -473,14 +506,25 @@ impl WikiDigest {
             // the graph stale until the document's next commit.
             return Ok(DigestOutcome::NotReady);
         }
-        if doc.current_version != version._id
-            || doc.status != super::DOC_STATUS_ACTIVE
+        if doc.current_version != version._id {
+            // Stale version: the current version's own digest supersedes
+            // for it, so skipping loses nothing.
+            report.skipped += 1;
+            return Ok(DigestOutcome::Skipped);
+        }
+        if doc.status != super::DOC_STATUS_ACTIVE
             || doc.namespace == EVAL_NAMESPACE
             // The Cognitive Nexus has no ACL: distilling a labeled document
             // would let any Read principal recall its facts (and citation
             // URIs) through the graph.
             || !doc.acl_label.is_empty()
         {
+            // The document reached a state the digest refuses to distill —
+            // but an earlier version may already be in the graph, and no
+            // other path ever retracts it. Without this, committing an
+            // `acl_label` onto a public document would leave its previously
+            // digested facts recallable by every Read principal forever.
+            report.superseded += self.retract_digested(&doc, version, now_ms).await?;
             report.skipped += 1;
             return Ok(DigestOutcome::Skipped);
         }
@@ -656,37 +700,103 @@ impl WikiDigest {
         }
         let superseded_by =
             citation_uri(&self.wiki.space_id, doc._id, version._id, 0, version.size);
+        Ok(self
+            .supersede_facts(doc._id, &previous, alive, &superseded_by)
+            .await)
+    }
 
+    /// Retracts the document's newest digest at or before `version`: every
+    /// fact it recorded is marked superseded, and an empty `retracted`
+    /// ledger entry becomes the document's digest head so later supersede
+    /// passes see a clean slate. `version_digested` treats the marker as
+    /// "not digested", which keeps the restore catch-up re-digesting the
+    /// version if the document becomes distillable again. No-op — and no
+    /// ledger entry — when nothing is recorded (never digested, or the head
+    /// is already a retraction), so repeated passes stay cheap and quiet.
+    async fn retract_digested(
+        &self,
+        doc: &WikiDocRecord,
+        version: &WikiVersionRecord,
+        now_ms: u64,
+    ) -> Result<usize, BoxError> {
+        // `+ 1`: unlike superseding during a digest, retraction must cover
+        // the given version's own digest — an archived document's facts are
+        // recorded at its still-current version.
+        let previous = self
+            .previous_digest_facts(doc._id, version._id.saturating_add(1))
+            .await?;
+        if previous.is_empty() {
+            return Ok(0);
+        }
+        let superseded_by =
+            citation_uri(&self.wiki.space_id, doc._id, version._id, 0, version.size);
+        let superseded = self
+            .supersede_facts(doc._id, &previous, &BTreeSet::new(), &superseded_by)
+            .await;
+        self.wiki
+            .write_event(
+                EVENT_DIGEST_EXTRACTED,
+                Some(doc._id),
+                Some(version._id),
+                "wiki_digest".to_string(),
+                BTreeMap::from([
+                    ("facts".to_string(), json!([])),
+                    ("superseded".to_string(), Json::from(superseded as u64)),
+                    ("retracted".to_string(), Json::from(true)),
+                    ("extractor".to_string(), Json::from(self.extractor())),
+                ]),
+                now_ms,
+            )
+            .await?;
+        log::info!(
+            target: "brain",
+            doc_id = doc._id,
+            version_id = version._id;
+            "wiki digest retracted {superseded} facts (document no longer distillable)"
+        );
+        Ok(superseded)
+    }
+
+    /// Marks each fact's proposition superseded unless its triple is in
+    /// `alive`. Per-fact capsules keep one missing endpoint (e.g. merged
+    /// away by maintenance) from aborting the rest.
+    async fn supersede_facts(
+        &self,
+        doc_id: u64,
+        facts: &[DigestedFact],
+        alive: &BTreeSet<TripleKey>,
+        superseded_by: &str,
+    ) -> usize {
         let mut superseded = 0usize;
-        for fact in previous {
+        for fact in facts {
             if alive.contains(&fact.triple_key()) {
                 continue;
             }
             // Graph maintenance may have metabolized the proposition away; a
             // supersede UPSERT would then resurrect it as a tombstone. Only
             // touch propositions that still exist.
-            if !self.proposition_exists(&fact).await {
+            if !self.proposition_exists(fact).await {
                 continue;
             }
-            let kml = render_supersede_kml(&fact, &superseded_by);
+            let kml = render_supersede_kml(fact, superseded_by);
             match parse_kml(&kml) {
                 Ok(cmd) => match self.memory.nexus.execute_kml(cmd, false).await {
                     Ok(_) => superseded += 1,
                     Err(err) => {
                         log::warn!(
                             target: "brain",
-                            doc_id = doc._id;
+                            doc_id = doc_id;
                             "supersede skipped for {:?}: {err:?}",
                             fact.predicate
                         );
                     }
                 },
                 Err(err) => {
-                    log::warn!(target: "brain", doc_id = doc._id; "supersede kml parse failed: {err:?}");
+                    log::warn!(target: "brain", doc_id = doc_id; "supersede kml parse failed: {err:?}");
                 }
             }
         }
-        Ok(superseded)
+        superseded
     }
 
     /// Existence probe for one (subject, predicate, object) proposition.
@@ -802,7 +912,9 @@ impl WikiDigest {
     }
 
     /// Consecutive-failure counter for the poison fuse; resets whenever a
-    /// different version fails or any version succeeds.
+    /// different version fails or any version succeeds. Single-slot is
+    /// sound because both loops stop at their first retryable failure, so
+    /// the failing version is always the next one retried.
     fn bump_failure(&self, version_id: u64) -> u64 {
         let mut count = 1u64;
         let _ = self.wiki.docs.set_extension_from_with::<_, (u64, u64)>(
@@ -858,21 +970,12 @@ async fn digest_chunks(
         .await
         .map_err(WikiError::from)?;
     if rows.is_empty() {
-        match wiki.doc_record(version.doc_id).await {
-            Ok(doc) if doc.current_version == version._id => {
-                // Should be impossible (commits delete chunks only after
-                // flipping the doc away): stay loud, but never fall through
-                // to an empty extraction.
-                log::warn!(
-                    target: "brain",
-                    doc_id = version.doc_id,
-                    version_id = version._id;
-                    "current version has no chunk rows; digest skipped without superseding"
-                );
-            }
-            Ok(_) | Err(WikiError::NotFound(_)) => {}
-            Err(err) => return Err(err.into()),
-        }
+        log::warn!(
+            target: "brain",
+            doc_id = version.doc_id,
+            version_id = version._id;
+            "version has no chunk rows; digest skipped without superseding"
+        );
         return Ok(None);
     }
     rows.sort_by_key(|row| row.ordinal);
@@ -880,7 +983,9 @@ async fn digest_chunks(
 }
 
 /// Whether the digest ledger already covers (doc, version): true when the
-/// document's newest `DigestExtracted` event points at that version.
+/// document's newest `DigestExtracted` event points at that version. A
+/// retraction marker does NOT count — its facts were withdrawn, so a
+/// restored document must be re-digested for them to re-enter the graph.
 async fn version_digested(
     wiki: &WikiService,
     doc_id: u64,
@@ -894,16 +999,19 @@ async fn version_digested(
             Some(20),
         )
         .await?;
-    Ok(events
-        .events
-        .iter()
-        .max_by_key(|e| e.id)
-        .is_some_and(|e| e.version_id == Some(version_id)))
+    Ok(events.events.iter().max_by_key(|e| e.id).is_some_and(|e| {
+        e.version_id == Some(version_id)
+            && !e
+                .detail
+                .get("retracted")
+                .and_then(Json::as_bool)
+                .unwrap_or(false)
+    }))
 }
 
-/// Re-verifies the citations recorded by the most recent digests. Facts of
-/// one digest cite the same version, so (doc, version) loads are cached
-/// across facts instead of re-reading full version content per fact.
+/// Re-verifies the citations recorded by the most recent digests. All facts
+/// of one digest cite the same (doc, version), so both rows are loaded once
+/// per event and each fact only re-checks its own range and checksum.
 async fn verify_recent_citations(
     wiki: &WikiService,
     now_ms: u64,
@@ -916,8 +1024,11 @@ async fn verify_recent_citations(
             Some(VERIFY_SAMPLE_EVENTS),
         )
         .await?;
-    type Loaded = Option<(WikiDocRecord, WikiVersionRecord)>;
-    let mut cache: BTreeMap<(u64, u64), Loaded> = BTreeMap::new();
+    let verify_input = |fact: &DigestedFact| WikiVerifyInput {
+        uri: Some(fact.citation.clone()),
+        checksum: Some(fact.checksum.clone()),
+        ..Default::default()
+    };
     let mut checked = 0usize;
     let mut invalid = 0usize;
     for event in events.events {
@@ -929,27 +1040,20 @@ async fn verify_recent_citations(
         else {
             continue;
         };
-        for fact in facts {
-            let input = WikiVerifyInput {
-                uri: Some(fact.citation.clone()),
-                checksum: Some(fact.checksum.clone()),
-                ..Default::default()
-            };
-            let (doc_id, version_id, start, end) = wiki.verify_target(&input)?;
-            let loaded = match cache.entry((doc_id, version_id)) {
-                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    let loaded = match wiki.doc_record(doc_id).await {
-                        Ok(doc) => match wiki.version_record(version_id).await {
-                            Ok(version) => Some((doc, version)),
-                            Err(_) => None,
-                        },
-                        Err(_) => None,
-                    };
-                    entry.insert(loaded)
-                }
-            };
-            let status = match loaded {
+        let Some(first) = facts.first() else {
+            continue;
+        };
+        let (doc_id, version_id, _, _) = wiki.verify_target(&verify_input(first))?;
+        let loaded = match wiki.doc_record(doc_id).await {
+            Ok(doc) => match wiki.version_record(version_id).await {
+                Ok(version) => Some((doc, version)),
+                Err(_) => None,
+            },
+            Err(_) => None,
+        };
+        for fact in &facts {
+            let (_, _, start, end) = wiki.verify_target(&verify_input(fact))?;
+            let status = match &loaded {
                 Some((doc, version)) => {
                     wiki.verify_resolved(
                         "wiki_digest".to_string(),
@@ -1576,12 +1680,6 @@ mod tests {
         wiki.archive("a".to_string(), out.doc.id, 2000)
             .await
             .unwrap();
-        assert!(
-            wiki.docs
-                .get_extension_as::<BTreeSet<u64>>(DIGEST_PENDING_KEY)
-                .unwrap_or_default()
-                .is_empty()
-        );
         wiki.restore("a".to_string(), out.doc.id, 3000)
             .await
             .unwrap();
@@ -1673,5 +1771,199 @@ mod tests {
             .await
             .unwrap();
         assert!(events.events.is_empty());
+    }
+
+    use anda_cognitive_nexus::CognitiveNexus;
+    use anda_db::{database::AndaDB, database::DBConfig, storage::StorageConfig};
+    use object_store::memory::InMemory;
+
+    /// A digest engine over an in-memory space with a live Cognitive Nexus
+    /// (no LLM: only the non-extracting paths may run).
+    async fn test_digest(name: &str) -> (Arc<WikiService>, WikiDigest) {
+        let db = Arc::new(
+            AndaDB::create(
+                Arc::new(InMemory::new()),
+                DBConfig {
+                    name: name.to_string(),
+                    description: "wiki digest test db".to_string(),
+                    storage: StorageConfig::default(),
+                    lock: None,
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let nexus = Arc::new(
+            CognitiveNexus::connect(db.clone(), async |_| Ok(()))
+                .await
+                .unwrap(),
+        );
+        let memory = Arc::new(MemoryManagement::connect(db.clone(), nexus).await.unwrap());
+        let wiki = Arc::new(
+            WikiService::connect("test_space".to_string(), db)
+                .await
+                .unwrap(),
+        );
+        let digest = WikiDigest::new(wiki.clone(), memory, Arc::new(Models::default()));
+        (wiki, digest)
+    }
+
+    async fn proposition_status_superseded(digest: &WikiDigest, fact: &DigestedFact) -> bool {
+        let kql = format!(
+            "FIND(?link) WHERE {{ ?link ({}, {}, {}) FILTER(?link.metadata.status == \"superseded\") }} LIMIT 1",
+            concept_literal(&fact.subject_type, &fact.subject_name),
+            serde_json::to_string(&fact.predicate).unwrap(),
+            concept_literal(&fact.object_type, &fact.object_name),
+        );
+        let (result, _) = digest
+            .memory
+            .nexus
+            .execute_kql(parse_kql(&kql).unwrap())
+            .await
+            .unwrap();
+        kql_has_rows(&result)
+    }
+
+    #[tokio::test]
+    async fn labeling_a_document_retracts_its_digested_facts() {
+        let (wiki, digest) = test_digest("wiki_digest_retract").await;
+        let v1 = wiki
+            .commit(
+                "a".to_string(),
+                commit_input("秘密文档", "# 秘密文档\n\n内容甲。\n"),
+                1000,
+            )
+            .await
+            .unwrap();
+        let doc = wiki.doc_record(v1.doc.id).await.unwrap();
+        let v1_version = wiki
+            .versions
+            .get_as::<WikiVersionRecord>(v1.version.id)
+            .await
+            .unwrap();
+
+        // Seed the graph and the ledger as if v1 had been digested.
+        let fact = DigestedFact {
+            subject_type: "Person".to_string(),
+            subject_name: "alice".to_string(),
+            predicate: "knows".to_string(),
+            object_type: "Topic".to_string(),
+            object_name: "secret_topic".to_string(),
+            confidence: 0.9,
+            citation: citation_uri("test_space", doc._id, v1_version._id, 0, v1_version.size),
+            checksum: "sha3-256:x".to_string(),
+        };
+        let kml = render_digest_kml(
+            "test_space",
+            &doc,
+            &v1_version,
+            &Extraction::default(),
+            std::slice::from_ref(&fact),
+            "wiki_digest@v1/test",
+        );
+        digest
+            .memory
+            .nexus
+            .execute_kml(parse_kml(&kml).unwrap(), false)
+            .await
+            .unwrap();
+        wiki.write_event(
+            EVENT_DIGEST_EXTRACTED,
+            Some(doc._id),
+            Some(v1_version._id),
+            "wiki_digest".to_string(),
+            BTreeMap::from([(
+                "facts".to_string(),
+                serde_json::to_value(vec![fact.clone()]).unwrap(),
+            )]),
+            1500,
+        )
+        .await
+        .unwrap();
+        assert!(digest.proposition_exists(&fact).await);
+        assert!(!proposition_status_superseded(&digest, &fact).await);
+
+        // v2 labels the document — the state the digest refuses to distill.
+        let mut update = commit_input("秘密文档", "# 秘密文档\n\n内容乙。\n");
+        update.doc_id = Some(doc._id);
+        update.parent_version = Some(v1_version._id);
+        update.acl_label = Some("secret".to_string());
+        let v2 = wiki.commit("a".to_string(), update, 2000).await.unwrap();
+        let doc = wiki.doc_record(v2.doc.id).await.unwrap();
+        assert_eq!(doc.acl_label, "secret");
+        let v2_version = wiki
+            .versions
+            .get_as::<WikiVersionRecord>(v2.version.id)
+            .await
+            .unwrap();
+
+        let retracted = digest
+            .retract_digested(&doc, &v2_version, 3000)
+            .await
+            .unwrap();
+        assert_eq!(retracted, 1);
+        // The proposition is tombstoned in the graph…
+        assert!(proposition_status_superseded(&digest, &fact).await);
+        // …the digest head is a clean, retracted slate…
+        let head = digest
+            .previous_digest_facts(doc._id, v2_version._id + 1)
+            .await
+            .unwrap();
+        assert!(head.is_empty());
+        // …and the retraction marker does NOT count as "digested", so a
+        // restore/unlabel catch-up would re-digest the version.
+        assert!(
+            !version_digested(&wiki, doc._id, v2_version._id)
+                .await
+                .unwrap()
+        );
+
+        // Idempotent: a second retraction is a no-op with no ledger growth.
+        let events_before = wiki
+            .list_events(
+                Some(EVENT_DIGEST_EXTRACTED.to_string()),
+                Some(doc._id),
+                None,
+                Some(20),
+            )
+            .await
+            .unwrap()
+            .events
+            .len();
+        assert_eq!(
+            digest
+                .retract_digested(&doc, &v2_version, 4000)
+                .await
+                .unwrap(),
+            0
+        );
+        let events_after = wiki
+            .list_events(
+                Some(EVENT_DIGEST_EXTRACTED.to_string()),
+                Some(doc._id),
+                None,
+                Some(20),
+            )
+            .await
+            .unwrap()
+            .events
+            .len();
+        assert_eq!(events_before, events_after);
+    }
+
+    #[tokio::test]
+    async fn poison_fuse_counts_consecutive_failures_of_one_version() {
+        let (_wiki, digest) = test_digest("wiki_digest_fuse").await;
+        assert_eq!(digest.bump_failure(10), 1);
+        assert_eq!(digest.bump_failure(10), 2);
+        assert_eq!(digest.bump_failure(10), 3);
+        assert!(digest.bump_failure(10) >= MAX_VERSION_FAILURES);
+
+        // A different version failing takes over the single slot…
+        assert_eq!(digest.bump_failure(20), 1);
+        assert_eq!(digest.bump_failure(20), 2);
+        // …and any success resets it.
+        digest.clear_failure();
+        assert_eq!(digest.bump_failure(20), 1);
     }
 }

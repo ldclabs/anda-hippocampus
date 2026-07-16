@@ -23,7 +23,6 @@ use anda_kip::{
     KipError, KipErrorCode, META_SELF_NAME, PERSON_SELF_KIP, PERSON_SYSTEM_KIP, PERSON_TYPE,
     parse_kml,
 };
-use futures::StreamExt;
 use ic_auth_types::ByteBufB64;
 use ic_cose_types::cose::{
     SIGN1_TAG, cwt::cwt_from, ed25519::VerifyingKey, sign1::cose_sign1_from, skip_prefix,
@@ -91,6 +90,12 @@ pub static FUNCTION_DEFINITION: LazyLock<FunctionDefinition> = LazyLock::new(|| 
     })).unwrap()
 });
 
+/// Default cap on concurrent LLM-billed requests, matching the CLI's
+/// `LLM_MAX_CONCURRENCY` flag default. States built without
+/// [`AppState::with_llm_concurrency`] (tests, library embedders) get this
+/// budget.
+const DEFAULT_LLM_MAX_CONCURRENCY: usize = 64;
+
 pub struct SpaceEntry {
     cell: OnceCell<Arc<Space>>,
     last_access_ms: AtomicU64,
@@ -126,6 +131,11 @@ pub struct AppState {
     /// state loads — service mode included, so shadow-eval verdicts stop
     /// falling back to the evaluated space's own model.
     judge_model: Arc<Option<ModelConfig>>,
+    /// Bounds requests that can each drive a full multi-turn LLM round.
+    /// One budget for every channel: the HTTP LLM routes and the MCP LLM
+    /// tools (recall/maintenance) drain this same semaphore, so neither
+    /// channel can turn request concurrency into unbounded model spend.
+    llm_semaphore: Arc<tokio::sync::Semaphore>,
 
     pub app_name: String,
     pub app_version: String,
@@ -154,6 +164,7 @@ impl AppState {
             models,
             ed25519_pubkeys,
             judge_model: Arc::new(None),
+            llm_semaphore: Arc::new(tokio::sync::Semaphore::new(DEFAULT_LLM_MAX_CONCURRENCY)),
             app_name,
             app_version,
             sharding,
@@ -167,6 +178,21 @@ impl AppState {
         self
     }
 
+    /// Sets the cap on concurrent LLM-billed requests (the service's
+    /// `LLM_MAX_CONCURRENCY` flag; consuming builder, call before the state
+    /// is cloned). `max(1)` keeps a misconfigured `0` from shedding every
+    /// request.
+    pub fn with_llm_concurrency(mut self, max: usize) -> Self {
+        self.llm_semaphore = Arc::new(tokio::sync::Semaphore::new(max.max(1)));
+        self
+    }
+
+    /// The shared LLM concurrency budget (see the field doc): the HTTP LLM
+    /// routes and the MCP LLM tools must both draw permits from it.
+    pub fn llm_semaphore(&self) -> &Arc<tokio::sync::Semaphore> {
+        &self.llm_semaphore
+    }
+
     pub fn cwt_auth_enabled(&self) -> bool {
         !self.ed25519_pubkeys.is_empty()
     }
@@ -174,13 +200,6 @@ impl AppState {
     /// The object store backing this state's spaces.
     pub fn object_store(&self) -> Arc<dyn ObjectStore> {
         self.object_store.clone()
-    }
-
-    /// Removes a space entry from the in-process cache. Used by the eval
-    /// harness after a run-scoped space is closed and its objects deleted,
-    /// so nothing can reopen a half-removed space through the cache.
-    pub async fn evict_space(&self, space_id: &str) {
-        self.spaces.write().await.remove(space_id);
     }
 
     /// Forks a space into its own in-memory store, optionally installing a
@@ -375,6 +394,7 @@ impl AppState {
             http_client: self.http_client.clone(),
             models: self.models.clone(),
             judge_model: self.judge_model.clone(),
+            llm_semaphore: self.llm_semaphore.clone(),
             ed25519_pubkeys: self.ed25519_pubkeys.clone(),
             management: self.management.clone(),
             app_name: self.app_name.clone(),
@@ -701,9 +721,6 @@ pub struct Space {
     /// Serializes token minting so the name-uniqueness and count-cap checks
     /// in `add_space_token` cannot race two concurrent mints.
     token_lock: tokio::sync::Mutex<()>,
-    /// Single-flights the first (uncached) graph census in `memory_status`,
-    /// which is a near-full scan reachable anonymously on public spaces.
-    census_lock: tokio::sync::Mutex<()>,
     /// Independent judge model for eval runs (plan M9); unset means judge
     /// completions share the space's default model (documented caveat).
     judge_model: std::sync::RwLock<Option<Arc<Model>>>,
@@ -906,13 +923,13 @@ impl Space {
 
         let mut changed = false;
         // The ACL-defaults write does real I/O and can fail; run it before
-        // any in-memory extension mutation, or an error response would leave
-        // part of the update (worst case `public: true`) silently applied
-        // and later persisted by the periodic flush.
+        // any in-memory extension mutation so its failure leaves the update
+        // untouched.
         if let Some(defaults) = input.wiki_acl_defaults {
             changed = true;
             self.wiki.set_acl_defaults(defaults).await?;
         }
+
         if let Some(name) = input.name {
             changed = true;
             self.db.set_extension_from("name".to_string(), name);
@@ -942,6 +959,10 @@ impl Space {
             self.db
                 .set_extension_from(MemoryPolicy::EXTENSION_KEY.to_string(), policy);
         }
+
+        // Accepted non-atomicity: if this flush fails, the in-memory writes
+        // above may already be visible and will be persisted by the periodic
+        // flush anyway; `update` is idempotent, so a retry converges.
         if changed {
             self.db.flush_metadata(now_ms).await?;
         }
@@ -1291,7 +1312,7 @@ impl Space {
         // claim a formation cycle could start inside that window and write
         // the graph concurrently with the upcoming maintenance cycle. The
         // claim is consumed (inherited) by `MaintenanceAgent::run`.
-        let _claim = self
+        let claim = self
             .maintenance
             .try_claim_processing()
             .ok_or("Maintenance cycle is already in progress.")?;
@@ -1335,6 +1356,11 @@ impl Space {
                 },
             )
             .await?;
+        // `agent_run` returning Ok proves `MaintenanceAgent::run` inherited
+        // and already released the claim, so its Drop is a no-op; forget it
+        // to close the ABA window where a later claim's flag could be
+        // clobbered. The Err path above keeps Drop as the release.
+        std::mem::forget(claim);
         Ok(rt)
     }
 
@@ -1372,30 +1398,17 @@ impl Space {
         // Graph counters come from the settlement-time census (M12: readers
         // never pay heavy queries — the orphan count is a near-full scan,
         // and this endpoint is reachable anonymously on public spaces). A
-        // space that has never settled pays the census once and caches it.
-        let graph = match self
+        // space that has never settled reports the free in-memory counts;
+        // `as_of: None` and the omitted scan-backed fields say "not yet
+        // censused" without running any scan here.
+        let graph = self
             .db
             .get_extension_as::<MemoryGraphCounters>("memory_graph_counters")
-        {
-            Some(graph) => graph,
-            None => {
-                // Single-flight the first census: concurrent (possibly
-                // anonymous) requests must not each run a near-full scan.
-                let _guard = self.census_lock.lock().await;
-                match self
-                    .db
-                    .get_extension_as::<MemoryGraphCounters>("memory_graph_counters")
-                {
-                    Some(graph) => graph,
-                    None => {
-                        let graph = self.census_graph_counters(unix_ms()).await;
-                        self.db
-                            .set_extension_from("memory_graph_counters".to_string(), graph.clone());
-                        graph
-                    }
-                }
-            }
-        };
+            .unwrap_or_else(|| MemoryGraphCounters {
+                concepts: self.memory.nexus.concepts.len() as u64,
+                propositions: self.memory.nexus.propositions.len() as u64,
+                ..Default::default()
+            });
         let maintenance_usage: Usage = self
             .db
             .get_extension_as("maintenance_usage")
@@ -1454,10 +1467,11 @@ impl Space {
             collect_string_leaves(result, &mut names);
         }
 
-        // Bounded fan-out: each count is a scan, and this runs while the
-        // settlement lock is held — full parallelism would hammer the graph,
-        // strict serial ordering stalls settlement for minutes.
-        let counts = futures::stream::iter(names.into_iter().take(50).map(|name| async move {
+        // Serial, bounded to 50 predicates: each count is a scan and this
+        // runs while the settlement lock is held, so it must not hammer the
+        // graph with parallel scans.
+        let mut predicates = BTreeMap::new();
+        for name in names.into_iter().take(50) {
             let count = assess::kip_count(
                 self,
                 &format!(
@@ -1466,13 +1480,6 @@ impl Space {
                 ),
             )
             .await;
-            (name, count)
-        }))
-        .buffer_unordered(4)
-        .collect::<Vec<_>>()
-        .await;
-        let mut predicates = BTreeMap::new();
-        for (name, count) in counts {
             // A failed count (typically the engine's full-scan cap on the
             // busiest predicates) must be *absent*, not zero: reporting the
             // most-used predicate as having zero links would point the
@@ -1497,44 +1504,6 @@ impl Space {
                 predicates,
             },
         );
-
-        // Correction *rates* need a denominator (plan M3): for every source
-        // already charged with corrections, census its total link count.
-        // Sources storing `metadata.source` as an array are skipped by the
-        // equality filter — the rate is then an upper bound, which is the
-        // safe direction for encode-time discounting.
-        let sources: BTreeMap<String, SourceReliability> = self
-            .db
-            .get_extension_as("source_reliability")
-            .unwrap_or_default();
-        if !sources.is_empty() {
-            let totals: BTreeMap<String, Option<u64>> =
-                futures::stream::iter(sources.keys().take(20).cloned().map(|source| async move {
-                    let total = assess::kip_count(
-                        self,
-                        &format!(
-                            "FIND(COUNT(?link)) WHERE {{ ?link (?s, ?p, ?o) FILTER(?link.metadata.source == {}) }}",
-                            kip_string_literal(&source)
-                        ),
-                    )
-                    .await;
-                    (source, total)
-                }))
-                .buffer_unordered(4)
-                .collect()
-                .await;
-            let _ = self
-                .db
-                .set_extension_from_with("source_reliability".to_string(), |value| {
-                    let mut map: BTreeMap<String, SourceReliability> = value.unwrap_or_default();
-                    for (source, total) in totals {
-                        if let (Some(entry), Some(total)) = (map.get_mut(&source), total) {
-                            entry.total_links = Some(total);
-                        }
-                    }
-                    Some(map)
-                });
-        }
         Ok(())
     }
 
@@ -2293,40 +2262,35 @@ impl Space {
             return Ok(None);
         }
 
-        // 2) Resolve subject/object names for query generation. A `None`
-        // resolution means the lookup itself errored (graph busy): that
-        // candidate is *unknown*, so it is skipped without a tested stamp
-        // and a later pass re-samples it — unlike a confirmed-missing
-        // concept, which resolves to empty strings below.
-        let mut concept_cache: BTreeMap<String, Option<(String, String)>> = BTreeMap::new();
-        let mut unknown: BTreeSet<String> = BTreeSet::new();
+        // 2) Resolve subject/object names for query generation. An errored
+        // lookup (graph busy) aborts the whole pass via `?` — "unknown ≠
+        // missing": nothing gets a tested stamp, and a later pass re-samples
+        // the same window — unlike a confirmed-missing concept, which
+        // resolves to empty strings below.
+        let mut concept_cache: BTreeMap<String, (String, String)> = BTreeMap::new();
         for candidate in &mut candidates {
-            let subject = self
+            let (subject_type, subject_name) = self
                 .self_test_concept(&mut concept_cache, &candidate.subject)
-                .await;
-            let object = self
+                .await?;
+            let (_, object_name) = self
                 .self_test_concept(&mut concept_cache, &candidate.object)
-                .await;
-            let (Some((subject_type, subject_name)), Some((_, object_name))) = (subject, object)
-            else {
-                unknown.insert(candidate.id.clone());
-                continue;
-            };
+                .await?;
             candidate.subject_type = subject_type;
             candidate.subject_name = subject_name;
             candidate.object_name = object_name;
         }
-        candidates.retain(|candidate| !unknown.contains(&candidate.id));
-        // Unresolvable candidates (their subject concept is gone) are marked
-        // tested too, or they would occupy the sample window forever.
-        let unresolved: Vec<String> = candidates
+        // Unresolvable candidates (their subject concept is confirmed gone)
+        // are stamped tested too, or they would occupy the sample window
+        // forever; `stamp_only` later also collects candidates the LLM
+        // returned no query for.
+        let mut stamp_only: Vec<String> = candidates
             .iter()
             .filter(|candidate| candidate.subject_name.is_empty())
             .map(|candidate| candidate.id.clone())
             .collect();
         candidates.retain(|candidate| !candidate.subject_name.is_empty());
         if candidates.is_empty() {
-            self.mark_self_tested(unresolved.iter(), now_ms).await;
+            self.mark_self_tested(stamp_only.iter(), now_ms).await;
             return Ok(None);
         }
 
@@ -2374,10 +2338,6 @@ impl Space {
         // 4) Deterministic grounding check: does search surface the memory's
         // subject or object concept for the generated query?
         let mut tested_entities = BTreeSet::new();
-        // Candidates the LLM returned no query for consumed prompt budget and
-        // cannot be tested; stamp them anyway or they would occupy the
-        // sampling window's stable prefix forever.
-        let mut unqueried: Vec<String> = Vec::new();
         for candidate in &candidates {
             let Some(query) = queries
                 .queries
@@ -2386,7 +2346,10 @@ impl Space {
                 .map(|query| query.query.trim())
                 .filter(|query| !query.is_empty())
             else {
-                unqueried.push(candidate.id.clone());
+                // Candidates the LLM returned no query for consumed prompt
+                // budget and cannot be tested; stamp them anyway or they
+                // would occupy the sampling window's stable prefix forever.
+                stamp_only.push(candidate.id.clone());
                 continue;
             };
             let response = self
@@ -2407,15 +2370,14 @@ impl Space {
                     // An errored/timed-out search is *unknown*, not
                     // "ungroundable": counting it would fabricate a false
                     // negative, lower the groundability metric, and burn a
-                    // re-encode task on a healthy memory. Skip without a
-                    // stamp so a later pass re-samples it.
-                    log::warn!(
-                        target: "brain",
-                        space_id = self.id;
-                        "self-test grounding search errored for {}; skipping: {response:?}",
+                    // re-encode task on a healthy memory. Abort the whole
+                    // pass without stamping anything; a later pass
+                    // re-samples the same window.
+                    return Err(format!(
+                        "self-test grounding search errored for {}: {response:?}",
                         candidate.id
-                    );
-                    continue;
+                    )
+                    .into());
                 }
             }
             report.tested += 1;
@@ -2466,14 +2428,8 @@ impl Space {
         // Stamp tested (and unresolvable/unqueried) links on the graph so
         // the next sampling pass moves past them — this is what keeps
         // self-test coverage sliding across the whole graph.
-        self.mark_self_tested(
-            tested_entities
-                .iter()
-                .chain(unresolved.iter())
-                .chain(unqueried.iter()),
-            now_ms,
-        )
-        .await;
+        self.mark_self_tested(tested_entities.iter().chain(stamp_only.iter()), now_ms)
+            .await;
         self.bump_metrics(|metrics| {
             metrics.self_test_tested += report.tested;
             metrics.self_test_grounded += report.grounded;
@@ -2512,20 +2468,20 @@ impl Space {
         marked
     }
 
-    /// Resolves a concept id to `(type, name)`, memoized per pass. `None`
-    /// means the lookup itself errored or timed out — *unknown*, as opposed
-    /// to a confirmed-missing concept, which resolves to empty strings.
-    /// Callers must skip (and not stamp) unknown candidates so they are
-    /// re-sampled once the graph is responsive again.
+    /// Resolves a concept id to `(type, name)`, memoized per pass. A
+    /// confirmed-missing concept resolves to empty strings; an errored or
+    /// timed-out lookup is `Err` — *unknown*, never "missing" — which aborts
+    /// the caller's whole pass so nothing gets a tested stamp and the same
+    /// window is re-sampled once the graph is responsive again.
     async fn self_test_concept(
         &self,
-        cache: &mut BTreeMap<String, Option<(String, String)>>,
+        cache: &mut BTreeMap<String, (String, String)>,
         concept_id: &str,
-    ) -> Option<(String, String)> {
+    ) -> Result<(String, String), BoxError> {
         if let Some(found) = cache.get(concept_id) {
-            return found.clone();
+            return Ok(found.clone());
         }
-        let resolved = match self
+        let response = self
             .execute_kip_readonly(anda_kip::Request {
                 command: format!(
                     "FIND(?c) WHERE {{ ?c {{id: {}}} }} LIMIT 1",
@@ -2534,11 +2490,11 @@ impl Space {
                 readonly: true,
                 ..Default::default()
             })
-            .await
-        {
-            Ok(anda_kip::Response::Ok { result, .. }) => {
+            .await?;
+        let resolved = match &response {
+            anda_kip::Response::Ok { result, .. } => {
                 let mut resolved = (String::new(), String::new());
-                assess::collect_entity_objects(&result, &mut |id, object| {
+                assess::collect_entity_objects(result, &mut |id, object| {
                     if id == concept_id {
                         resolved = (
                             object
@@ -2554,12 +2510,17 @@ impl Space {
                         );
                     }
                 });
-                Some(resolved)
+                resolved
             }
-            _ => None,
+            anda_kip::Response::Err { .. } => {
+                return Err(format!(
+                    "self-test concept lookup errored for {concept_id}: {response:?}"
+                )
+                .into());
+            }
         };
         cache.insert(concept_id.to_string(), resolved.clone());
-        resolved
+        Ok(resolved)
     }
 
     /// True when a pending review SleepTask already targets this concept.
@@ -2767,13 +2728,16 @@ impl Space {
         let rt = match collection.as_deref() {
             Some("recall") => self.recall.conversations.get_conversation(id).await?,
             Some("maintenance") => self.maintenance.conversations.get_conversation(id).await?,
-            None => self.memory.get_conversation(id).await?,
+            // "formation" is the documented name of the default collection
+            // (API.md, MCP tool schemas): the canonical spelling must stay
+            // valid even though omitting it means the same thing.
+            None | Some("formation") => self.memory.get_conversation(id).await?,
             // A typo (e.g. "Recall") must not silently read the formation
             // collection — the ids overlap, so it would return an unrelated
             // conversation instead of an error.
             Some(other) => {
                 return Err(format!(
-                    "unknown conversation collection {other:?} (expected \"recall\" or \"maintenance\")"
+                    "unknown conversation collection {other:?} (expected \"formation\", \"recall\" or \"maintenance\")"
                 )
                 .into());
             }
@@ -2793,12 +2757,12 @@ impl Space {
         let collection = match collection.as_deref() {
             Some("recall") => self.recall.conversations.conversations.clone(),
             Some("maintenance") => self.maintenance.conversations.conversations.clone(),
-            None => self.memory.conversations.clone(),
+            None | Some("formation") => self.memory.conversations.clone(),
             // Same strictness as `get_conversation`: unknown names error
             // instead of silently listing the formation collection.
             Some(other) => {
                 return Err(format!(
-                    "unknown conversation collection {other:?} (expected \"recall\" or \"maintenance\")"
+                    "unknown conversation collection {other:?} (expected \"formation\", \"recall\" or \"maintenance\")"
                 )
                 .into());
             }
@@ -3045,7 +3009,6 @@ impl Space {
             self_test_lock: tokio::sync::Mutex::new(()),
             shadow_lock: tokio::sync::Mutex::new(()),
             token_lock: tokio::sync::Mutex::new(()),
-            census_lock: tokio::sync::Mutex::new(()),
             judge_model: std::sync::RwLock::new(None),
             memory,
             wiki,
@@ -3230,24 +3193,14 @@ impl BrainHook for Hooks {
         if let Err(err) = space.restart_formation(SELF_USER_ID, id + 1).await {
             let reason = err.to_string();
             // "No pending ..." simply means no backlog. Anything else is a
-            // transient handoff race — e.g. maintenance finished so fast
-            // that formation's loop had not yet released its processing slot
-            // — and the queued backlog would otherwise stall until the next
-            // external input. One delayed retry (holding the space alive so
-            // eviction cannot close the DB underneath it) covers the window.
+            // transient handoff race; no retry — eviction-reload autostart or
+            // the next ingest self-heals the queued backlog.
             if !reason.contains("No pending formation conversation") {
-                let space = space.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                    let id = space.formation.get_processed().unwrap_or_default();
-                    if let Err(err) = space.restart_formation(SELF_USER_ID, id + 1).await {
-                        log::warn!(
-                            target: "brain",
-                            space_id = space.id;
-                            "formation resume retry failed: {err}"
-                        );
-                    }
-                });
+                log::warn!(
+                    target: "brain",
+                    space_id = space.id;
+                    "formation resume failed: {reason}"
+                );
             }
         }
         // Post-sleep digest: fold freshly committed wiki knowledge into the
@@ -3610,31 +3563,6 @@ pub async fn copy_space_objects(
     Ok(copied)
 }
 
-/// Deletes every object of a space (`{space_id}/**`) from the store. Used by
-/// the eval harness to remove run-scoped spaces after a run; the space must
-/// be closed first.
-pub async fn delete_space_objects(
-    store: &Arc<dyn ObjectStore>,
-    space_id: &str,
-) -> Result<u64, BoxError> {
-    use futures::TryStreamExt;
-    use object_store::ObjectStoreExt;
-
-    let prefix = object_store::path::Path::from(space_id);
-    // Collect before deleting: mutating while listing can invalidate the
-    // stream on some backends.
-    let locations: Vec<_> = store
-        .list(Some(&prefix))
-        .map_ok(|meta| meta.location)
-        .try_collect()
-        .await?;
-    let deleted = locations.len() as u64;
-    for location in locations {
-        store.delete(&location).await?;
-    }
-    Ok(deleted)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -3943,35 +3871,6 @@ mod tests {
         let fork2 = fork_state2.load_space("fork_space", true).await.unwrap();
         assert_eq!(fork2.get_info().name.as_deref(), Some("before fork"));
         fork2.db.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn delete_space_objects_removes_run_scoped_space() {
-        let app = test_app_state("delete_src");
-        let space = create_loaded_space(&app, "delete_space").await;
-        space.db.close().await.unwrap();
-
-        let deleted = super::delete_space_objects(&app.object_store(), "delete_space")
-            .await
-            .unwrap();
-        assert!(deleted > 0);
-        app.evict_space("delete_space").await;
-
-        // The prefix is empty afterwards: forking the deleted space fails.
-        let empty: Arc<dyn super::ObjectStore> = Arc::new(InMemory::new());
-        assert!(
-            super::copy_space_objects(&app.object_store(), &empty, "delete_space")
-                .await
-                .is_err()
-        );
-
-        // Deleting an already-empty prefix is a no-op, not an error.
-        assert_eq!(
-            super::delete_space_objects(&app.object_store(), "delete_space")
-                .await
-                .unwrap(),
-            0
-        );
     }
 
     #[test]
@@ -5692,6 +5591,32 @@ mod tests {
         let (items, cursor) = space.list_conversations(None, None, Some(0)).await.unwrap();
         assert_eq!(items.len(), 1);
         assert!(cursor.is_some());
+
+        // "formation" is the documented name of the default collection (API
+        // docs, MCP tool schemas): the canonical spelling must stay valid,
+        // while typos keep erroring instead of silently reading formation.
+        let (items, _) = space
+            .list_conversations(Some("formation".to_string()), None, Some(10))
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 3);
+        let got = space
+            .get_conversation(Some("formation".to_string()), items[0]._id)
+            .await
+            .unwrap();
+        assert_eq!(got._id, items[0]._id);
+        assert!(
+            space
+                .list_conversations(Some("Formation".to_string()), None, Some(10))
+                .await
+                .is_err()
+        );
+        assert!(
+            space
+                .get_conversation(Some("Recall".to_string()), items[0]._id)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

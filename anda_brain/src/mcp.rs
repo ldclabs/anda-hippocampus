@@ -4,7 +4,6 @@ use anda_core::{
 };
 use anda_engine::unix_ms;
 use axum::extract::OriginalUri;
-use http::{HeaderMap, header};
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -28,7 +27,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     agents::SELF_USER_ID,
-    payload::StringOr,
+    authz::{self, AuthzError, AuthzMode, Caller},
+    payload::{StringOr, extract_bearer_token, extract_shard_id},
     space::{AppState, Space},
     types::{
         FormationInput, InputContext, MaintenanceInput, MaintenanceParameters, MaintenanceScope,
@@ -89,47 +89,6 @@ struct McpAccess {
     sharding: Option<u32>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
-pub struct McpInputContext {
-    #[serde(alias = "user", skip_serializing_if = "Option::is_none")]
-    pub counterparty: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub topic: Option<String>,
-}
-
-impl<'de> Deserialize<'de> for McpInputContext {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        // Reuse the HTTP channel's wire format, which also accepts a
-        // JSON-string body (LLM callers frequently double-encode `context`);
-        // the MCP channel must not be stricter than the HTTP one.
-        let context = InputContext::deserialize(deserializer)?;
-        Ok(Self {
-            counterparty: context.counterparty,
-            agent: context.agent,
-            source: context.source,
-            topic: context.topic,
-        })
-    }
-}
-
-impl From<McpInputContext> for InputContext {
-    fn from(context: McpInputContext) -> Self {
-        Self {
-            counterparty: context.counterparty,
-            agent: context.agent,
-            source: context.source,
-            topic: context.topic,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum McpMessageContent {
@@ -179,7 +138,7 @@ impl McpMessage {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct RememberConversationInput {
     pub messages: Vec<McpMessage>,
-    pub context: Option<McpInputContext>,
+    pub context: Option<InputContext>,
     /// Optional ISO 8601 timestamp for the represented conversation.
     pub timestamp: Option<String>,
 }
@@ -192,7 +151,7 @@ impl RememberConversationInput {
                 .into_iter()
                 .map(McpMessage::into_message)
                 .collect::<Result<Vec<_>, _>>()?,
-            context: self.context.map(InputContext::from),
+            context: self.context,
             timestamp: self.timestamp,
         })
     }
@@ -201,51 +160,14 @@ impl RememberConversationInput {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct RecallMemoryInput {
     pub query: String,
-    pub context: Option<McpInputContext>,
+    pub context: Option<InputContext>,
 }
 
 impl From<RecallMemoryInput> for RecallInput {
     fn from(input: RecallMemoryInput) -> Self {
         Self {
             query: input.query,
-            context: input.context.map(InputContext::from),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum McpMaintenanceScope {
-    Daydream,
-    Full,
-    Quick,
-}
-
-impl From<McpMaintenanceScope> for MaintenanceScope {
-    fn from(scope: McpMaintenanceScope) -> Self {
-        match scope {
-            McpMaintenanceScope::Daydream => Self::Daydream,
-            McpMaintenanceScope::Full => Self::Full,
-            McpMaintenanceScope::Quick => Self::Quick,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct McpMaintenanceParameters {
-    pub stale_event_threshold_days: Option<u32>,
-    pub confidence_decay_factor: Option<f64>,
-    pub unsorted_max_backlog: Option<u32>,
-    pub orphan_max_count: Option<u32>,
-}
-
-impl From<McpMaintenanceParameters> for MaintenanceParameters {
-    fn from(parameters: McpMaintenanceParameters) -> Self {
-        Self {
-            stale_event_threshold_days: parameters.stale_event_threshold_days,
-            confidence_decay_factor: parameters.confidence_decay_factor,
-            unsorted_max_backlog: parameters.unsorted_max_backlog,
-            orphan_max_count: parameters.orphan_max_count,
+            context: input.context,
         }
     }
 }
@@ -255,19 +177,19 @@ pub struct RunMaintenanceInput {
     /// Maintenance trigger label. Defaults to "on_demand".
     pub trigger: Option<String>,
     /// Maintenance scope. Defaults to "daydream".
-    pub scope: Option<McpMaintenanceScope>,
+    pub scope: Option<MaintenanceScope>,
     /// Optional ISO 8601 timestamp.
     pub timestamp: Option<String>,
-    pub parameters: Option<McpMaintenanceParameters>,
+    pub parameters: Option<MaintenanceParameters>,
 }
 
 impl From<RunMaintenanceInput> for MaintenanceInput {
     fn from(input: RunMaintenanceInput) -> Self {
         Self {
             trigger: input.trigger.unwrap_or_else(|| "on_demand".to_string()),
-            scope: input.scope.map(MaintenanceScope::from).unwrap_or_default(),
+            scope: input.scope.unwrap_or_default(),
             timestamp: input.timestamp,
-            parameters: input.parameters.map(MaintenanceParameters::from),
+            parameters: input.parameters,
             formation_id: 0,
         }
     }
@@ -372,6 +294,20 @@ impl AndaBrainMcpServer {
         }
     }
 
+    /// One permit per synchronous LLM-driving tool call (recall,
+    /// maintenance), drawn from the `AppState`'s shared LLM budget — the
+    /// same semaphore that caps the HTTP LLM routes, so the MCP channel
+    /// cannot bypass that cap. Fails fast like the HTTP 429 load-shed
+    /// instead of queueing unbounded work.
+    fn acquire_llm_permit(&self) -> Result<tokio::sync::SemaphorePermit<'_>, ErrorData> {
+        self.app.llm_semaphore().try_acquire().map_err(|_| {
+            ErrorData::invalid_request(
+                "too many concurrent model-driven requests, retry later",
+                None,
+            )
+        })
+    }
+
     fn access_from_context(
         &self,
         context: &RequestContext<RoleServer>,
@@ -398,8 +334,8 @@ impl AndaBrainMcpServer {
 
         Ok(McpAccess {
             space_id: space_id_from_mcp_path(path, &self.config.remote_path_prefix)?,
-            auth_token: bearer_token_from_headers(&parts.headers).unwrap_or_default(),
-            sharding: sharding_from_headers(&parts.headers).or(Some(0)),
+            auth_token: extract_bearer_token(&parts.headers),
+            sharding: Some(extract_shard_id(&parts.headers)),
         })
     }
 
@@ -449,15 +385,6 @@ impl AndaBrainMcpServer {
         }
     }
 
-    async fn load_existing_space(&self, space_id: &str) -> Result<Arc<Space>, ErrorData> {
-        self.app.load_space(space_id, false).await.map_err(|err| {
-            internal_error(format!(
-                "failed to load memory space '{}': {err}. Create it first or start MCP with --mcp-auto-create-space",
-                space_id
-            ))
-        })
-    }
-
     async fn load_authorized_space(
         &self,
         scope: TokenScope,
@@ -470,45 +397,44 @@ impl AndaBrainMcpServer {
     }
 
     /// Like [`Self::load_authorized_space`] but also returns the verified
-    /// CWT and space token so wiki tools can resolve the caller's ACL view
-    /// and audit actor (PRD §8.2): CWT holders are unrestricted, space
-    /// tokens carry their labels, and an anonymous public-space reader is
-    /// neither — the caller must map that to the unlabeled-only view. A
-    /// supplied space token is verified even on public spaces so a labeled
-    /// token keeps its granted labels instead of degrading to anonymous.
+    /// [`Caller`] (CWT / space token) so wiki tools can resolve the caller's
+    /// ACL view and audit actor (PRD §8.2): CWT holders are unrestricted,
+    /// space tokens carry their labels, and an anonymous public-space reader
+    /// is neither — the caller must map that to the unlabeled-only view.
+    ///
+    /// A thin wrapper over the shared [`authz::authorize`] (read tools get
+    /// the public-read fallback, write tools always require a credential);
+    /// only auto-create stays MCP-specific: when the space fails to load and
+    /// auto-create is enabled, a verified write CWT may create it, then
+    /// authorization is retried once against the fresh space.
     async fn load_authorized_space_with_token(
         &self,
         scope: TokenScope,
         access: &McpAccess,
-    ) -> Result<
-        (
-            Arc<Space>,
-            Option<crate::types::CWToken>,
-            Option<crate::types::SpaceToken>,
-        ),
-        ErrorData,
-    > {
-        if let Some(sharding) = access.sharding
-            && sharding != self.app.sharding
-        {
-            return Err(ErrorData::invalid_request(
-                format!(
-                    "space_id sharding {sharding} does not match server sharding {}",
-                    self.app.sharding
-                ),
-                None,
-            ));
-        }
-
+    ) -> Result<(Arc<Space>, Caller), ErrorData> {
+        let mode = if scope == TokenScope::Read {
+            AuthzMode::PublicRead
+        } else {
+            AuthzMode::Credentialed
+        };
         let now_ms = unix_ms();
-        let cwt = self
-            .app
-            .check_auth_if(&access.auth_token, &access.space_id, scope, now_ms)
-            .map_err(|_| unauthorized(scope))?;
+        let attempt = || {
+            authz::authorize(
+                &self.app,
+                &access.space_id,
+                &access.auth_token,
+                access.sharding,
+                scope,
+                mode,
+                now_ms,
+            )
+        };
 
-        let space = match self.load_existing_space(&access.space_id).await {
-            Ok(space) => space,
-            Err(_err) if self.config.auto_create_space => {
+        match attempt().await {
+            Ok(rt) => Ok(rt),
+            Err(AuthzError::SpaceNotFound { .. } | AuthzError::SpaceLoad { .. })
+                if self.config.auto_create_space =>
+            {
                 if self.config.dynamic_space_from_path && !self.app.cwt_auth_enabled() {
                     return Err(ErrorData::invalid_request(
                         "remote MCP auto-create requires ED25519_PUBKEYS and a write CWT for the target space",
@@ -527,21 +453,11 @@ impl AndaBrainMcpServer {
                 // The verified write-CWT principal owns the space it caused
                 // to be created; `SELF_USER_ID` would misreport ownership.
                 self.load_configured_space(&access.space_id, creator.user)
-                    .await?
+                    .await?;
+                attempt().await.map_err(authz_error_data)
             }
-            Err(err) => return Err(err),
-        };
-        let mut space_token = None;
-        if cwt.is_none() {
-            match space.verify_space_token(access.auth_token.clone(), scope, now_ms) {
-                Ok(st) => space_token = Some(st),
-                // Public-space reads fall back to the anonymous view only
-                // when no valid credential was presented.
-                Err(_) if scope == TokenScope::Read && space.is_public() => {}
-                Err(_) => return Err(unauthorized(scope)),
-            }
+            Err(err) => Err(authz_error_data(err)),
         }
-        Ok((space, cwt, space_token))
     }
 
     pub async fn ensure_space_available(&self) -> Result<(), ErrorData> {
@@ -590,10 +506,10 @@ impl AndaBrainMcpServer {
         input: RecallMemoryInput,
     ) -> Result<CallToolResult, ErrorData> {
         let input = RecallInput::from(input);
-        let (space, _cwt, st) = self
+        let (space, caller) = self
             .load_authorized_space_with_token(TokenScope::Read, access)
             .await?;
-        if st.as_ref().is_some_and(|st| st.labels.is_some()) {
+        if caller.label_restricted() {
             // RecallAgent's wiki tools span all labels; a label-restricted
             // token cannot use agentic recall (same guard as HTTP /recall).
             return Err(ErrorData::invalid_request(
@@ -601,6 +517,10 @@ impl AndaBrainMcpServer {
                 None,
             ));
         }
+        // Same budget as HTTP /recall's 429 cap: without it, anonymous
+        // callers on public spaces could run up to the global HTTP cap of
+        // concurrent multi-turn LLM recalls through this tool.
+        let _permit = self.acquire_llm_permit()?;
         let output = space
             .query(SELF_USER_ID, StringOr::Value(input))
             .await
@@ -623,6 +543,8 @@ impl AndaBrainMcpServer {
             ));
         }
 
+        // Same budget as HTTP /maintenance's 429 cap (see recall_memory_for).
+        let _permit = self.acquire_llm_permit()?;
         let output = space
             .maintenance(SELF_USER_ID, MaintenanceInput::from(input))
             .await
@@ -665,16 +587,14 @@ impl AndaBrainMcpServer {
         access: &McpAccess,
         input: ListConversationsInput,
     ) -> Result<CallToolResult, ErrorData> {
-        let (space, _cwt, st) = self
+        let (space, caller) = self
             .load_authorized_space_with_token(TokenScope::Read, access)
             .await?;
-        if crate::handler::label_restricted(st.as_ref()) {
-            // Conversations persist the full runner history (recall's wiki
-            // tools run unrestricted); same guard as the HTTP channel.
-            return Err(ErrorData::invalid_request(
-                "conversations require an unrestricted token",
-                None,
-            ));
+        // Same guard as the HTTP channel: label-restricted tokens are denied
+        // outright, and anonymous public readers cannot touch recall
+        // conversations (private-era runs may embed labeled wiki output).
+        if let Some(reason) = caller.conversation_read_forbidden(input.collection.as_deref()) {
+            return Err(ErrorData::invalid_request(reason, None));
         }
         let (conversations, next_cursor) = space
             .list_conversations(input.collection, input.cursor, input.limit)
@@ -691,15 +611,12 @@ impl AndaBrainMcpServer {
         access: &McpAccess,
         input: GetConversationInput,
     ) -> Result<CallToolResult, ErrorData> {
-        let (space, _cwt, st) = self
+        let (space, caller) = self
             .load_authorized_space_with_token(TokenScope::Read, access)
             .await?;
-        if crate::handler::label_restricted(st.as_ref()) {
-            // Same guard as list_conversations_for / the HTTP channel.
-            return Err(ErrorData::invalid_request(
-                "conversations require an unrestricted token",
-                None,
-            ));
+        // Same guard as list_conversations_for / the HTTP channel.
+        if let Some(reason) = caller.conversation_read_forbidden(input.collection.as_deref()) {
+            return Err(ErrorData::invalid_request(reason, None));
         }
         let conversation = space
             .get_conversation(input.collection, input.conversation_id)
@@ -721,12 +638,12 @@ impl AndaBrainMcpServer {
         access: &McpAccess,
         input: WikiCommitToolInput,
     ) -> Result<CallToolResult, ErrorData> {
-        let (space, cwt, st) = self
+        let (space, caller) = self
             .load_authorized_space_with_token(TokenScope::Write, access)
             .await?;
         // Real audit subject (PRD §8.1 hard requirement), same derivation as
         // the HTTP channel.
-        let actor = crate::handler::wiki_actor(&cwt, st.as_ref());
+        let actor = caller.actor();
         let output = space
             .wiki
             .commit(actor, input.into(), unix_ms())
@@ -740,10 +657,10 @@ impl AndaBrainMcpServer {
         access: &McpAccess,
         input: WikiSearchToolInput,
     ) -> Result<CallToolResult, ErrorData> {
-        let (space, cwt, st) = self
+        let (space, caller) = self
             .load_authorized_space_with_token(TokenScope::Read, access)
             .await?;
-        let scope = crate::handler::wiki_read_access(&cwt, st.as_ref());
+        let scope = caller.wiki_access();
         let input = WikiSearchInput::try_from(input)?;
         let output = space
             .wiki
@@ -758,10 +675,10 @@ impl AndaBrainMcpServer {
         access: &McpAccess,
         input: WikiReadToolInput,
     ) -> Result<CallToolResult, ErrorData> {
-        let (space, cwt, st) = self
+        let (space, caller) = self
             .load_authorized_space_with_token(TokenScope::Read, access)
             .await?;
-        let scope = crate::handler::wiki_read_access(&cwt, st.as_ref());
+        let scope = caller.wiki_access();
         let output = space
             .wiki
             .read_scoped(&scope, input.try_into()?, unix_ms())
@@ -775,10 +692,10 @@ impl AndaBrainMcpServer {
         access: &McpAccess,
         input: WikiVerifyToolInput,
     ) -> Result<CallToolResult, ErrorData> {
-        let (space, cwt, st) = self
+        let (space, caller) = self
             .load_authorized_space_with_token(TokenScope::Read, access)
             .await?;
-        let scope = crate::handler::wiki_read_access(&cwt, st.as_ref());
+        let scope = caller.wiki_access();
         let output = space
             .wiki
             .verify_scoped(
@@ -1358,28 +1275,34 @@ fn unauthorized(scope: TokenScope) -> ErrorData {
     )
 }
 
+/// Maps a shared authorization failure onto the MCP error surface,
+/// preserving this channel's historical messages (the HTTP mapping lives in
+/// `From<AuthzError> for AppError`).
+fn authz_error_data(err: AuthzError) -> ErrorData {
+    match err {
+        AuthzError::ShardMismatch { sharding, expected } => ErrorData::invalid_request(
+            format!("space_id sharding {sharding} does not match server sharding {expected}"),
+            None,
+        ),
+        AuthzError::Unauthorized(scope) => unauthorized(scope),
+        AuthzError::SpaceNotFound {
+            space_id, display, ..
+        }
+        | AuthzError::SpaceLoad {
+            space_id, display, ..
+        } => internal_error(format!(
+            "failed to load memory space '{space_id}': {display}. Create it first or start MCP with --mcp-auto-create-space"
+        )),
+        AuthzError::Forbidden(message) => ErrorData::invalid_request(message, None),
+    }
+}
+
 fn invalid_params(error: impl ToString) -> ErrorData {
     ErrorData::invalid_params(error.to_string(), None)
 }
 
 fn internal_error(error: impl ToString) -> ErrorData {
     ErrorData::internal_error(error.to_string(), None)
-}
-
-fn bearer_token_from_headers(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.trim_start_matches("Bearer ").to_string())
-        .filter(|s| !s.is_empty())
-}
-
-fn sharding_from_headers(headers: &HeaderMap) -> Option<u32> {
-    headers
-        .get("Shard-Id")
-        .or_else(|| headers.get("X-Shard"))
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.parse::<u32>().ok())
 }
 
 fn normalize_mcp_path_prefix(prefix: &str) -> String {
@@ -1423,6 +1346,7 @@ mod tests {
         model::{CompletionFeaturesDyn, Model, Models, reqwest},
     };
     use cose2::{CoseMap, Label, Sign1Message, Value as CoseValue, cwt::Claims, iana};
+    use http::{HeaderMap, header};
     use ic_auth_types::ByteBufB64;
     use ic_cose_types::cose::ed25519::{SigningKey, VerifyingKey, ed25519_sign};
     use object_store::memory::InMemory;
@@ -1695,7 +1619,7 @@ mod tests {
                         user: None,
                         timestamp: None,
                     }],
-                    context: Some(McpInputContext {
+                    context: Some(InputContext {
                         counterparty: Some("alice".to_string()),
                         agent: Some("test-agent".to_string()),
                         source: Some("mcp-test".to_string()),
@@ -2151,14 +2075,12 @@ mod tests {
         );
         assert!(space_id_from_mcp_path("/mcp", "/mcp").is_err());
 
+        // The MCP channel shares the HTTP header extractors from `payload`.
         let mut headers = HeaderMap::new();
         headers.insert(header::AUTHORIZATION, "Bearer ST-token".parse().unwrap());
         headers.insert("X-Shard", "7".parse().unwrap());
 
-        assert_eq!(
-            bearer_token_from_headers(&headers).as_deref(),
-            Some("ST-token")
-        );
-        assert_eq!(sharding_from_headers(&headers), Some(7));
+        assert_eq!(extract_bearer_token(&headers), "ST-token");
+        assert_eq!(extract_shard_id(&headers), 7);
     }
 }

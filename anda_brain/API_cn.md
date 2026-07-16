@@ -8,6 +8,7 @@
 - 支持的序列化格式：
   - 请求：`Content-Type: application/json | application/cbor | text/markdown`
   - 响应：`Accept: application/json | application/cbor | text/markdown`
+  - 内容协商仅作用于成功响应体；错误响应体始终为 JSON，与 `Accept` 无关
 - 大多数业务接口都会返回 RPC 包装后的结构体：`RpcResponse<T>`
 - MCP 客户端可使用内置的支持流式传输的 HTTP MCP 端点：`/mcp/<space_id>`，也可以使用本地 stdio server：`anda_brain mcp --space-id <space_id> [local|aws]`
 
@@ -602,17 +603,17 @@ MCP_AUTH_TOKEN="$SPACE_TOKEN" \
 ### GET `/v1/{space_id}/conversations/{conversation_id}?collection=<collection>`
 
 - 作用：获取单条会话详情
-- 鉴权：SpaceToken/CWT `read`（公开空间免鉴权，私有空间需有效 token）；带 ACL 标签限制的 token 返回 `403`——会话持久化了完整的 agent 运行历史，不受标签过滤
+- 鉴权：SpaceToken/CWT `read`（公开空间免鉴权，私有空间需有效 token）；带 ACL 标签限制的 token 返回 `403`——会话持久化了完整的 agent 运行历史，不受标签过滤；`collection=recall` 对公开空间的匿名访问也返回 `403`（私有期的 recall 运行可能内嵌 labeled wiki 内容）
 - Query:
-  - `collection?: string` // "recall" 或 "maintenance" 指定非默认会话集合；未知值返回 `400`
+  - `collection?: string` // "formation"（默认）、"recall" 或 "maintenance"；未知值返回 `400`
 - 响应：`RpcResponse<Conversation>`
 
 ### GET `/v1/{space_id}/conversations/{conversation_id}/delta?collection=<collection>&messages_offset=<n>&artifacts_offset=<n>`
 
 - 作用：按客户端已消费的 offset 获取会话增量更新
-- 鉴权：SpaceToken/CWT `read`（公开空间免鉴权，私有空间需有效 token）；带 ACL 标签限制的 token 返回 `403`
+- 鉴权：SpaceToken/CWT `read`（公开空间免鉴权，私有空间需有效 token）；带 ACL 标签限制的 token 返回 `403`（`collection=recall`：公开空间匿名访问同样拒绝）
 - Query:
-  - `collection?: string` // "recall" 或 "maintenance" 指定非默认会话集合；未知值返回 `400`
+  - `collection?: string` // "formation"（默认）、"recall" 或 "maintenance"；未知值返回 `400`
   - `messages_offset?: number` // 仅返回该偏移量之后的新消息，默认 `0`
   - `artifacts_offset?: number` // 仅返回该偏移量之后的新 artifacts，默认 `0`
 - 响应：`RpcResponse<ConversationDelta>`
@@ -620,9 +621,9 @@ MCP_AUTH_TOKEN="$SPACE_TOKEN" \
 ### GET `/v1/{space_id}/conversations?collection=<collection>&cursor=<cursor>&limit=<n>`
 
 - 作用：分页列出会话
-- 鉴权：SpaceToken/CWT `read`（公开空间免鉴权，私有空间需有效 token）；带 ACL 标签限制的 token 返回 `403`
+- 鉴权：SpaceToken/CWT `read`（公开空间免鉴权，私有空间需有效 token）；带 ACL 标签限制的 token 返回 `403`（`collection=recall`：公开空间匿名访问同样拒绝）
 - Query:
-  - `collection?: string` // "recall" 或 "maintenance" 指定非默认会话集合；未知值返回 `400`
+  - `collection?: string` // "formation"（默认）、"recall" 或 "maintenance"；未知值返回 `400`
   - `cursor?: string`
   - `limit?: number`
 - 响应：`RpcResponse<Conversation[]>`（并通过 `next_cursor` 给出下一页游标）
@@ -830,3 +831,4 @@ if (recall.error) {
 - 认证失败：HTTP `401`，响应体为 `RpcError`
 - 参数错误：HTTP `400`，响应体为 `RpcError`
 - 成功时：HTTP `200`，响应体通常为 `RpcResponse<T>`
+- 错误响应体始终为 JSON，即使请求指定了 `application/cbor` 或 `text/markdown`（包括携带 `error.data.current_version` 的 wiki `409` 冲突响应体）；只有成功响应体遵循 `Accept` 协商

@@ -5,6 +5,7 @@ use std::str::FromStr;
 
 pub mod agents;
 pub mod assess;
+pub mod authz;
 pub mod eval;
 pub mod handler;
 pub mod ledger;

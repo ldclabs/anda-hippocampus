@@ -8,6 +8,7 @@
 - Supported serialization formats:
   - Request: `Content-Type: application/json | application/cbor | text/markdown`
   - Response: `Accept: application/json | application/cbor | text/markdown`
+  - Content negotiation applies to success bodies only; error response bodies are always JSON regardless of `Accept`
 - Most business endpoints return an RPC envelope: `RpcResponse<T>`
 - MCP clients can use the built-in Streamable HTTP endpoint: `/mcp/<space_id>`, or the local stdio server: `anda_brain mcp --space-id <space_id> [local|aws]`
 
@@ -602,17 +603,17 @@ When `ED25519_PUBKEYS` is set, configure the remote MCP client with an `Authoriz
 ### GET `/v1/{space_id}/conversations/{conversation_id}?collection=<collection>`
 
 - Purpose: Get a single conversation detail
-- Auth: SpaceToken/CWT `read` (public spaces are unauthenticated; private spaces require a valid token); tokens restricted by ACL labels are rejected with `403` — conversations persist the full agent runner history, which is not label-scoped
+- Auth: SpaceToken/CWT `read` (public spaces are unauthenticated; private spaces require a valid token); tokens restricted by ACL labels are rejected with `403` — conversations persist the full agent runner history, which is not label-scoped; `collection=recall` additionally rejects anonymous access on public spaces with `403` (recall runs from a private era may embed labeled wiki content)
 - Query:
-  - `collection?: string` // "recall" or "maintenance" for non-default conversation collections; unknown values are rejected with `400`
+  - `collection?: string` // "formation" (default), "recall" or "maintenance"; unknown values are rejected with `400`
 - Response: `RpcResponse<Conversation>`
 
 ### GET `/v1/{space_id}/conversations/{conversation_id}/delta?collection=<collection>&messages_offset=<n>&artifacts_offset=<n>`
 
 - Purpose: Get incremental conversation updates after client-side offsets
-- Auth: SpaceToken/CWT `read` (public spaces are unauthenticated; private spaces require a valid token); tokens restricted by ACL labels are rejected with `403`
+- Auth: SpaceToken/CWT `read` (public spaces are unauthenticated; private spaces require a valid token); tokens restricted by ACL labels are rejected with `403` (`collection=recall`: anonymous access on public spaces is also rejected)
 - Query:
-  - `collection?: string` // "recall" or "maintenance" for non-default conversation collections; unknown values are rejected with `400`
+  - `collection?: string` // "formation" (default), "recall" or "maintenance"; unknown values are rejected with `400`
   - `messages_offset?: number` // returns only messages after this offset, defaults to `0`
   - `artifacts_offset?: number` // returns only artifacts after this offset, defaults to `0`
 - Response: `RpcResponse<ConversationDelta>`
@@ -620,9 +621,9 @@ When `ED25519_PUBKEYS` is set, configure the remote MCP client with an `Authoriz
 ### GET `/v1/{space_id}/conversations?collection=<collection>&cursor=<cursor>&limit=<n>`
 
 - Purpose: List conversations with pagination
-- Auth: SpaceToken/CWT `read` (public spaces are unauthenticated; private spaces require a valid token); tokens restricted by ACL labels are rejected with `403`
+- Auth: SpaceToken/CWT `read` (public spaces are unauthenticated; private spaces require a valid token); tokens restricted by ACL labels are rejected with `403` (`collection=recall`: anonymous access on public spaces is also rejected)
 - Query:
-  - `collection?: string` // "recall" or "maintenance" for non-default conversation collections; unknown values are rejected with `400`
+  - `collection?: string` // "formation" (default), "recall" or "maintenance"; unknown values are rejected with `400`
   - `cursor?: string`
   - `limit?: number`
 - Response: `RpcResponse<Conversation[]>` (next page cursor is returned via `next_cursor`)
@@ -827,3 +828,4 @@ if (recall.error) {
 - Authentication failure: HTTP `401`, response body is `RpcError`
 - Invalid request/parameters: HTTP `400`, response body is `RpcError`
 - Success: HTTP `200`, response body is usually `RpcResponse<T>`
+- Error response bodies are always JSON, even when the request asked for `application/cbor` or `text/markdown` (this includes the wiki `409` conflict body carrying `error.data.current_version`); only success bodies follow the `Accept` header

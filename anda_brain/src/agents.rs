@@ -8,6 +8,7 @@ use anda_db::schema::DocumentId;
 use anda_engine::{
     context::CompletionRunner,
     memory::{Conversation, ConversationStatus},
+    unix_ms,
 };
 use parking_lot::RwLock;
 use std::collections::VecDeque;
@@ -42,6 +43,199 @@ const COMPACTION_CONTINUE_PROMPT: &str = "Continue the active memory-agent work 
 /// persisted conversation.
 pub(super) const PERSIST_EVERY_N_TURNS: usize = 5;
 
+/// Hard guardrails for the formation/maintenance runner loops (review P2-3).
+///
+/// A model that keeps emitting tool calls without converging would otherwise
+/// run forever: the runner compacts every ~81 turns and simply continues, so
+/// the agent's processing flag stays set and the space's memory system stalls
+/// (formation's queue freezes; maintenance blocks formation entirely). Both
+/// agents legitimately need far more turns than recall
+/// (`RECALL_MAX_MODEL_TURNS` = 7 + 180s), so these caps are intentionally
+/// loose. Exceeding either budget marks the conversation Failed through the
+/// host's `mark_failed`, which reuses each agent's existing failure path
+/// (formation: the Failed retry path; maintenance: releases the processing
+/// slot through the guard/hook flow). Budgets are checked between turns so an
+/// in-flight KIP write turn is never cancelled halfway.
+pub(super) const RUNNER_MAX_MODEL_TURNS: usize = 200;
+pub(super) const RUNNER_MAX_WALL_CLOCK_MS: u64 = 30 * 60 * 1000;
+
+/// Control flow returned by [`RunnerHost::after_turn`].
+pub(super) enum RunnerFlow {
+    /// Keep looping (the host may have queued a follow-up).
+    Continue,
+    /// The conversation converged; leave the runner loop cleanly.
+    Break,
+}
+
+/// Per-agent seams of the shared formation/maintenance runner loop
+/// ([`drive_runner_loop`]). Everything else — budget guards, the compaction
+/// arm, turn accounting, `append_runner_history`, the status three-state, the
+/// persistence throttle, the single failure exit with usage backfill and the
+/// tail Working flush — is identical between the two agents and lives in the
+/// driver. recall deliberately does not use this skeleton: its timeout
+/// wrapper and failed_output semantics do not fit these seams.
+pub(super) trait RunnerHost {
+    /// Agent label used in budget-exceeded failure reasons.
+    fn label(&self) -> &'static str;
+
+    /// The agent's completed-conversation ring served as model context.
+    fn history(&self) -> &RwLock<VecDeque<Document>>;
+
+    /// Persists the current full conversation snapshot; failures are logged
+    /// by the host and must not interrupt the processing loop.
+    async fn persist_snapshot(&self, conversation: &Conversation);
+
+    /// Marks the conversation Failed with `reason` and persists it.
+    async fn mark_failed(&self, conversation: &mut Conversation, reason: String);
+
+    /// Host-specific convergence predicate for the current turn (formation
+    /// also treats an idle runner as done once the review pass has run).
+    fn turn_is_done(&self, runner: &CompletionRunner) -> bool;
+
+    /// Runs on every successful (non-failed) turn, before the completed
+    /// history push (formation clears `failed_reason` so the Failed-retry
+    /// path converges to a clean snapshot; maintenance leaves it untouched).
+    fn on_turn_success(&self, conversation: &mut Conversation);
+
+    /// Runs at the end of every non-terminal turn, after persistence. The
+    /// host decides whether the loop ends now (formation injects the pending
+    /// review follow-up when the runner idles and otherwise breaks as soon as
+    /// it is done) or defers to the runner's own `Ok(None)` exit on the next
+    /// iteration (maintenance).
+    fn after_turn(&mut self, runner: &mut CompletionRunner, is_done: bool) -> RunnerFlow;
+}
+
+/// Shared runner loop driving one formation/maintenance conversation to a
+/// terminal state. Every failure exits through the labeled break so usage
+/// backfill and `mark_failed` live at exactly one place below the loop.
+pub(super) async fn drive_runner_loop<H: RunnerHost>(
+    host: &mut H,
+    runner: &mut CompletionRunner,
+    conversation: &mut Conversation,
+) {
+    let started_at_ms = unix_ms();
+    let mut replace_initial_input = true;
+    let mut persisted_runner_history_len = 0;
+    let mut total_model_turns = 0usize;
+    let mut accounted_runner_turns = 0usize;
+    let mut unpersisted_turns = 0usize;
+    let failure: Option<String> = 'run: {
+        loop {
+            // Guardrails against a non-converging tool loop; see
+            // RUNNER_MAX_MODEL_TURNS. Exceeding a budget takes the host's
+            // existing mark_failed path.
+            if total_model_turns >= RUNNER_MAX_MODEL_TURNS {
+                break 'run Some(format!(
+                    "{} exceeded model turn limit of {}",
+                    host.label(),
+                    RUNNER_MAX_MODEL_TURNS
+                ));
+            }
+            if unix_ms().saturating_sub(started_at_ms) >= RUNNER_MAX_WALL_CLOCK_MS {
+                break 'run Some(format!(
+                    "{} exceeded wall-clock budget of {} seconds",
+                    host.label(),
+                    RUNNER_MAX_WALL_CLOCK_MS / 1000
+                ));
+            }
+
+            match compact_runner_if_needed(runner).await {
+                Ok(true) => {
+                    // The compaction handoff consumed one model turn, and the
+                    // replacement runner restarts its own turn counter.
+                    total_model_turns = total_model_turns.saturating_add(1);
+                    accounted_runner_turns = runner.turns();
+                    persisted_runner_history_len = 0;
+                    replace_initial_input = false;
+                }
+                Ok(false) => {}
+                Err(err) => break 'run Some(format!("CompletionRunner error: {err:?}")),
+            }
+
+            match runner.next().await {
+                Ok(None) => break 'run None,
+                Ok(Some(res)) => {
+                    let runner_turns = runner.turns();
+                    total_model_turns = total_model_turns
+                        .saturating_add(runner_turns.saturating_sub(accounted_runner_turns));
+                    accounted_runner_turns = runner_turns;
+
+                    let now_ms = unix_ms();
+                    let is_done = host.turn_is_done(runner);
+
+                    append_runner_history(
+                        conversation,
+                        &res.chat_history,
+                        &mut persisted_runner_history_len,
+                        &mut replace_initial_input,
+                    );
+
+                    conversation.status = if res.failed_reason.is_some() {
+                        ConversationStatus::Failed
+                    } else if is_done {
+                        ConversationStatus::Completed
+                    } else {
+                        ConversationStatus::Working
+                    };
+                    conversation.usage = res.usage;
+                    conversation.updated_at = now_ms;
+
+                    if let Some(failed_reason) = res.failed_reason {
+                        conversation.failed_reason = Some(failed_reason);
+                    } else {
+                        host.on_turn_success(conversation);
+                        push_completed_history(host.history(), conversation, 2);
+                    }
+
+                    // Persisting rewrites the full message array (O(turns^2)
+                    // over a session), so intermediate Working turns are
+                    // throttled; terminal statuses always persist. See
+                    // PERSIST_EVERY_N_TURNS.
+                    unpersisted_turns = unpersisted_turns.saturating_add(1);
+                    if conversation.status != ConversationStatus::Working
+                        || unpersisted_turns >= PERSIST_EVERY_N_TURNS
+                    {
+                        host.persist_snapshot(conversation).await;
+                        unpersisted_turns = 0;
+                    }
+
+                    if conversation.status == ConversationStatus::Cancelled
+                        || conversation.status == ConversationStatus::Failed
+                    {
+                        break 'run None;
+                    }
+
+                    if let RunnerFlow::Break = host.after_turn(runner, is_done) {
+                        break 'run None;
+                    }
+                }
+                Err(err) => break 'run Some(format!("CompletionRunner error: {err:?}")),
+            }
+        }
+    };
+
+    // Single failure exit. The usage snapshot happens after the error
+    // occurred: failure can strike after usage was accumulated but before it
+    // was copied from a runner output (e.g. a compaction handoff consumed ~a
+    // full context window of input tokens and the very next call errors), so
+    // the runner's running total is backfilled here, like recall does, or
+    // those tokens vanish from the agent's usage ledger. Success exits must
+    // NOT backfill: the runner's final_output/final_idle_output mem::take
+    // total_usage, so the last `res.usage` already carries the full total.
+    if let Some(reason) = failure {
+        conversation.usage = runner.total_usage().clone();
+        host.mark_failed(conversation, reason).await;
+    }
+
+    // Terminal and failure exits above always persist (any non-Working
+    // status forces a write, and mark_failed writes its own snapshot), so
+    // only a Working exit — e.g. the runner returning `Ok(None)` — can still
+    // hold turns skipped by the throttle.
+    if unpersisted_turns > 0 && conversation.status == ConversationStatus::Working {
+        host.persist_snapshot(conversation).await;
+    }
+}
+
 fn queued_runner_tokens(runner: &CompletionRunner) -> u64 {
     runner
         .steering_message_iter()
@@ -52,21 +246,15 @@ fn queued_runner_tokens(runner: &CompletionRunner) -> u64 {
 
 pub(super) async fn compact_runner_if_needed(
     runner: &mut CompletionRunner,
-    extra_pending_tokens: u64,
-    continue_after_compaction: bool,
 ) -> Result<bool, BoxError> {
-    if !runner
-        .needs_compaction_with(|| queued_runner_tokens(runner).saturating_add(extra_pending_tokens))
-    {
+    if !runner.needs_compaction_with(|| queued_runner_tokens(runner)) {
         return Ok(false);
     }
 
     let (mut compacted, output) = runner.handoff(None).await?;
     compacted.accumulate(&output.usage);
     compacted.accumulate_tools_usage(&output.tools_usage);
-    if continue_after_compaction {
-        compacted.follow_up(ContentPart::from(COMPACTION_CONTINUE_PROMPT.to_string()));
-    }
+    compacted.follow_up(ContentPart::from(COMPACTION_CONTINUE_PROMPT.to_string()));
     *runner = compacted;
     Ok(true)
 }

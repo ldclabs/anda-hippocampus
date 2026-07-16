@@ -67,6 +67,10 @@ pub fn normalize_content(content: &str) -> String {
     while out.ends_with("\n\n") {
         out.pop();
     }
+    // Leading blank lines would otherwise surface as a whitespace-only
+    // first chunk with no retrievable text.
+    let blank = out.len() - out.trim_start_matches('\n').len();
+    out.drain(..blank);
     if out.trim().is_empty() {
         return String::new();
     }
@@ -165,7 +169,6 @@ pub fn chunk_markdown(content: &str) -> ChunkPlan {
         pack_section(content, section, &mut drafts, &mut forced_splits);
     }
     merge_small_siblings(&mut drafts);
-    merge_blank_chunks(content, &mut drafts);
 
     let mut capped = false;
     while drafts.len() > MAX_CHUNKS_PER_VERSION {
@@ -201,11 +204,8 @@ struct LineInfo {
 }
 
 /// Code-fence state machine shared by the chunker and title derivation
-/// (CommonMark subset): a fence opens on a run of ≥3 backticks/tildes
-/// indented less than four columns whose info string contains no backtick
-/// (for backtick fences), and closes on a run of at least the opening
-/// length followed only by whitespace. Anything indented four columns or
-/// more is indented code, never a delimiter.
+/// (CommonMark subset): a fence opens on a run of ≥3 backticks/tildes and
+/// closes on a run of at least the opening length.
 #[derive(Default)]
 pub(super) struct FenceTracker {
     fence: Option<(char, usize)>,
@@ -219,22 +219,15 @@ impl FenceTracker {
         match self.fence {
             Some((ch, len)) => {
                 let run = trimmed.chars().take_while(|c| *c == ch).count();
-                if run >= len
-                    && indent_columns(line) < 4
-                    && trimmed.chars().skip(run).all(char::is_whitespace)
-                {
+                if run >= len {
                     self.fence = None; // closing delimiter; the line stays in-fence
                 }
                 true
             }
             None => {
-                if indent_columns(line) >= 4 {
-                    return false;
-                }
                 for ch in ['`', '~'] {
                     let run = trimmed.chars().take_while(|c| *c == ch).count();
-                    // ASCII delimiters: `run` chars == `run` bytes.
-                    if run >= 3 && !(ch == '`' && trimmed[run..].contains('`')) {
+                    if run >= 3 {
                         self.fence = Some((ch, run));
                         return true;
                     }
@@ -243,19 +236,6 @@ impl FenceTracker {
             }
         }
     }
-}
-
-/// Leading indentation in columns, tabs expanding to the next 4-column stop.
-fn indent_columns(line: &str) -> usize {
-    let mut cols = 0usize;
-    for ch in line.chars() {
-        match ch {
-            ' ' => cols += 1,
-            '\t' => cols += 4 - cols % 4,
-            _ => break,
-        }
-    }
-    cols
 }
 
 fn scan_lines(content: &str) -> Vec<LineInfo> {
@@ -557,28 +537,6 @@ fn merge_small_siblings(drafts: &mut Vec<ChunkDraft>) {
     }
 }
 
-/// Whitespace-only chunks (e.g. blank lines before the first heading) carry
-/// no retrievable text: fold them into the following chunk (or the previous
-/// one at the tail) so tiling holds without indexing empty strings.
-fn merge_blank_chunks(content: &str, drafts: &mut Vec<ChunkDraft>) {
-    let mut i = 0usize;
-    while i < drafts.len() {
-        let blank = content[drafts[i].byte_start..drafts[i].byte_end]
-            .trim()
-            .is_empty();
-        if !blank || drafts.len() == 1 {
-            i += 1;
-            continue;
-        }
-        if i + 1 < drafts.len() {
-            drafts[i + 1].byte_start = drafts[i].byte_start;
-        } else {
-            drafts[i - 1].byte_end = drafts[i].byte_end;
-        }
-        drafts.remove(i);
-    }
-}
-
 /// Pathology guard: merges adjacent pairs unconditionally, halving the chunk
 /// count per sweep, until the per-version cap holds.
 fn halve_adjacent(drafts: &mut Vec<ChunkDraft>) {
@@ -649,6 +607,12 @@ mod tests {
         let normalized = normalize_content("a  \r\nb\t\r\n\r\nc");
         assert_eq!(normalized, "a\nb\n\nc\n");
         assert_eq!(normalize_content("   \n\t\n"), "");
+        // Leading blank lines are stripped so the first chunk is never
+        // whitespace-only.
+        assert_eq!(
+            normalize_content("\n\n# 标题\n\n正文。\n"),
+            "# 标题\n\n正文。\n"
+        );
         // NFC: decomposed é (e + combining acute) becomes composed é
         assert_eq!(normalize_content("Cafe\u{0301}"), "Café\n");
     }
@@ -841,49 +805,6 @@ mod tests {
         assert!(plan.drafts.len() > 1);
         for draft in &plan.drafts {
             assert!(draft.byte_end - draft.byte_start <= CHUNK_HARD_MAX);
-        }
-    }
-
-    #[test]
-    fn indented_and_backtick_info_fences_are_not_fences() {
-        // A ``` indented ≥4 columns is an indented code block, not a fence:
-        // it must not swallow the following headings.
-        let content = normalize_content("# A\n\n    ```\n\n# B\nreal section\n");
-        let plan = chunk_markdown(&content);
-        assert_tiling(&content, &plan);
-        let paths: Vec<_> = plan.drafts.iter().map(|d| d.heading_path.clone()).collect();
-        assert!(paths.contains(&vec!["B".to_string()]));
-
-        // An info string containing a backtick cannot open a backtick fence.
-        let content = normalize_content("# A\n``` foo`bar\n\n# B\nreal section\n");
-        let plan = chunk_markdown(&content);
-        assert_tiling(&content, &plan);
-        let paths: Vec<_> = plan.drafts.iter().map(|d| d.heading_path.clone()).collect();
-        assert!(paths.contains(&vec!["B".to_string()]));
-    }
-
-    #[test]
-    fn spaced_backtick_runs_do_not_close_a_fence() {
-        // "``` ```" inside a fence is content, not a closing delimiter: the
-        // heading after it is still inside the fence.
-        let content = normalize_content("# A\n```\n``` ```\n# swallowed\n```\n\n# B\ntail\n");
-        let plan = chunk_markdown(&content);
-        assert_tiling(&content, &plan);
-        let paths: Vec<_> = plan.drafts.iter().map(|d| d.heading_path.clone()).collect();
-        assert!(!paths.iter().any(|p| p.contains(&"swallowed".to_string())));
-        assert!(paths.contains(&vec!["B".to_string()]));
-    }
-
-    #[test]
-    fn leading_blank_lines_do_not_produce_blank_chunks() {
-        let content = "\n\n# 标题\n\n正文内容。\n";
-        let plan = chunk_markdown(content);
-        assert_tiling(content, &plan);
-        for draft in &plan.drafts {
-            assert!(
-                !content[draft.byte_start..draft.byte_end].trim().is_empty(),
-                "blank chunk {draft:?}"
-            );
         }
     }
 
