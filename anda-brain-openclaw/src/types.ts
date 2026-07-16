@@ -50,9 +50,14 @@ export interface RecallInput {
 }
 
 export interface Usage {
+  /** Input tokens sent to the LLM. */
   input_tokens?: number
+  /** Output tokens received from the LLM. */
   output_tokens?: number
-  total_tokens?: number
+  /** Cached tokens used in the execution. */
+  cached_tokens?: number
+  /** Number of requests made to models, agents, or tools. */
+  requests?: number
 }
 
 export interface AgentOutput {

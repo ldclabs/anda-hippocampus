@@ -265,18 +265,31 @@ pub enum WikiSearchMode {
     Docs,
 }
 
+/// The tool schema declares these fields nullable ("null searches all") and
+/// strict mode forces the model to send every key, but `#[serde(default)]`
+/// only covers a *missing* key — an explicit `null` fails on plain
+/// `Vec`/enum fields. Map `null` to the default so schema-conforming tool
+/// calls deserialize.
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct WikiSearchInput {
     pub query: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub namespaces: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub doc_ids: Vec<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub tags: Vec<String>,
     #[serde(default)]
     pub top_k: Option<usize>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub mode: WikiSearchMode,
     /// Neighbor expansion: widen each hit by up to N adjacent chunks on both
     /// sides (0–2, default 0). Hits expand independently (nearby hits may

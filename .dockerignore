@@ -1,0 +1,35 @@
+# Build context for anda_brain/Dockerfile (context is the repo root, and the
+# builder stage runs `COPY . .`). The Rust build only needs Cargo.toml,
+# Cargo.lock and anda_brain/ (the sole workspace member).
+
+# Secrets: never bake env files into image layers.
+.env*
+**/.env*
+# example.env holds placeholders only (no real keys), but the build does not
+# need it either, so it is excluded as well.
+example.env
+
+# Build outputs and dependency caches.
+target/
+debug/
+dist/
+node_modules/
+db/
+
+# VCS / CI / editor / agent metadata.
+.git/
+.github/
+.claude/
+.vscode/
+.agents/
+
+# Not needed for the Rust build.
+anda-brain-demo/
+anda-brain-openclaw/
+anda-cli/
+deploy/
+posts/
+skills/
+pnpm-lock.yaml
+pnpm-workspace.yaml
+tsconfig.json

@@ -21,6 +21,22 @@ StandardError=journal
 
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+# /home stays visible (binary and data live there) but read-only;
+# ReadWritePaths then re-enables writes for the data directory only.
+ProtectHome=read-only
+ReadWritePaths=/home/ec2-user/app
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallFilter=@system-service
+# Listens on an unprivileged port (8042); no capabilities required.
+CapabilityBoundingSet=
 
 [Install]
 WantedBy=multi-user.target

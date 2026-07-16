@@ -304,9 +304,19 @@ func (c *Client) AddSpaceToken(ctx context.Context, input *AddSpaceTokenInput) (
 	return &resp, nil
 }
 
-// RevokeSpaceToken revokes a space token (management).
+// RevokeSpaceToken revokes a space token by its full value (management).
 func (c *Client) RevokeSpaceToken(ctx context.Context, token string) (*RpcResponse[bool], error) {
-	input := RevokeSpaceTokenInput{Token: token}
+	return c.revokeSpaceToken(ctx, RevokeSpaceTokenInput{Token: token})
+}
+
+// RevokeSpaceTokenByName revokes a space token by its unique name (management).
+// This is the recovery path when the full token value was not saved at mint
+// time: ListSpaceTokens only echoes a display prefix.
+func (c *Client) RevokeSpaceTokenByName(ctx context.Context, name string) (*RpcResponse[bool], error) {
+	return c.revokeSpaceToken(ctx, RevokeSpaceTokenInput{Name: name})
+}
+
+func (c *Client) revokeSpaceToken(ctx context.Context, input RevokeSpaceTokenInput) (*RpcResponse[bool], error) {
 	data, err := c.doJSON(ctx, http.MethodPost, c.spacePath("/management/revoke_space_token"), input)
 	if err != nil {
 		return nil, err

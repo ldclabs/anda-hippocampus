@@ -70,6 +70,40 @@ impl FormationAgent {
         }
     }
 
+    /// Backfills the completed-conversation ring after a restart, mirroring
+    /// recall/maintenance `init` — without it the `history_formation` context
+    /// block stays empty until the next conversation completes. Formation
+    /// conversations live in the shared memory store under their ingesting
+    /// user, so there is no single-user list to query; walk backwards from
+    /// the newest conversation and keep the latest completed formation ones.
+    /// The scan is bounded: this is best-effort context, not recovery state.
+    pub async fn init(&self) -> Result<(), BoxError> {
+        // Matches the `push_completed_history` cap in `drive_runner_loop`.
+        const HISTORY_LEN: usize = 2;
+        const SCAN_LIMIT: u64 = 32;
+
+        // Collected newest-first; the runtime ring runs oldest -> newest.
+        let mut newest: Vec<Document> = Vec::with_capacity(HISTORY_LEN);
+        let mut id = self.memory.max_conversation_id();
+        let mut scanned = 0u64;
+        while id > 0 && scanned < SCAN_LIMIT && newest.len() < HISTORY_LEN {
+            scanned += 1;
+            if let Ok(conv) = self.memory.get_conversation(id).await
+                && conv.status == ConversationStatus::Completed
+                && conv
+                    .label
+                    .as_deref()
+                    .is_none_or(|label| label == "formation")
+            {
+                newest.push(Document::from(conv));
+            }
+            id -= 1;
+        }
+        newest.reverse();
+        *self.history.write() = newest.into();
+        Ok(())
+    }
+
     pub fn is_processing(&self) -> bool {
         self.processing_conversation.load(Ordering::SeqCst) != 0
     }

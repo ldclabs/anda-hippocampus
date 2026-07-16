@@ -531,24 +531,48 @@ type AddSpaceTokenInput struct {
 	Scope     TokenScope `json:"scope"`
 	Name      string     `json:"name"`
 	ExpiresAt *int64     `json:"expires_at,omitempty"`
+	// Labels restricts the token to wiki content carrying these ACL labels
+	// (plus unlabeled content). Nil = unrestricted. The server only accepts
+	// labels on read-scoped tokens.
+	Labels []string `json:"labels,omitempty"`
 }
 
 type RevokeSpaceTokenInput struct {
-	Token string `json:"token"`
+	// Token is the full token value to revoke. Leave empty when revoking by Name.
+	Token string `json:"token,omitempty"`
+	// Name revokes by the unique token name instead. This is the recovery path
+	// when the full value was not saved at mint time: list_space_tokens only
+	// echoes a display prefix.
+	Name string `json:"name,omitempty"`
 }
 
 type UpdateSpaceInput struct {
 	Name        *string `json:"name,omitempty"`
 	Description *string `json:"description,omitempty"`
 	Public      *bool   `json:"public,omitempty"`
+	// WikiDigest enables/disables the WikiDigest background extraction
+	// (disabled by default).
+	WikiDigest *bool `json:"wiki_digest,omitempty"`
+	// WikiAuditReads enables/disables read auditing for external wiki reads
+	// (disabled by default).
+	WikiAuditReads *bool `json:"wiki_audit_reads,omitempty"`
+	// WikiACLDefaults maps namespace -> default ACL label for newly created
+	// wiki documents. When present it replaces the whole map (a pointer to an
+	// empty map clears all defaults; nil leaves the map unchanged).
+	WikiACLDefaults *map[string]string `json:"wiki_acl_defaults,omitempty"`
 }
 
 type ModelConfig struct {
-	Family   string `json:"family"` // "gemini", "anthropic", "openai", "deepseek", "mimo" etc.
-	Model    string `json:"model"`
-	APIBase  string `json:"api_base"`
-	APIKey   string `json:"api_key"`
-	Disabled *bool  `json:"disabled,omitempty"`
+	Family        string `json:"family"` // "gemini", "anthropic", "openai", "deepseek", "mimo" etc.
+	Model         string `json:"model"`
+	APIBase       string `json:"api_base"`
+	APIKey        string `json:"api_key"`
+	Disabled      *bool  `json:"disabled,omitempty"`
+	Label         string `json:"label,omitempty"`
+	BearerAuth    bool   `json:"bearer_auth,omitempty"`
+	Stream        bool   `json:"stream,omitempty"`
+	ContextWindow int    `json:"context_window,omitempty"`
+	MaxOutput     int    `json:"max_output,omitempty"`
 }
 
 type RestartFormationInput struct {
@@ -587,6 +611,8 @@ type SpaceToken struct {
 	CreatedAt int64      `json:"created_at"`
 	UpdatedAt int64      `json:"updated_at"`
 	ExpiresAt *int64     `json:"expires_at,omitempty"`
+	// Labels are the wiki ACL labels this token may read (nil = unrestricted).
+	Labels []string `json:"labels,omitempty"`
 }
 
 type StorageStats map[string]any

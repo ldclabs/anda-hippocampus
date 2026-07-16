@@ -44,3 +44,38 @@ jobs:
         run: cargo clippy --all-targets --all-features
       - name: Run tests
         run: cargo test --workspace -- --nocapture
+  test-cli:
+    name: Test anda-cli (Go)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: anda-cli
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: anda-cli/go.mod
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Run tests
+        run: go test ./...
+  test-openclaw:
+    name: Test anda-brain-openclaw (TypeScript)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck
+        run: pnpm -C anda-brain-openclaw run typecheck
+      - name: Build
+        run: pnpm -C anda-brain-openclaw run build

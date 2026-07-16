@@ -336,6 +336,75 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for HeaderVals {
     }
 }
 
+// Drop-in replacements for the raw axum `Query`/`Path`/`Bytes` extractors.
+// The raw extractors reject with plain-text bodies (e.g. `?limit=abc`, a
+// non-numeric path segment, or a body over the size limit), which would
+// break the "error bodies are always JSON" contract before the handler even
+// runs. Handlers must use these wrappers, which re-emit the rejection
+// through the `AppError` JSON envelope with the rejection's own status.
+
+/// `axum::extract::Query` with JSON-enveloped rejections.
+pub struct AppQuery<T>(pub T);
+
+impl<S: Send + Sync, T: serde::de::DeserializeOwned> axum::extract::FromRequestParts<S>
+    for AppQuery<T>
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        match axum::extract::Query::<T>::from_request_parts(parts, state).await {
+            Ok(query) => Ok(AppQuery(query.0)),
+            Err(rejection) => Err(AppError::with_status(
+                rejection.status(),
+                rejection.body_text(),
+            )),
+        }
+    }
+}
+
+/// `axum::extract::Path` with JSON-enveloped rejections.
+pub struct AppPath<T>(pub T);
+
+impl<S: Send + Sync, T: serde::de::DeserializeOwned + Send> axum::extract::FromRequestParts<S>
+    for AppPath<T>
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        match axum::extract::Path::<T>::from_request_parts(parts, state).await {
+            Ok(path) => Ok(AppPath(path.0)),
+            Err(rejection) => Err(AppError::with_status(
+                rejection.status(),
+                rejection.body_text(),
+            )),
+        }
+    }
+}
+
+/// `axum::body::Bytes` with JSON-enveloped rejections (covers the body size
+/// limit's 413).
+pub struct AppBytes(pub axum::body::Bytes);
+
+impl<S: Send + Sync> axum::extract::FromRequest<S> for AppBytes {
+    type Rejection = AppError;
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        match axum::body::Bytes::from_request(req, state).await {
+            Ok(bytes) => Ok(AppBytes(bytes)),
+            Err(rejection) => Err(AppError::with_status(
+                rejection.status(),
+                rejection.body_text(),
+            )),
+        }
+    }
+}
+
 // ─── App Error ────────────────────────────────────────────────────────────────
 
 /// A typed error that converts to an HTTP response via `IntoResponse`.
@@ -457,7 +526,8 @@ impl<T: Serialize> IntoResponse for AppResponse<T> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Accept, AppError, ContentType, HeaderVals, PayloadFormat, StringOr, prefers_chinese,
+        Accept, AppError, AppQuery, ContentType, HeaderVals, PayloadFormat, StringOr,
+        prefers_chinese,
     };
     use axum::{
         body::to_bytes,
@@ -803,6 +873,37 @@ mod tests {
             .unwrap();
         assert_eq!(token, "");
         assert_eq!(sharding, 0);
+    }
+
+    #[tokio::test]
+    async fn app_query_rejection_is_json_enveloped() {
+        #[derive(Debug, Deserialize)]
+        struct DemoQuery {
+            #[allow(dead_code)]
+            limit: Option<usize>,
+        }
+
+        let req = Request::builder().uri("/x?limit=abc").body(()).unwrap();
+        let (mut parts, _) = req.into_parts();
+        let Err(err) = AppQuery::<DemoQuery>::from_request_parts(&mut parts, &()).await else {
+            panic!("expected the query rejection");
+        };
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+
+        // The raw axum extractor would reject with a plain-text body; the
+        // wrapper must uphold the "error bodies are always JSON" contract.
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body["error"]["message"].as_str().is_some());
     }
 
     #[tokio::test]

@@ -2819,14 +2819,13 @@ fn score_checkpoint(
     };
     if let Some(verdict) = verdict {
         for finding in &verdict.findings {
-            // A judge finding of a kind the harness already recorded is the
-            // same root cause when either side omits the expectation id or
-            // the ids match; keeping both would double-count against gates.
+            // A judge finding duplicates a harness finding only when both
+            // kind and expectation id match (None == None counts). Treating
+            // "either side omitted the id" as the same root cause would
+            // silently drop judge findings about expectations the harness
+            // never probed, skewing attribution counts and the finding gates.
             let duplicate = findings.iter().any(|existing| {
-                existing.kind == finding.kind
-                    && (finding.expectation_id.is_none()
-                        || existing.expectation_id.is_none()
-                        || existing.expectation_id == finding.expectation_id)
+                existing.kind == finding.kind && existing.expectation_id == finding.expectation_id
             });
             if !duplicate {
                 findings.push(finding.clone());
@@ -3583,8 +3582,10 @@ mod tests {
     #[tokio::test]
     async fn judge_findings_do_not_double_count_harness_findings() {
         // The probe finds nothing, so the harness records a FormationMiss for
-        // the expectation; the judge reports the same kind (no expectation id)
-        // plus a novel BadSynthesis. Only the novel finding may add.
+        // the expectation. The judge echoes that finding with the matching
+        // expectation id (merged), reports a second FormationMiss about a
+        // fact no expectation covers (kept — dedup is exact on (kind, id)),
+        // and adds a novel BadSynthesis (kept).
         let verdict = json!({
             "memory_utility": 0.2,
             "forgetting_quality": 1.0,
@@ -3592,7 +3593,8 @@ mod tests {
             "satisfaction": 0.4,
             "reasoning": "memory missing",
             "findings": [
-                {"kind": "formation_miss", "message": "graph never formed the fact"},
+                {"kind": "formation_miss", "message": "graph never formed the fact", "expectation_id": "missing"},
+                {"kind": "formation_miss", "message": "an uncovered fact is also absent"},
                 {"kind": "bad_synthesis", "message": "answer ignored the query"}
             ]
         });
@@ -3630,7 +3632,7 @@ mod tests {
 
         let report = run_scenario(&driver, &scenario, &profile).await.unwrap();
 
-        assert_eq!(report.attribution.formation_miss, 1);
+        assert_eq!(report.attribution.formation_miss, 2);
         assert_eq!(report.attribution.bad_synthesis, 1);
     }
 

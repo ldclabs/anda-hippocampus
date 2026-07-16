@@ -254,3 +254,104 @@ impl Tool<BaseCtx> for WikiCommitTool {
         Ok(ToolOutput::new(output))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wiki::{WikiSearchMode, WikiSelector};
+
+    // The strict tool schemas force the model to send every key and declare
+    // the optional ones nullable, so each Args type must accept explicit
+    // `null` for every nullable field — `Tool::call_raw` feeds the raw JSON
+    // straight into serde with no null preprocessing.
+
+    #[test]
+    fn wiki_search_args_accept_schema_conforming_nulls() {
+        let args: WikiSearchInput = serde_json::from_value(json!({
+            "query": "error code 42",
+            "namespaces": null,
+            "doc_ids": null,
+            "tags": null,
+            "top_k": null,
+            "mode": null,
+            "expand": null
+        }))
+        .unwrap();
+        assert_eq!(args.query, "error code 42");
+        assert!(args.namespaces.is_empty());
+        assert!(args.doc_ids.is_empty());
+        assert!(args.tags.is_empty());
+        assert_eq!(args.top_k, None);
+        assert_eq!(args.mode, WikiSearchMode::Chunks);
+        assert_eq!(args.expand, None);
+
+        // Non-null values still deserialize as before.
+        let args: WikiSearchInput = serde_json::from_value(json!({
+            "query": "q",
+            "namespaces": ["policy"],
+            "doc_ids": [7],
+            "tags": ["faq"],
+            "top_k": 3,
+            "mode": "docs",
+            "expand": 1
+        }))
+        .unwrap();
+        assert_eq!(args.namespaces, vec!["policy".to_string()]);
+        assert_eq!(args.doc_ids, vec![7]);
+        assert_eq!(args.mode, WikiSearchMode::Docs);
+    }
+
+    #[test]
+    fn wiki_read_args_accept_schema_conforming_nulls() {
+        for (selector_json, expected) in [
+            (
+                json!({"type": "toc", "anchor": null, "start": null, "end": null}),
+                WikiSelector::Toc,
+            ),
+            (
+                json!({"type": "section", "anchor": "h-intro", "start": null, "end": null}),
+                WikiSelector::Section {
+                    anchor: "h-intro".to_string(),
+                },
+            ),
+            (
+                json!({"type": "range", "anchor": null, "start": 0, "end": 128}),
+                WikiSelector::Range { start: 0, end: 128 },
+            ),
+            (
+                json!({"type": "full", "anchor": null, "start": null, "end": null}),
+                WikiSelector::Full,
+            ),
+        ] {
+            let args: WikiReadInput = serde_json::from_value(json!({
+                "doc_id": 1,
+                "version": null,
+                "selector": selector_json
+            }))
+            .unwrap();
+            assert_eq!(args.doc_id, 1);
+            assert_eq!(args.version, None);
+            assert_eq!(args.selector, expected);
+        }
+    }
+
+    #[test]
+    fn wiki_commit_args_accept_schema_conforming_nulls() {
+        let args: WikiCommitInput = serde_json::from_value(json!({
+            "doc_id": null,
+            "parent_version": null,
+            "namespace": null,
+            "slug": null,
+            "title": "Refund policy",
+            "content": "# Refund policy",
+            "tags": null,
+            "source_uri": null,
+            "message": null,
+            "acl_label": null
+        }))
+        .unwrap();
+        assert_eq!(args.title, "Refund policy");
+        assert!(args.doc_id.is_none());
+        assert!(args.tags.is_none());
+    }
+}

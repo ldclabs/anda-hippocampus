@@ -529,6 +529,85 @@ mod tests {
         }
     }
 
+    /// Converges on the first turn (final answer, no tool calls) while
+    /// reporting input-token usage far above the compaction threshold, so the
+    /// loop iteration right after convergence sees `needs_compaction`.
+    #[derive(Debug)]
+    struct HugeUsageFinalCompleter;
+
+    impl CompletionFeaturesDyn for HugeUsageFinalCompleter {
+        fn model_name(&self) -> String {
+            "maintenance-huge-usage-test-model".to_string()
+        }
+
+        fn completion(&self, _req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+            Box::pin(async move {
+                Ok(AgentOutput {
+                    content: "maintained".to_string(),
+                    usage: Usage {
+                        input_tokens: 200_000,
+                        output_tokens: 10,
+                        requests: 1,
+                        ..Default::default()
+                    },
+                    chat_history: vec![Message {
+                        role: "assistant".to_string(),
+                        content: vec!["maintained".to_string().into()],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
+    /// Emits one over-threshold tool-call turn, then an empty summary for the
+    /// compaction handoff turn (tools cleared), making `handoff()` fail after
+    /// its internal finalize already drained the runner's total usage.
+    #[derive(Debug)]
+    struct CompactionFailingCompleter;
+
+    impl CompletionFeaturesDyn for CompactionFailingCompleter {
+        fn model_name(&self) -> String {
+            "maintenance-compaction-failing-test-model".to_string()
+        }
+
+        fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+            Box::pin(async move {
+                if req.tools.is_empty() {
+                    // Compaction handoff turn: an empty summary makes
+                    // handoff() return Err after finalize drained usage.
+                    return Ok(AgentOutput {
+                        content: "  ".to_string(),
+                        usage: Usage {
+                            input_tokens: 5_000,
+                            output_tokens: 1,
+                            requests: 1,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    });
+                }
+                Ok(AgentOutput {
+                    tool_calls: vec![ToolCall {
+                        name: "execute_kip".to_string(),
+                        args: serde_json::json!({"commands": []}),
+                        result: None,
+                        call_id: Some("over-threshold".to_string()),
+                        remote_id: None,
+                    }],
+                    usage: Usage {
+                        input_tokens: 200_000,
+                        output_tokens: 10,
+                        requests: 1,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
     /// Emits an endless stream of tool calls (a non-converging model), and a
     /// summary for compaction handoff requests so the runner keeps looping.
     #[derive(Debug)]
@@ -746,6 +825,82 @@ mod tests {
         assert!(err.to_string().contains("invalid MaintenanceInput"));
         assert!(!maintenance.is_processing());
         assert_eq!(maintenance.conversations.conversations.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn process_one_convergence_survives_pending_compaction_check() {
+        // Regression: maintenance runs the runner in bound mode and
+        // `after_turn` keeps looping after convergence, so the next loop
+        // iteration runs the compaction check against a finished runner.
+        // Handing it off would flip the persisted Completed conversation to
+        // Failed ("completion already finalized") and zero its usage.
+        let app =
+            test_app_state_with_completer("maintenance_compact_done", HugeUsageFinalCompleter);
+        let space = create_loaded_space(&app, "maintenance_compact_done").await;
+        let maintenance = space.maintenance_for_test();
+        let ctx = space
+            .ctx_for_test(SELF_USER_ID, MaintenanceAgent::NAME)
+            .unwrap();
+        let mut conversation = stored_conversation(
+            &maintenance,
+            vec![json!(Message {
+                role: "user".to_string(),
+                content: vec![maintenance_prompt(MaintenanceScope::Quick).into()],
+                ..Default::default()
+            })],
+        )
+        .await;
+
+        maintenance.process_one(&ctx, &mut conversation).await;
+
+        assert_eq!(conversation.status, ConversationStatus::Completed);
+        assert!(conversation.failed_reason.is_none());
+        assert_eq!(conversation.usage.input_tokens, 200_000);
+        let stored = maintenance
+            .conversations
+            .get_conversation(conversation._id)
+            .await
+            .unwrap();
+        assert_eq!(stored.status, ConversationStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn failed_compaction_handoff_keeps_accumulated_usage() {
+        // Regression: handoff()'s internal finalize mem::takes the runner's
+        // total usage into an output that handoff drops when the
+        // summarization turn produces an empty summary. Without the restore
+        // in compact_runner_if_needed the failure exit would backfill zero
+        // usage over the tokens already paid for.
+        let app =
+            test_app_state_with_completer("maintenance_compact_failed", CompactionFailingCompleter);
+        let space = create_loaded_space(&app, "maintenance_compact_failed").await;
+        let maintenance = space.maintenance_for_test();
+        let ctx = space
+            .ctx_for_test(SELF_USER_ID, MaintenanceAgent::NAME)
+            .unwrap();
+        let mut conversation = stored_conversation(
+            &maintenance,
+            vec![json!(Message {
+                role: "user".to_string(),
+                content: vec![maintenance_prompt(MaintenanceScope::Quick).into()],
+                ..Default::default()
+            })],
+        )
+        .await;
+
+        maintenance.process_one(&ctx, &mut conversation).await;
+
+        assert_eq!(conversation.status, ConversationStatus::Failed);
+        assert!(
+            conversation
+                .failed_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("empty summary")
+        );
+        // The pre-handoff total survives; only the failed summarization
+        // turn's own usage is unknowable and lost.
+        assert_eq!(conversation.usage.input_tokens, 200_000);
     }
 
     #[tokio::test]

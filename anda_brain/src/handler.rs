@@ -1,8 +1,7 @@
 use anda_engine::{memory::Conversation, unix_ms};
 use axum::{
     Json,
-    body::Bytes,
-    extract::{Path, Query, State},
+    extract::State,
     response::{IntoResponse, Response},
 };
 use http::StatusCode;
@@ -14,7 +13,10 @@ use serde_json::json;
 use crate::{
     agents::SELF_USER_ID,
     authz::{AuthzError, AuthzMode, authorize, check_cwt, ensure_sharding, load_space},
-    payload::{Accept, AppError, ContentType, HeaderVals, PayloadFormat, RpcResponse, StringOr},
+    payload::{
+        Accept, AppBytes, AppError, AppPath, AppQuery, ContentType, HeaderVals, PayloadFormat,
+        RpcResponse, StringOr,
+    },
     space::AppState,
     types::*,
     wiki::{
@@ -59,7 +61,7 @@ pub async fn get_skill(State(_app): State<AppState>) -> impl IntoResponse {
 /// GET /v1/{space_id}/info
 pub async fn get_info(
     State(app): State<AppState>,
-    Path(space_id): Path<String>,
+    AppPath(space_id): AppPath<String>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
 ) -> Result<impl IntoResponse, AppError> {
@@ -81,7 +83,7 @@ pub async fn get_info(
 /// GET /v1/{space_id}/formation_status
 pub async fn get_formation_status(
     State(app): State<AppState>,
-    Path(space_id): Path<String>,
+    AppPath(space_id): AppPath<String>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
 ) -> Result<impl IntoResponse, AppError> {
@@ -103,10 +105,10 @@ pub async fn get_formation_status(
 /// POST /v1/{space_id}/formation
 pub async fn post_formation(
     State(app): State<AppState>,
-    Path(space_id): Path<String>,
+    AppPath(space_id): AppPath<String>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
-    body: Bytes,
+    AppBytes(body): AppBytes,
 ) -> Result<Response, AppError> {
     ensure_sharding(&app, sharding)?;
 
@@ -143,10 +145,10 @@ pub async fn post_formation(
 /// POST /v1/{space_id}/recall
 pub async fn post_recall(
     State(app): State<AppState>,
-    Path(space_id): Path<String>,
+    AppPath(space_id): AppPath<String>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
-    body: Bytes,
+    AppBytes(body): AppBytes,
 ) -> Result<impl IntoResponse, AppError> {
     ensure_sharding(&app, sharding)?;
 
@@ -188,10 +190,10 @@ pub async fn post_recall(
 /// `found`/`uncertainty`, so callers can decide to assert, hedge, or ask.
 pub async fn post_recall_structured(
     State(app): State<AppState>,
-    Path(space_id): Path<String>,
+    AppPath(space_id): AppPath<String>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
-    body: Bytes,
+    AppBytes(body): AppBytes,
 ) -> Result<impl IntoResponse, AppError> {
     ensure_sharding(&app, sharding)?;
 
@@ -230,10 +232,10 @@ pub async fn post_recall_structured(
 /// search that tells the caller whether a full recall is worth paying for.
 pub async fn post_probe(
     State(app): State<AppState>,
-    Path(space_id): Path<String>,
+    AppPath(space_id): AppPath<String>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
-    body: Bytes,
+    AppBytes(body): AppBytes,
 ) -> Result<impl IntoResponse, AppError> {
     ensure_sharding(&app, sharding)?;
 
@@ -268,10 +270,10 @@ pub async fn post_probe(
 /// are exempt from confidence decay.
 pub async fn post_memory_pin(
     State(app): State<AppState>,
-    Path(space_id): Path<String>,
+    AppPath(space_id): AppPath<String>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
-    body: Bytes,
+    AppBytes(body): AppBytes,
 ) -> Result<impl IntoResponse, AppError> {
     ensure_sharding(&app, sharding)?;
 
@@ -308,10 +310,10 @@ pub async fn post_memory_pin(
 /// `dry_run: true` first; the report shows what would be removed.
 pub async fn post_memory_forget(
     State(app): State<AppState>,
-    Path(space_id): Path<String>,
+    AppPath(space_id): AppPath<String>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
-    body: Bytes,
+    AppBytes(body): AppBytes,
 ) -> Result<impl IntoResponse, AppError> {
     ensure_sharding(&app, sharding)?;
 
@@ -345,7 +347,7 @@ pub async fn post_memory_forget(
 /// latest settlement/self-test/shadow reports.
 pub async fn get_memory_status(
     State(app): State<AppState>,
-    Path(space_id): Path<String>,
+    AppPath(space_id): AppPath<String>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
 ) -> Result<impl IntoResponse, AppError> {
@@ -372,10 +374,10 @@ pub async fn get_memory_status(
 /// judging); management-scoped.
 pub async fn post_shadow_eval(
     State(app): State<AppState>,
-    Path(space_id): Path<String>,
+    AppPath(space_id): AppPath<String>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
-    body: Bytes,
+    AppBytes(body): AppBytes,
 ) -> Result<impl IntoResponse, AppError> {
     ensure_sharding(&app, sharding)?;
 
@@ -461,10 +463,10 @@ pub struct WikiEventsQuery {
 /// POST /v1/{space_id}/wiki/docs — commit (create or CAS update)
 pub async fn post_wiki_commit(
     State(app): State<AppState>,
-    Path(space_id): Path<String>,
+    AppPath(space_id): AppPath<String>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
-    body: Bytes,
+    AppBytes(body): AppBytes,
 ) -> Result<impl IntoResponse, AppError> {
     ensure_sharding(&app, sharding)?;
 
@@ -498,8 +500,8 @@ pub async fn post_wiki_commit(
 /// GET /v1/{space_id}/wiki/docs
 pub async fn list_wiki_docs(
     State(app): State<AppState>,
-    Path(space_id): Path<String>,
-    Query(q): Query<WikiDocsQuery>,
+    AppPath(space_id): AppPath<String>,
+    AppQuery(q): AppQuery<WikiDocsQuery>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
 ) -> Result<impl IntoResponse, AppError> {
@@ -539,7 +541,7 @@ pub async fn list_wiki_docs(
 /// GET /v1/{space_id}/wiki/docs/{doc_id} — metadata + TOC
 pub async fn get_wiki_doc(
     State(app): State<AppState>,
-    Path((space_id, doc_id)): Path<(String, u64)>,
+    AppPath((space_id, doc_id)): AppPath<(String, u64)>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
 ) -> Result<impl IntoResponse, AppError> {
@@ -581,8 +583,8 @@ pub async fn get_wiki_doc(
 /// the bounded full text; `?version=` time-travels.
 pub async fn get_wiki_content(
     State(app): State<AppState>,
-    Path((space_id, doc_id)): Path<(String, u64)>,
-    Query(q): Query<WikiContentQuery>,
+    AppPath((space_id, doc_id)): AppPath<(String, u64)>,
+    AppQuery(q): AppQuery<WikiContentQuery>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
 ) -> Result<impl IntoResponse, AppError> {
@@ -625,8 +627,8 @@ pub async fn get_wiki_content(
 /// GET /v1/{space_id}/wiki/docs/{doc_id}/versions
 pub async fn list_wiki_versions(
     State(app): State<AppState>,
-    Path((space_id, doc_id)): Path<(String, u64)>,
-    Query(pg): Query<WikiPageQuery>,
+    AppPath((space_id, doc_id)): AppPath<(String, u64)>,
+    AppQuery(pg): AppQuery<WikiPageQuery>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
 ) -> Result<impl IntoResponse, AppError> {
@@ -657,7 +659,7 @@ pub async fn list_wiki_versions(
 /// POST /v1/{space_id}/wiki/docs/{doc_id}/archive
 pub async fn post_wiki_archive(
     State(app): State<AppState>,
-    Path((space_id, doc_id)): Path<(String, u64)>,
+    AppPath((space_id, doc_id)): AppPath<(String, u64)>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
 ) -> Result<impl IntoResponse, AppError> {
@@ -667,7 +669,7 @@ pub async fn post_wiki_archive(
 /// POST /v1/{space_id}/wiki/docs/{doc_id}/restore
 pub async fn post_wiki_restore(
     State(app): State<AppState>,
-    Path((space_id, doc_id)): Path<(String, u64)>,
+    AppPath((space_id, doc_id)): AppPath<(String, u64)>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
 ) -> Result<impl IntoResponse, AppError> {
@@ -708,10 +710,10 @@ async fn wiki_set_archived(
 /// POST /v1/{space_id}/wiki/search
 pub async fn post_wiki_search(
     State(app): State<AppState>,
-    Path(space_id): Path<String>,
+    AppPath(space_id): AppPath<String>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
-    body: Bytes,
+    AppBytes(body): AppBytes,
 ) -> Result<impl IntoResponse, AppError> {
     ensure_sharding(&app, sharding)?;
 
@@ -745,10 +747,10 @@ pub async fn post_wiki_search(
 /// POST /v1/{space_id}/wiki/verify — citation verification
 pub async fn post_wiki_verify(
     State(app): State<AppState>,
-    Path(space_id): Path<String>,
+    AppPath(space_id): AppPath<String>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
-    body: Bytes,
+    AppBytes(body): AppBytes,
 ) -> Result<impl IntoResponse, AppError> {
     ensure_sharding(&app, sharding)?;
 
@@ -784,8 +786,8 @@ pub async fn post_wiki_verify(
 /// GET /v1/{space_id}/wiki/events
 pub async fn list_wiki_events(
     State(app): State<AppState>,
-    Path(space_id): Path<String>,
-    Query(q): Query<WikiEventsQuery>,
+    AppPath(space_id): AppPath<String>,
+    AppQuery(q): AppQuery<WikiEventsQuery>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
 ) -> Result<impl IntoResponse, AppError> {
@@ -825,10 +827,10 @@ pub struct WikiExportQuery {
 /// POST /v1/{space_id}/wiki/import — OKF bundle import (requires All scope)
 pub async fn post_wiki_import(
     State(app): State<AppState>,
-    Path(space_id): Path<String>,
+    AppPath(space_id): AppPath<String>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
-    body: Bytes,
+    AppBytes(body): AppBytes,
 ) -> Result<impl IntoResponse, AppError> {
     ensure_sharding(&app, sharding)?;
 
@@ -863,8 +865,8 @@ pub async fn post_wiki_import(
 /// GET /v1/{space_id}/wiki/export?namespace= — OKF bundle export (requires All scope)
 pub async fn get_wiki_export(
     State(app): State<AppState>,
-    Path(space_id): Path<String>,
-    Query(q): Query<WikiExportQuery>,
+    AppPath(space_id): AppPath<String>,
+    AppQuery(q): AppQuery<WikiExportQuery>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
 ) -> Result<impl IntoResponse, AppError> {
@@ -893,7 +895,7 @@ pub async fn get_wiki_export(
 /// Cognitive Nexus (requires the space to have wiki_digest enabled)
 pub async fn post_wiki_digest(
     State(app): State<AppState>,
-    Path(space_id): Path<String>,
+    AppPath(space_id): AppPath<String>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
 ) -> Result<impl IntoResponse, AppError> {
@@ -918,10 +920,10 @@ pub async fn post_wiki_digest(
 /// POST /v1/{space_id}/maintenance
 pub async fn post_maintenance(
     State(app): State<AppState>,
-    Path(space_id): Path<String>,
+    AppPath(space_id): AppPath<String>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
-    body: Bytes,
+    AppBytes(body): AppBytes,
 ) -> Result<impl IntoResponse, AppError> {
     ensure_sharding(&app, sharding)?;
 
@@ -958,10 +960,10 @@ pub async fn post_maintenance(
 /// POST /v1/{space_id}/execute_kip_readonly
 pub async fn execute_kip_readonly(
     State(app): State<AppState>,
-    Path(space_id): Path<String>,
+    AppPath(space_id): AppPath<String>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
-    body: Bytes,
+    AppBytes(body): AppBytes,
 ) -> Result<impl IntoResponse, AppError> {
     ensure_sharding(&app, sharding)?;
 
@@ -992,10 +994,10 @@ pub async fn execute_kip_readonly(
 /// POST /v1/{space_id}/get_or_init_user
 pub async fn get_or_init_user(
     State(app): State<AppState>,
-    Path(space_id): Path<String>,
+    AppPath(space_id): AppPath<String>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
-    body: Bytes,
+    AppBytes(body): AppBytes,
 ) -> Result<impl IntoResponse, AppError> {
     ensure_sharding(&app, sharding)?;
 
@@ -1066,8 +1068,8 @@ async fn load_authorized_conversation(
 /// GET /v1/{space_id}/conversations/{conversation_id}
 pub async fn get_conversation(
     State(app): State<AppState>,
-    Path((space_id, conversation_id)): Path<(String, String)>,
-    Query(dq): Query<ConversationDeltaQuery>,
+    AppPath((space_id, conversation_id)): AppPath<(String, String)>,
+    AppQuery(dq): AppQuery<ConversationDeltaQuery>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
 ) -> Result<impl IntoResponse, AppError> {
@@ -1086,8 +1088,8 @@ pub async fn get_conversation(
 /// GET /v1/{space_id}/conversations/{conversation_id}/delta
 pub async fn get_conversation_delta(
     State(app): State<AppState>,
-    Path((space_id, conversation_id)): Path<(String, String)>,
-    Query(dq): Query<ConversationDeltaQuery>,
+    AppPath((space_id, conversation_id)): AppPath<(String, String)>,
+    AppQuery(dq): AppQuery<ConversationDeltaQuery>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
 ) -> Result<impl IntoResponse, AppError> {
@@ -1109,8 +1111,8 @@ pub async fn get_conversation_delta(
 /// GET /v1/{space_id}/conversations
 pub async fn list_conversations(
     State(app): State<AppState>,
-    Path(space_id): Path<String>,
-    Query(pg): Query<Pagination>,
+    AppPath(space_id): AppPath<String>,
+    AppQuery(pg): AppQuery<Pagination>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
 ) -> Result<impl IntoResponse, AppError> {
@@ -1147,7 +1149,7 @@ pub async fn list_conversations(
 /// GET /v1/{space_id}/management/space_tokens
 pub async fn list_space_tokens(
     State(app): State<AppState>,
-    Path(space_id): Path<String>,
+    AppPath(space_id): AppPath<String>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
 ) -> Result<impl IntoResponse, AppError> {
@@ -1169,10 +1171,10 @@ pub async fn list_space_tokens(
 /// POST /v1/{space_id}/management/add_space_token
 pub async fn add_space_token(
     State(app): State<AppState>,
-    Path(space_id): Path<String>,
+    AppPath(space_id): AppPath<String>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
-    body: Bytes,
+    AppBytes(body): AppBytes,
 ) -> Result<impl IntoResponse, AppError> {
     ensure_sharding(&app, sharding)?;
 
@@ -1215,10 +1217,10 @@ pub async fn add_space_token(
 /// POST /v1/{space_id}/management/revoke_space_token
 pub async fn revoke_space_token(
     State(app): State<AppState>,
-    Path(space_id): Path<String>,
+    AppPath(space_id): AppPath<String>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
-    body: Bytes,
+    AppBytes(body): AppBytes,
 ) -> Result<impl IntoResponse, AppError> {
     ensure_sharding(&app, sharding)?;
 
@@ -1253,10 +1255,10 @@ pub async fn revoke_space_token(
 /// PATCH /v1/{space_id}/management/update_space
 pub async fn update_space(
     State(app): State<AppState>,
-    Path(space_id): Path<String>,
+    AppPath(space_id): AppPath<String>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
-    body: Bytes,
+    AppBytes(body): AppBytes,
 ) -> Result<impl IntoResponse, AppError> {
     ensure_sharding(&app, sharding)?;
 
@@ -1283,10 +1285,10 @@ pub async fn update_space(
 /// PATCH /v1/{space_id}/management/restart_formation
 pub async fn restart_formation(
     State(app): State<AppState>,
-    Path(space_id): Path<String>,
+    AppPath(space_id): AppPath<String>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
-    body: Bytes,
+    AppBytes(body): AppBytes,
 ) -> Result<impl IntoResponse, AppError> {
     ensure_sharding(&app, sharding)?;
 
@@ -1312,7 +1314,7 @@ pub async fn restart_formation(
 /// GET /v1/{space_id}/management/space_byok
 pub async fn get_byok(
     State(app): State<AppState>,
-    Path(space_id): Path<String>,
+    AppPath(space_id): AppPath<String>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
 ) -> Result<impl IntoResponse, AppError> {
@@ -1334,10 +1336,10 @@ pub async fn get_byok(
 /// PATCH /v1/{space_id}/management/space_byok
 pub async fn update_byok(
     State(app): State<AppState>,
-    Path(space_id): Path<String>,
+    AppPath(space_id): AppPath<String>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
-    body: Bytes,
+    AppBytes(body): AppBytes,
 ) -> Result<impl IntoResponse, AppError> {
     ensure_sharding(&app, sharding)?;
 
@@ -1367,7 +1369,7 @@ pub async fn create_space(
     State(app): State<AppState>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
-    body: Bytes,
+    AppBytes(body): AppBytes,
 ) -> Result<impl IntoResponse, AppError> {
     let now_ms = unix_ms();
     let token = app
@@ -1392,10 +1394,10 @@ pub async fn create_space(
 /// POST /admin/{space_id}/update_space_tier
 pub async fn update_space_tier(
     State(app): State<AppState>,
-    Path(space_id): Path<String>,
+    AppPath(space_id): AppPath<String>,
     Accept(ct, _): Accept,
     HeaderVals(token, sharding): HeaderVals,
-    body: Bytes,
+    AppBytes(body): AppBytes,
 ) -> Result<impl IntoResponse, AppError> {
     let now_ms = unix_ms();
     let _ = app
@@ -1444,7 +1446,7 @@ mod tests {
     use crate::{
         agents::SELF_USER_ID,
         authz::wiki_read_access,
-        payload::{Accept, AppError, HeaderVals, PayloadFormat},
+        payload::{Accept, AppBytes, AppError, AppPath, AppQuery, HeaderVals, PayloadFormat},
         space::{AppState, Space},
         types::{
             AddSpaceTokenInput, ConversationDeltaQuery, CreateOrUpdateSpaceInput, FormationInput,
@@ -1463,7 +1465,7 @@ mod tests {
     };
     use axum::{
         body::{Bytes, to_bytes},
-        extract::{Path, Query, State},
+        extract::State,
         http::{HeaderMap, StatusCode, header},
         response::{IntoResponse, Response},
     };
@@ -1627,8 +1629,8 @@ mod tests {
         HeaderVals(String::new(), app.sharding)
     }
 
-    fn json_bytes<T: Serialize>(value: &T) -> Bytes {
-        Bytes::from(serde_json::to_vec(value).unwrap())
+    fn json_bytes<T: Serialize>(value: &T) -> AppBytes {
+        AppBytes(Bytes::from(serde_json::to_vec(value).unwrap()))
     }
 
     async fn response_text(response: Response) -> String {
@@ -1759,7 +1761,7 @@ mod tests {
         let info = ok_json(
             get_info(
                 State(app.clone()),
-                Path(space_id.clone()),
+                AppPath(space_id.clone()),
                 accept_json(),
                 headers(&app),
             )
@@ -1777,7 +1779,7 @@ mod tests {
         let updated = ok_json(
             update_space(
                 State(app.clone()),
-                Path(space_id.clone()),
+                AppPath(space_id.clone()),
                 accept_json(),
                 headers(&app),
                 json_bytes(&update_input),
@@ -1790,7 +1792,7 @@ mod tests {
         let info = ok_json(
             get_info(
                 State(app.clone()),
-                Path(space_id.clone()),
+                AppPath(space_id.clone()),
                 accept_json(),
                 HeaderVals("not-a-token".to_string(), app.sharding),
             )
@@ -1803,7 +1805,7 @@ mod tests {
         let status = ok_json(
             get_formation_status(
                 State(app.clone()),
-                Path(space_id.clone()),
+                AppPath(space_id.clone()),
                 accept_json(),
                 headers(&app),
             )
@@ -1823,7 +1825,7 @@ mod tests {
         let byok_updated = ok_json(
             update_byok(
                 State(app.clone()),
-                Path(space_id.clone()),
+                AppPath(space_id.clone()),
                 accept_json(),
                 headers(&app),
                 json_bytes(&byok),
@@ -1836,7 +1838,7 @@ mod tests {
         let byok_result = ok_json(
             get_byok(
                 State(app.clone()),
-                Path(space_id.clone()),
+                AppPath(space_id.clone()),
                 accept_json(),
                 headers(&app),
             )
@@ -1854,7 +1856,7 @@ mod tests {
         let added = ok_json(
             add_space_token(
                 State(app.clone()),
-                Path(space_id.clone()),
+                AppPath(space_id.clone()),
                 accept_json(),
                 headers(&app),
                 json_bytes(&token_input),
@@ -1868,7 +1870,7 @@ mod tests {
         let tokens = ok_json(
             list_space_tokens(
                 State(app.clone()),
-                Path(space_id.clone()),
+                AppPath(space_id.clone()),
                 accept_json(),
                 headers(&app),
             )
@@ -1880,7 +1882,7 @@ mod tests {
         let revoked = ok_json(
             revoke_space_token(
                 State(app.clone()),
-                Path(space_id.clone()),
+                AppPath(space_id.clone()),
                 accept_json(),
                 headers(&app),
                 json_bytes(&RevokeSpaceTokenInput {
@@ -1896,7 +1898,7 @@ mod tests {
         let mismatched_tier = err_json(
             update_space_tier(
                 State(app.clone()),
-                Path(space_id.clone()),
+                AppPath(space_id.clone()),
                 accept_json(),
                 headers(&app),
                 json_bytes(&CreateOrUpdateSpaceInput {
@@ -1919,7 +1921,7 @@ mod tests {
         let tier = ok_json(
             update_space_tier(
                 State(app.clone()),
-                Path(space_id.clone()),
+                AppPath(space_id.clone()),
                 accept_json(),
                 headers(&app),
                 json_bytes(&CreateOrUpdateSpaceInput {
@@ -1936,7 +1938,7 @@ mod tests {
         let sharding_err = err_json(
             get_info(
                 State(app),
-                Path(space_id),
+                AppPath(space_id),
                 accept_json(),
                 HeaderVals(String::new(), 99),
             )
@@ -1988,7 +1990,7 @@ mod tests {
         let byok_denied = err_json(
             get_byok(
                 State(app.clone()),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_json(),
                 HeaderVals(read_cwt.clone(), 0),
             )
@@ -2004,7 +2006,7 @@ mod tests {
         let tokens_denied = err_json(
             list_space_tokens(
                 State(app.clone()),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_json(),
                 HeaderVals(read_cwt, 0),
             )
@@ -2020,7 +2022,7 @@ mod tests {
         let byok = ok_json(
             get_byok(
                 State(app.clone()),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_json(),
                 HeaderVals(write_cwt.clone(), 0),
             )
@@ -2032,7 +2034,7 @@ mod tests {
         let tokens = ok_json(
             list_space_tokens(
                 State(app),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_json(),
                 HeaderVals(write_cwt, 0),
             )
@@ -2072,7 +2074,7 @@ mod tests {
         let info = err_json(
             get_info(
                 State(app.clone()),
-                Path(space_id.clone()),
+                AppPath(space_id.clone()),
                 accept_json(),
                 wrong(),
             )
@@ -2090,7 +2092,7 @@ mod tests {
         let _ = err_json(
             get_formation_status(
                 State(app.clone()),
-                Path(space_id.clone()),
+                AppPath(space_id.clone()),
                 accept_json(),
                 wrong(),
             )
@@ -2101,10 +2103,10 @@ mod tests {
         let _ = err_json(
             post_formation(
                 State(app.clone()),
-                Path(space_id.clone()),
+                AppPath(space_id.clone()),
                 accept_json(),
                 wrong(),
-                Bytes::new(),
+                AppBytes(Bytes::new()),
             )
             .await,
             StatusCode::BAD_REQUEST,
@@ -2113,10 +2115,10 @@ mod tests {
         let _ = err_json(
             post_recall(
                 State(app.clone()),
-                Path(space_id.clone()),
+                AppPath(space_id.clone()),
                 accept_json(),
                 wrong(),
-                Bytes::new(),
+                AppBytes(Bytes::new()),
             )
             .await,
             StatusCode::BAD_REQUEST,
@@ -2125,10 +2127,10 @@ mod tests {
         let _ = err_json(
             post_maintenance(
                 State(app.clone()),
-                Path(space_id.clone()),
+                AppPath(space_id.clone()),
                 accept_json(),
                 wrong(),
-                Bytes::new(),
+                AppBytes(Bytes::new()),
             )
             .await,
             StatusCode::BAD_REQUEST,
@@ -2137,10 +2139,10 @@ mod tests {
         let _ = err_json(
             execute_kip_readonly(
                 State(app.clone()),
-                Path(space_id.clone()),
+                AppPath(space_id.clone()),
                 accept_json(),
                 wrong(),
-                Bytes::new(),
+                AppBytes(Bytes::new()),
             )
             .await,
             StatusCode::BAD_REQUEST,
@@ -2149,10 +2151,10 @@ mod tests {
         let _ = err_json(
             get_or_init_user(
                 State(app.clone()),
-                Path(space_id.clone()),
+                AppPath(space_id.clone()),
                 accept_json(),
                 wrong(),
-                Bytes::new(),
+                AppBytes(Bytes::new()),
             )
             .await,
             StatusCode::BAD_REQUEST,
@@ -2161,8 +2163,8 @@ mod tests {
         let _ = err_json(
             get_conversation(
                 State(app.clone()),
-                Path((space_id.clone(), "1".to_string())),
-                Query(ConversationDeltaQuery {
+                AppPath((space_id.clone(), "1".to_string())),
+                AppQuery(ConversationDeltaQuery {
                     messages_offset: None,
                     artifacts_offset: None,
                     collection: None,
@@ -2177,8 +2179,8 @@ mod tests {
         let _ = err_json(
             get_conversation_delta(
                 State(app.clone()),
-                Path((space_id.clone(), "1".to_string())),
-                Query(ConversationDeltaQuery {
+                AppPath((space_id.clone(), "1".to_string())),
+                AppQuery(ConversationDeltaQuery {
                     messages_offset: None,
                     artifacts_offset: None,
                     collection: None,
@@ -2193,8 +2195,8 @@ mod tests {
         let _ = err_json(
             list_conversations(
                 State(app.clone()),
-                Path(space_id.clone()),
-                Query(Pagination {
+                AppPath(space_id.clone()),
+                AppQuery(Pagination {
                     cursor: None,
                     limit: None,
                     collection: None,
@@ -2210,7 +2212,7 @@ mod tests {
         let _ = err_json(
             list_space_tokens(
                 State(app.clone()),
-                Path(space_id.clone()),
+                AppPath(space_id.clone()),
                 accept_json(),
                 wrong(),
             )
@@ -2221,7 +2223,7 @@ mod tests {
         let _ = err_json(
             add_space_token(
                 State(app.clone()),
-                Path(space_id.clone()),
+                AppPath(space_id.clone()),
                 accept_json(),
                 wrong(),
                 json_bytes(&token_input),
@@ -2233,7 +2235,7 @@ mod tests {
         let _ = err_json(
             revoke_space_token(
                 State(app.clone()),
-                Path(space_id.clone()),
+                AppPath(space_id.clone()),
                 accept_json(),
                 wrong(),
                 json_bytes(&RevokeSpaceTokenInput {
@@ -2248,7 +2250,7 @@ mod tests {
         let _ = err_json(
             update_space(
                 State(app.clone()),
-                Path(space_id.clone()),
+                AppPath(space_id.clone()),
                 accept_json(),
                 wrong(),
                 json_bytes(&update_input),
@@ -2260,7 +2262,7 @@ mod tests {
         let _ = err_json(
             restart_formation(
                 State(app.clone()),
-                Path(space_id.clone()),
+                AppPath(space_id.clone()),
                 accept_json(),
                 wrong(),
                 json_bytes(&FormationRestartInput { conversation: 1 }),
@@ -2272,7 +2274,7 @@ mod tests {
         let _ = err_json(
             get_byok(
                 State(app.clone()),
-                Path(space_id.clone()),
+                AppPath(space_id.clone()),
                 accept_json(),
                 wrong(),
             )
@@ -2283,10 +2285,10 @@ mod tests {
         let _ = err_json(
             update_byok(
                 State(app.clone()),
-                Path(space_id.clone()),
+                AppPath(space_id.clone()),
                 accept_json(),
                 wrong(),
-                Bytes::new(),
+                AppBytes(Bytes::new()),
             )
             .await,
             StatusCode::BAD_REQUEST,
@@ -2306,7 +2308,7 @@ mod tests {
         let _ = err_json(
             update_space_tier(
                 State(app),
-                Path(space_id),
+                AppPath(space_id),
                 accept_json(),
                 wrong(),
                 json_bytes(&create_input),
@@ -2353,8 +2355,8 @@ mod tests {
         let formation = ok_json(
             get_conversation(
                 State(app.clone()),
-                Path((space_id.to_string(), formation_id.to_string())),
-                Query(ConversationDeltaQuery {
+                AppPath((space_id.to_string(), formation_id.to_string())),
+                AppQuery(ConversationDeltaQuery {
                     messages_offset: None,
                     artifacts_offset: None,
                     collection: None,
@@ -2370,8 +2372,8 @@ mod tests {
         let delta = ok_json(
             get_conversation_delta(
                 State(app.clone()),
-                Path((space_id.to_string(), formation_id.to_string())),
-                Query(ConversationDeltaQuery {
+                AppPath((space_id.to_string(), formation_id.to_string())),
+                AppQuery(ConversationDeltaQuery {
                     messages_offset: Some(1),
                     artifacts_offset: Some(0),
                     collection: None,
@@ -2388,8 +2390,8 @@ mod tests {
         let recall = ok_json(
             get_conversation(
                 State(app.clone()),
-                Path((space_id.to_string(), recall_id.to_string())),
-                Query(ConversationDeltaQuery {
+                AppPath((space_id.to_string(), recall_id.to_string())),
+                AppQuery(ConversationDeltaQuery {
                     messages_offset: None,
                     artifacts_offset: None,
                     collection: Some("recall".to_string()),
@@ -2405,8 +2407,8 @@ mod tests {
         let listed = ok_json(
             list_conversations(
                 State(app.clone()),
-                Path(space_id.to_string()),
-                Query(Pagination {
+                AppPath(space_id.to_string()),
+                AppQuery(Pagination {
                     cursor: None,
                     limit: Some(1),
                     collection: None,
@@ -2423,8 +2425,8 @@ mod tests {
         let invalid_id = err_json(
             get_conversation(
                 State(app),
-                Path((space_id.to_string(), "not-a-number".to_string())),
-                Query(ConversationDeltaQuery {
+                AppPath((space_id.to_string(), "not-a-number".to_string())),
+                AppQuery(ConversationDeltaQuery {
                     messages_offset: None,
                     artifacts_offset: None,
                     collection: None,
@@ -2462,7 +2464,7 @@ mod tests {
 
         let formation_ok = match post_formation(
             State(app.clone()),
-            Path(space_id.to_string()),
+            AppPath(space_id.to_string()),
             accept_from_headers(Some("text/markdown"), Some("application/json"), None),
             headers(&app),
             json_bytes(&FormationInput {
@@ -2497,7 +2499,7 @@ mod tests {
         let recall_ok = ok_json(
             post_recall(
                 State(app.clone()),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_json(),
                 headers(&app),
                 json_bytes(&RecallInput {
@@ -2518,7 +2520,7 @@ mod tests {
         let maintenance_ok = ok_json(
             post_maintenance(
                 State(app.clone()),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_json(),
                 headers(&app),
                 json_bytes(&MaintenanceInput {
@@ -2535,10 +2537,10 @@ mod tests {
         let formation_err = err_json(
             post_formation(
                 State(app.clone()),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_json(),
                 headers(&app),
-                Bytes::from_static(b"{"),
+                AppBytes(Bytes::from_static(b"{")),
             )
             .await,
             StatusCode::BAD_REQUEST,
@@ -2554,10 +2556,10 @@ mod tests {
         let recall_err = err_json(
             post_recall(
                 State(app.clone()),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_json(),
                 HeaderVals(String::new(), 1),
-                Bytes::from_static(b"{}"),
+                AppBytes(Bytes::from_static(b"{}")),
             )
             .await,
             StatusCode::BAD_REQUEST,
@@ -2573,10 +2575,10 @@ mod tests {
         let maintenance_err = err_json(
             post_maintenance(
                 State(app.clone()),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_from_headers(Some("application/json"), Some("text/markdown"), None),
                 headers(&app),
-                Bytes::from_static(b"not json"),
+                AppBytes(Bytes::from_static(b"not json")),
             )
             .await,
             StatusCode::BAD_REQUEST,
@@ -2592,10 +2594,10 @@ mod tests {
         let kip = ok_json(
             execute_kip_readonly(
                 State(app.clone()),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_json(),
                 headers(&app),
-                Bytes::from_static(br#"{"command":"DESCRIBE PRIMER"}"#),
+                AppBytes(Bytes::from_static(br#"{"command":"DESCRIBE PRIMER"}"#)),
             )
             .await,
         )
@@ -2605,7 +2607,7 @@ mod tests {
         let user = ok_json(
             get_or_init_user(
                 State(app),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_json(),
                 HeaderVals(String::new(), 0),
                 json_bytes(&GetOrInitUserInput {
@@ -2638,7 +2640,7 @@ mod tests {
         err_json(
             post_probe(
                 State(app.clone()),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_json(),
                 no_token(),
                 probe_body(),
@@ -2650,7 +2652,7 @@ mod tests {
         err_json(
             post_recall_structured(
                 State(app.clone()),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_json(),
                 no_token(),
                 recall_body(),
@@ -2662,7 +2664,7 @@ mod tests {
         err_json(
             get_memory_status(
                 State(app.clone()),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_json(),
                 no_token(),
             )
@@ -2673,7 +2675,7 @@ mod tests {
         err_json(
             post_memory_pin(
                 State(app.clone()),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_json(),
                 no_token(),
                 pin_body(),
@@ -2685,7 +2687,7 @@ mod tests {
         err_json(
             post_memory_forget(
                 State(app.clone()),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_json(),
                 no_token(),
                 forget_body(),
@@ -2697,7 +2699,7 @@ mod tests {
         err_json(
             post_shadow_eval(
                 State(app.clone()),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_json(),
                 no_token(),
                 shadow_body(),
@@ -2721,7 +2723,7 @@ mod tests {
         ok_json(
             post_probe(
                 State(app.clone()),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_json(),
                 no_token(),
                 probe_body(),
@@ -2732,7 +2734,7 @@ mod tests {
         ok_json(
             get_memory_status(
                 State(app.clone()),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_json(),
                 no_token(),
             )
@@ -2742,7 +2744,7 @@ mod tests {
         ok_json(
             post_recall_structured(
                 State(app.clone()),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_json(),
                 no_token(),
                 recall_body(),
@@ -2753,7 +2755,7 @@ mod tests {
         err_json(
             post_memory_pin(
                 State(app.clone()),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_json(),
                 no_token(),
                 pin_body(),
@@ -2765,7 +2767,7 @@ mod tests {
         err_json(
             post_memory_forget(
                 State(app.clone()),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_json(),
                 no_token(),
                 forget_body(),
@@ -2777,7 +2779,7 @@ mod tests {
         err_json(
             post_shadow_eval(
                 State(app.clone()),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_json(),
                 no_token(),
                 shadow_body(),
@@ -2797,7 +2799,7 @@ mod tests {
         let pin_err = err_json(
             post_memory_pin(
                 State(app.clone()),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_json(),
                 with_token(),
                 pin_body(),
@@ -2816,7 +2818,7 @@ mod tests {
         let forget_ok = ok_json(
             post_memory_forget(
                 State(app.clone()),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_json(),
                 with_token(),
                 forget_body(),
@@ -2830,7 +2832,7 @@ mod tests {
         let shadow_ok = ok_json(
             post_shadow_eval(
                 State(app.clone()),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_json(),
                 with_token(),
                 shadow_body(),
@@ -2903,8 +2905,8 @@ mod tests {
         let _ = err_json(
             get_conversation(
                 State(app.clone()),
-                Path((space_id.to_string(), conv_id.to_string())),
-                Query(recall_query()),
+                AppPath((space_id.to_string(), conv_id.to_string())),
+                AppQuery(recall_query()),
                 accept_json(),
                 HeaderVals(labeled_token.clone(), 0),
             )
@@ -2915,8 +2917,8 @@ mod tests {
         let _ = err_json(
             get_conversation_delta(
                 State(app.clone()),
-                Path((space_id.to_string(), conv_id.to_string())),
-                Query(recall_query()),
+                AppPath((space_id.to_string(), conv_id.to_string())),
+                AppQuery(recall_query()),
                 accept_json(),
                 HeaderVals(labeled_token.clone(), 0),
             )
@@ -2927,8 +2929,8 @@ mod tests {
         let _ = err_json(
             list_conversations(
                 State(app.clone()),
-                Path(space_id.to_string()),
-                Query(Pagination {
+                AppPath(space_id.to_string()),
+                AppQuery(Pagination {
                     cursor: None,
                     limit: None,
                     collection: Some("recall".to_string()),
@@ -2945,8 +2947,8 @@ mod tests {
         let read = ok_json(
             get_conversation(
                 State(app.clone()),
-                Path((space_id.to_string(), conv_id.to_string())),
-                Query(recall_query()),
+                AppPath((space_id.to_string(), conv_id.to_string())),
+                AppQuery(recall_query()),
                 accept_json(),
                 HeaderVals(plain_token.clone(), 0),
             )
@@ -2960,8 +2962,8 @@ mod tests {
         let _ = err_json(
             get_conversation(
                 State(app.clone()),
-                Path((space_id.to_string(), conv_id.to_string())),
-                Query(ConversationDeltaQuery {
+                AppPath((space_id.to_string(), conv_id.to_string())),
+                AppQuery(ConversationDeltaQuery {
                     messages_offset: None,
                     artifacts_offset: None,
                     collection: Some("Recall".to_string()),
@@ -2991,8 +2993,8 @@ mod tests {
         let _ = err_json(
             get_conversation(
                 State(app.clone()),
-                Path((space_id.to_string(), conv_id.to_string())),
-                Query(recall_query()),
+                AppPath((space_id.to_string(), conv_id.to_string())),
+                AppQuery(recall_query()),
                 accept_json(),
                 HeaderVals(String::new(), 0),
             )
@@ -3003,8 +3005,8 @@ mod tests {
         let _ = err_json(
             list_conversations(
                 State(app.clone()),
-                Path(space_id.to_string()),
-                Query(Pagination {
+                AppPath(space_id.to_string()),
+                AppQuery(Pagination {
                     cursor: None,
                     limit: None,
                     collection: Some("recall".to_string()),
@@ -3022,8 +3024,8 @@ mod tests {
         let _ = ok_json(
             list_conversations(
                 State(app.clone()),
-                Path(space_id.to_string()),
-                Query(Pagination {
+                AppPath(space_id.to_string()),
+                AppQuery(Pagination {
                     cursor: None,
                     limit: None,
                     collection: None,
@@ -3037,8 +3039,8 @@ mod tests {
         let read = ok_json(
             get_conversation(
                 State(app.clone()),
-                Path((space_id.to_string(), conv_id.to_string())),
-                Query(recall_query()),
+                AppPath((space_id.to_string(), conv_id.to_string())),
+                AppQuery(recall_query()),
                 accept_json(),
                 HeaderVals(plain_token, 0),
             )
@@ -3085,7 +3087,7 @@ mod tests {
         let unauthorized = err_json(
             get_info(
                 State(app.clone()),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_json(),
                 HeaderVals(String::new(), 0),
             )
@@ -3101,7 +3103,7 @@ mod tests {
         let info = ok_json(
             get_info(
                 State(app.clone()),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_json(),
                 HeaderVals(read_token.clone(), 0),
             )
@@ -3113,7 +3115,7 @@ mod tests {
         let status = ok_json(
             get_formation_status(
                 State(app.clone()),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_json(),
                 HeaderVals(read_token.clone(), 0),
             )
@@ -3125,7 +3127,7 @@ mod tests {
         let recall = ok_json(
             post_recall(
                 State(app.clone()),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_json(),
                 HeaderVals(read_token.clone(), 0),
                 json_bytes(&RecallInput {
@@ -3141,10 +3143,10 @@ mod tests {
         let kip = ok_json(
             execute_kip_readonly(
                 State(app.clone()),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_json(),
                 HeaderVals(read_token.clone(), 0),
-                Bytes::from_static(br#"{"command":"DESCRIBE PRIMER"}"#),
+                AppBytes(Bytes::from_static(br#"{"command":"DESCRIBE PRIMER"}"#)),
             )
             .await,
         )
@@ -3154,7 +3156,7 @@ mod tests {
         let user = ok_json(
             get_or_init_user(
                 State(app.clone()),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_json(),
                 HeaderVals(write_token.clone(), 0),
                 json_bytes(&GetOrInitUserInput {
@@ -3169,7 +3171,7 @@ mod tests {
 
         let formation = match post_formation(
             State(app.clone()),
-            Path(space_id.to_string()),
+            AppPath(space_id.to_string()),
             accept_json(),
             HeaderVals(write_token.clone(), 0),
             json_bytes(&FormationInput {
@@ -3199,8 +3201,8 @@ mod tests {
         let conversation = ok_json(
             get_conversation(
                 State(app.clone()),
-                Path((space_id.to_string(), formation_id.to_string())),
-                Query(ConversationDeltaQuery {
+                AppPath((space_id.to_string(), formation_id.to_string())),
+                AppQuery(ConversationDeltaQuery {
                     messages_offset: None,
                     artifacts_offset: None,
                     collection: None,
@@ -3216,8 +3218,8 @@ mod tests {
         let delta = ok_json(
             get_conversation_delta(
                 State(app.clone()),
-                Path((space_id.to_string(), formation_id.to_string())),
-                Query(ConversationDeltaQuery {
+                AppPath((space_id.to_string(), formation_id.to_string())),
+                AppQuery(ConversationDeltaQuery {
                     messages_offset: Some(0),
                     artifacts_offset: Some(0),
                     collection: None,
@@ -3233,8 +3235,8 @@ mod tests {
         let list = ok_json(
             list_conversations(
                 State(app.clone()),
-                Path(space_id.to_string()),
-                Query(Pagination {
+                AppPath(space_id.to_string()),
+                AppQuery(Pagination {
                     cursor: None,
                     limit: Some(5),
                     collection: None,
@@ -3254,7 +3256,7 @@ mod tests {
         let maintenance = ok_json(
             post_maintenance(
                 State(app),
-                Path(space_id.to_string()),
+                AppPath(space_id.to_string()),
                 accept_json(),
                 HeaderVals(write_token, 0),
                 json_bytes(&MaintenanceInput {
@@ -3278,7 +3280,7 @@ mod tests {
         let commit = ok_json(
             post_wiki_commit(
                 State(app.clone()),
-                Path(space_id.clone()),
+                AppPath(space_id.clone()),
                 accept_json(),
                 headers(&app),
                 json_bytes(&crate::wiki::WikiCommitInput {
@@ -3298,7 +3300,7 @@ mod tests {
         let search = ok_json(
             post_wiki_search(
                 State(app.clone()),
-                Path(space_id.clone()),
+                AppPath(space_id.clone()),
                 accept_json(),
                 headers(&app),
                 json_bytes(&crate::wiki::WikiSearchInput::from_query(
@@ -3318,7 +3320,7 @@ mod tests {
         let detail = ok_json(
             get_wiki_doc(
                 State(app.clone()),
-                Path((space_id.clone(), doc_id)),
+                AppPath((space_id.clone(), doc_id)),
                 accept_json(),
                 headers(&app),
             )
@@ -3333,8 +3335,8 @@ mod tests {
         let content = ok_json(
             get_wiki_content(
                 State(app.clone()),
-                Path((space_id.clone(), doc_id)),
-                Query(WikiContentQuery::default()),
+                AppPath((space_id.clone(), doc_id)),
+                AppQuery(WikiContentQuery::default()),
                 accept_json(),
                 headers(&app),
             )
@@ -3352,7 +3354,7 @@ mod tests {
         let verify = ok_json(
             post_wiki_verify(
                 State(app.clone()),
-                Path(space_id.clone()),
+                AppPath(space_id.clone()),
                 accept_json(),
                 headers(&app),
                 json_bytes(&crate::wiki::WikiVerifyInput {
@@ -3371,7 +3373,7 @@ mod tests {
         let conflict = err_json(
             post_wiki_commit(
                 State(app.clone()),
-                Path(space_id.clone()),
+                AppPath(space_id.clone()),
                 accept_json(),
                 headers(&app),
                 json_bytes(&crate::wiki::WikiCommitInput {
@@ -3395,7 +3397,7 @@ mod tests {
         let _ = err_json(
             get_wiki_doc(
                 State(app.clone()),
-                Path((space_id.clone(), 999_999)),
+                AppPath((space_id.clone(), 999_999)),
                 accept_json(),
                 headers(&app),
             )
@@ -3481,7 +3483,7 @@ mod tests {
                 ok_json(
                     post_wiki_search(
                         State(app),
-                        Path(space_id),
+                        AppPath(space_id),
                         accept_json(),
                         HeaderVals(token, 0),
                         json_bytes(&crate::wiki::WikiSearchInput::from_query(query)),
@@ -3508,8 +3510,8 @@ mod tests {
         let _ = err_json(
             list_wiki_events(
                 State(app.clone()),
-                Path(space_id.clone()),
-                Query(WikiEventsQuery::default()),
+                AppPath(space_id.clone()),
+                AppQuery(WikiEventsQuery::default()),
                 accept_json(),
                 HeaderVals("STouter".to_string(), 0),
             )
@@ -3528,7 +3530,7 @@ mod tests {
         let import = ok_json(
             post_wiki_import(
                 State(app.clone()),
-                Path(space_id.clone()),
+                AppPath(space_id.clone()),
                 accept_json(),
                 headers(&app),
                 json_bytes(&crate::wiki::WikiImportInput {
@@ -3548,8 +3550,8 @@ mod tests {
         let export = ok_json(
             get_wiki_export(
                 State(app.clone()),
-                Path(space_id.clone()),
-                Query(WikiExportQuery {
+                AppPath(space_id.clone()),
+                AppQuery(WikiExportQuery {
                     namespace: Some("kb".to_string()),
                 }),
                 accept_json(),

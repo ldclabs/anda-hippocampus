@@ -1593,20 +1593,57 @@ async fn run_shared_formation_experiment(
 
     for scenario in scenarios {
         let (base_state, base_id) = env.space_host(&[base_space_id, "form", &scenario.id]);
-        let space = load_eval_space(env, &base_state, &base_id).await?;
-        // The formation phase only reads timeouts from the profile. The base
-        // snapshot must be flushed and closed before the profiles fork it.
-        let formation_result =
-            run_formation_phase(space.as_ref(), scenario, &profiles[0].profile).await;
-        let close_result = space.db.close().await;
-        let report = formation_result?;
-        close_result?;
-        shared_reports.push(report);
+        // Scenario-level failure isolation, matching `run_eval_suite`: one
+        // scenario's abort must not discard the other scenarios' already-paid
+        // formation and policy results.
+        let formation_result = match load_eval_space(env, &base_state, &base_id).await {
+            Ok(space) => {
+                // The formation phase only reads timeouts from the profile.
+                // The base snapshot must be flushed and closed before the
+                // profiles fork it; a close failure poisons every fork, so
+                // it fails the scenario rather than the experiment.
+                let formation_result =
+                    run_formation_phase(space.as_ref(), scenario, &profiles[0].profile).await;
+                let close_result = space.db.close().await;
+                match (formation_result, close_result) {
+                    (Ok(report), Ok(())) => Ok(report),
+                    (Err(err), _) => Err(err),
+                    (_, Err(err)) => Err(err.into()),
+                }
+            }
+            Err(err) => Err(err),
+        };
+        match formation_result {
+            Ok(report) => shared_reports.push(report),
+            Err(err) => {
+                eprintln!(
+                    "warning: shared formation for scenario `{}` aborted: {err}",
+                    scenario.id
+                );
+                // No profile can fork a snapshot that never materialized:
+                // every suite gets the zero-score stand-in for this scenario.
+                shared_reports.push(failed_scenario_report(
+                    scenario,
+                    &profiles[0].id,
+                    err.as_ref(),
+                ));
+                for (index, profile) in profiles.iter().enumerate() {
+                    profile_reports[index].push(failed_scenario_report(
+                        scenario,
+                        &profile.id,
+                        err.as_ref(),
+                    ));
+                }
+                continue;
+            }
+        }
 
         // Forks are fully isolated — each lives in its own in-memory store —
-        // so every profile's policy phase can replay concurrently.
+        // so every profile's policy phase can replay concurrently. Failures
+        // stay per-profile: `join_all` (not `try_join_all`) so one fork's
+        // abort cannot discard its siblings' finished reports.
         let base_store = base_state.object_store();
-        let fork_results = futures::future::try_join_all(profiles.iter().map(|profile| {
+        let fork_results = futures::future::join_all(profiles.iter().map(|profile| {
             let base_id = base_id.clone();
             let base_store = base_store.clone();
             async move {
@@ -1629,8 +1666,17 @@ async fn run_shared_formation_experiment(
         // The base snapshot is only needed until every profile has forked
         // it: `base_state` (and, unless --keep-spaces, its store) drops at
         // the end of this iteration.
-        for (index, report) in fork_results?.into_iter().enumerate() {
-            profile_reports[index].push(report);
+        for ((index, profile), result) in profiles.iter().enumerate().zip(fork_results) {
+            profile_reports[index].push(match result {
+                Ok(report) => report,
+                Err(err) => {
+                    eprintln!(
+                        "warning: policy phase for scenario `{}` profile `{}` aborted: {err}",
+                        scenario.id, profile.id
+                    );
+                    failed_scenario_report(scenario, &profile.id, err.as_ref())
+                }
+            });
         }
     }
 

@@ -1,6 +1,7 @@
 use anda_cognitive_nexus::{CognitiveNexus, ConceptPK};
 use anda_core::{
-    AgentInput, AgentOutput, BoxError, FunctionDefinition, Message, Principal, Resource, Usage,
+    AgentInput, AgentOutput, BoxError, ContentPart, FunctionDefinition, Message, Principal,
+    Resource, Usage,
 };
 use anda_db::{
     collection::{Collection, CollectionConfig},
@@ -1072,16 +1073,20 @@ impl Space {
     ) -> Result<AgentOutput, BoxError> {
         // Reject empty input up front (both HTTP and MCP funnel through
         // here): it would otherwise persist a garbage conversation and burn
-        // a full LLM encoding cycle on nothing.
+        // a full LLM encoding cycle on nothing. Checking part counts is not
+        // enough — a non-empty content array of blank text parts must also
+        // count as empty; non-text parts (files, inline data, tool calls)
+        // always count as content.
         let empty = match &input {
             StringOr::String(text) => text.trim().is_empty(),
-            StringOr::Value(input) => {
-                input.messages.is_empty()
-                    || input
-                        .messages
-                        .iter()
-                        .all(|message| message.content.is_empty())
-            }
+            StringOr::Value(input) => input.messages.iter().all(|message| {
+                message.content.iter().all(|part| match part {
+                    ContentPart::Text { text } | ContentPart::Reasoning { text } => {
+                        text.trim().is_empty()
+                    }
+                    _ => false,
+                })
+            }),
         };
         if empty {
             return Err("formation input must not be empty".into());
@@ -3030,6 +3035,9 @@ impl Space {
         if autostart {
             let this_clone = this.clone();
             tokio::spawn(async move {
+                if let Err(err) = this_clone.formation.init().await {
+                    log::warn!(target: "brain", space_id = this_clone.id; "formation history init failed: {err:?}");
+                }
                 if let Err(err) = this_clone.maintenance.init().await {
                     log::warn!(target: "brain", space_id = this_clone.id; "maintenance history init failed: {err:?}");
                 }
@@ -3061,6 +3069,9 @@ impl Space {
             // No-autostart open (shadow forks): the agents still need their
             // history cursors, but the inherited formation backlog and wiki
             // digest must stay untouched.
+            if let Err(err) = this.formation.init().await {
+                log::warn!(target: "brain", space_id = this.id; "formation history init failed: {err:?}");
+            }
             if let Err(err) = this.maintenance.init().await {
                 log::warn!(target: "brain", space_id = this.id; "maintenance history init failed: {err:?}");
             }
@@ -5438,6 +5449,24 @@ mod tests {
                 SELF_USER_ID,
                 StringOr::Value(FormationInput {
                     messages: vec![],
+                    context: None,
+                    timestamp: None,
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("must not be empty"));
+        // …including a non-empty content array holding only blank text parts
+        // (the part-count check alone would let this burn a formation cycle)…
+        let err = space
+            .ingest(
+                SELF_USER_ID,
+                StringOr::Value(FormationInput {
+                    messages: vec![Message {
+                        role: "user".into(),
+                        content: vec!["   ".to_string().into()],
+                        ..Default::default()
+                    }],
                     context: None,
                     timestamp: None,
                 }),

@@ -3,7 +3,7 @@ mod maintenance;
 pub mod prompts;
 mod recall;
 
-use anda_core::{BoxError, ContentPart, Document, Message, Principal};
+use anda_core::{BoxError, ContentPart, Document, Message, Principal, Usage};
 use anda_db::schema::DocumentId;
 use anda_engine::{
     context::CompletionRunner,
@@ -247,16 +247,51 @@ fn queued_runner_tokens(runner: &CompletionRunner) -> u64 {
 pub(super) async fn compact_runner_if_needed(
     runner: &mut CompletionRunner,
 ) -> Result<bool, BoxError> {
+    // A finished runner must never be handed off: finalize() rejects it with
+    // "completion already finalized", and surfacing that as a loop failure
+    // would flip an already-persisted Completed conversation to Failed with
+    // zeroed usage. Bound-mode hosts (maintenance) reach this arm on the
+    // iteration right after convergence, before `runner.next()` returns
+    // `Ok(None)`.
+    if runner.is_done() {
+        return Ok(false);
+    }
     if !runner.needs_compaction_with(|| queued_runner_tokens(runner)) {
         return Ok(false);
     }
 
-    let (mut compacted, output) = runner.handoff(None).await?;
-    compacted.accumulate(&output.usage);
-    compacted.accumulate_tools_usage(&output.tools_usage);
-    compacted.follow_up(ContentPart::from(COMPACTION_CONTINUE_PROMPT.to_string()));
-    *runner = compacted;
-    Ok(true)
+    // handoff()'s internal finalize mem::takes total_usage/tools_usage into an
+    // output that handoff drops when the summarization turn itself fails
+    // (refusal, cancellation, empty summary), which would make the caller's
+    // failure-exit backfill record zero. Early handoff errors leave the totals
+    // untouched, so restore only when they were actually drained.
+    let pre_usage = runner.total_usage().clone();
+    let pre_tools_usage = runner.tools_usage().clone();
+    match runner.handoff(None).await {
+        Ok((mut compacted, output)) => {
+            compacted.accumulate(&output.usage);
+            compacted.accumulate_tools_usage(&output.tools_usage);
+            compacted.follow_up(ContentPart::from(COMPACTION_CONTINUE_PROMPT.to_string()));
+            *runner = compacted;
+            Ok(true)
+        }
+        Err(err) => {
+            if usage_is_empty(runner.total_usage()) {
+                runner.accumulate(&pre_usage);
+            }
+            if runner.tools_usage().is_empty() {
+                runner.accumulate_tools_usage(&pre_tools_usage);
+            }
+            Err(err)
+        }
+    }
+}
+
+fn usage_is_empty(usage: &Usage) -> bool {
+    usage.input_tokens == 0
+        && usage.output_tokens == 0
+        && usage.cached_tokens == 0
+        && usage.requests == 0
 }
 
 pub(super) fn push_completed_history(

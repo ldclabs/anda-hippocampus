@@ -408,9 +408,14 @@ export interface MaintenanceAt {
 }
 
 export interface Usage {
-  input_tokens?: number;
-  output_tokens?: number;
-  total_tokens?: number;
+  /** 发送给 LLM 的输入 token 数。 */
+  input_tokens: number;
+  /** 从 LLM 接收的输出 token 数。 */
+  output_tokens: number;
+  /** 执行过程中命中缓存的 token 数。 */
+  cached_tokens: number;
+  /** 对模型、agent 或工具发起的请求次数。 */
+  requests: number;
 }
 
 export interface AgentOutput {

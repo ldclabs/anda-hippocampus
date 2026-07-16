@@ -86,6 +86,12 @@ MODEL_API_BASE='https://api.minimaxi.com/anthropic/v1'
 MODEL_API_KEY='YOUR_MODEL_API_KEY'
 ```
 
+`.env` 文件包含密钥（例如 `MODEL_API_KEY`），请收紧文件权限：
+
+```bash
+chmod 600 .env
+```
+
 ## 4. 运行 Anda Brain 服务（本地文件存储）
 
 您可以选择在本地编译并运行，或者通过 Docker 运行（支持拉取远程镜像）。
@@ -124,6 +130,8 @@ docker run --rm --platform $DOCKER_PLATFORM -p 8042:8042 \
   -v "$(pwd)/.env:/app/.env" \
 	ghcr.io/ldclabs/anda_brain_amd64:latest local --db /app/db
 ```
+
+> 注意：容器以非 root 用户（UID/GID `10001`）运行。在 Linux 宿主机上，请确保挂载路径对该 UID 可读写，例如 `sudo chown -R 10001:10001 ./db`、`sudo chown 10001 .env`（`.env` 保持 `600` 权限即可）。macOS/Windows 的 Docker Desktop 会自动处理文件共享权限。
 
 #### B2. 本地构建 Docker 镜像
 

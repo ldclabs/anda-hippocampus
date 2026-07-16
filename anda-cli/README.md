@@ -172,14 +172,31 @@ anda-cli --space-id my_space --token $TOKEN conversations delta 42 \
 # List space tokens
 anda-cli --space-id my_space --token $CWT_TOKEN management list-tokens
 
-# Add a space token
-anda-cli --space-id my_space --token $CWT_TOKEN management add-token --scope write
+# Add a space token (--name is required; full token value is only shown once)
+anda-cli --space-id my_space --token $CWT_TOKEN management add-token --name writer --scope write
 
-# Revoke a space token
+# Add a label-restricted wiki viewer token (labels require --scope read;
+# the token sees unlabeled content plus the listed ACL labels)
+anda-cli --space-id my_space --token $CWT_TOKEN management add-token \
+  --name hr-viewer --scope read --labels hr,finance
+
+# Revoke a space token by full value
 anda-cli --space-id my_space --token $CWT_TOKEN management revoke-token ST_xxx
+
+# Revoke by unique token name (list-tokens only echoes a token prefix, so use
+# --name when the full value was not saved at mint time)
+anda-cli --space-id my_space --token $CWT_TOKEN management revoke-token --name hr-viewer
 
 # Update space info
 anda-cli --space-id my_space --token $CWT_TOKEN management update-space --name "My Space" --public
+
+# Update wiki settings: enable WikiDigest extraction, audit external wiki
+# reads, and set namespace default ACL labels (namespace=label pairs; the
+# map is replaced as a whole — pass --wiki-acl-defaults "" to clear it)
+anda-cli --space-id my_space --token $CWT_TOKEN management update-space \
+  --wiki-digest \
+  --wiki-audit-reads \
+  --wiki-acl-defaults internal=staff,hr=hr
 
 # Restart formation for a conversation
 anda-cli --space-id my_space --token $CWT_TOKEN management restart-formation --conversation 42
@@ -187,12 +204,22 @@ anda-cli --space-id my_space --token $CWT_TOKEN management restart-formation --c
 # Get BYOK configuration
 anda-cli --space-id my_space --token $CWT_TOKEN management get-byok
 
-# Update BYOK configuration
+# Update BYOK configuration. --api-key accepts a literal value, @file/path
+# (recommended: keeps the key out of shell history and `ps`), or the
+# ANDA_BYOK_API_KEY environment variable as its default.
 anda-cli --space-id my_space --token $CWT_TOKEN management update-byok \
   --family anthropic \
   --model claude-opus-4-6 \
   --api-base https://api.anthropic.com/v1 \
-  --api-key sk-xxx
+  --api-key @./api_key.txt \
+  --stream \
+  --context-window 200000 \
+  --max-output 8192
+
+# Or via environment variable:
+export ANDA_BYOK_API_KEY=sk-xxx
+anda-cli --space-id my_space --token $CWT_TOKEN management update-byok \
+  --family anthropic --model claude-opus-4-6 --api-base https://api.anthropic.com/v1
 ```
 
 ### Admin (requires platform admin auth)

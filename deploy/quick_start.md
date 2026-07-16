@@ -86,6 +86,12 @@ MODEL_API_BASE='https://api.minimaxi.com/anthropic/v1'
 MODEL_API_KEY='YOUR_MODEL_API_KEY'
 ```
 
+The `.env` file contains secrets (e.g. `MODEL_API_KEY`). Restrict its permissions:
+
+```bash
+chmod 600 .env
+```
+
 ## 4. Start Anda Brain (Local File Storage)
 
 Choose one: Run via local build, or run via Docker (supports pulling remote images).
@@ -123,6 +129,8 @@ docker run --rm --platform $DOCKER_PLATFORM -p 8042:8042 \
   -v "$(pwd)/.env:/app/.env" \
 	ghcr.io/ldclabs/anda_brain_amd64:latest local --db /app/db
 ```
+
+> Note: The container runs as a non-root user (UID/GID `10001`). On Linux hosts, make sure the mounted paths are accessible to that UID, e.g. `sudo chown -R 10001:10001 ./db` and `sudo chown 10001 .env` (keep `.env` at mode `600`). Docker Desktop on macOS/Windows handles file-sharing permissions automatically.
 
 #### B2. Build the Docker image locally
 

@@ -129,8 +129,10 @@ Also report findings, attributing each failure to the responsible stage:
 
 A probe with "error": true (its "satisfied" is null, and the matching expectation's "probe_satisfied" is null) could not observe the graph at all — an infrastructure failure, not a memory failure. Treat that expectation's graph state as UNKNOWN: never report formation_miss or bad_consolidation from an errored probe; judge only from the remaining evidence.
 
+Each finding must set "expectation_id" to the id of the memory expectation it is about (copy the id from the expectations/probes). Use null ONLY when the finding does not correspond to any listed expectation. Findings are merged with the harness's own probe findings by exact (kind, expectation_id), so omitting the id on an expectation-linked finding double-counts it.
+
 Respond with ONLY a JSON object:
-{"memory_utility": 0.0, "forgetting_quality": 0.0, "uncertainty_calibration": 0.0, "satisfaction": 0.0, "reasoning": "...", "findings": [{"kind": "bad_synthesis", "message": "...", "expectation_id": null}]}"#;
+{"memory_utility": 0.0, "forgetting_quality": 0.0, "uncertainty_calibration": 0.0, "satisfaction": 0.0, "reasoning": "...", "findings": [{"kind": "bad_synthesis", "message": "...", "expectation_id": "expectation-id-or-null"}]}"#;
 
 pub(crate) async fn judge_checkpoint<C>(
     driver: &C,

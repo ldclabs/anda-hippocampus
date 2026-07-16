@@ -417,6 +417,22 @@ impl AndaBrainMcpServer {
         } else {
             AuthzMode::Credentialed
         };
+        self.load_authorized_space_with_mode(scope, mode, access)
+            .await
+    }
+
+    /// Same as [`Self::load_authorized_space_with_token`] with an explicit
+    /// [`AuthzMode`]. The info tools mirroring HTTP's `PublicReadLenient`
+    /// endpoints must pass that mode: on public spaces those endpoints skip
+    /// token verification entirely (`verify_space_token` counts usage), so a
+    /// valid token sent to an MCP info tool must not drift the token's usage
+    /// counter relative to the HTTP channel.
+    async fn load_authorized_space_with_mode(
+        &self,
+        scope: TokenScope,
+        mode: AuthzMode,
+        access: &McpAccess,
+    ) -> Result<(Arc<Space>, Caller), ErrorData> {
         let now_ms = unix_ms();
         let attempt = || {
             authz::authorize(
@@ -471,8 +487,17 @@ impl AndaBrainMcpServer {
             .map(|_| ())
     }
 
+    /// Loads the space the way HTTP's `PublicReadLenient` endpoints do; see
+    /// [`Self::load_authorized_space_with_mode`].
+    async fn load_lenient_space(&self, access: &McpAccess) -> Result<Arc<Space>, ErrorData> {
+        Ok(self
+            .load_authorized_space_with_mode(TokenScope::Read, AuthzMode::PublicReadLenient, access)
+            .await?
+            .0)
+    }
+
     async fn get_space_info_for(&self, access: &McpAccess) -> Result<CallToolResult, ErrorData> {
-        let space = self.load_authorized_space(TokenScope::Read, access).await?;
+        let space = self.load_lenient_space(access).await?;
         structured_result(space.get_info())
     }
 
@@ -480,7 +505,7 @@ impl AndaBrainMcpServer {
         &self,
         access: &McpAccess,
     ) -> Result<CallToolResult, ErrorData> {
-        let space = self.load_authorized_space(TokenScope::Read, access).await?;
+        let space = self.load_lenient_space(access).await?;
         structured_result(space.formation_status())
     }
 
@@ -558,7 +583,7 @@ impl AndaBrainMcpServer {
         input: ExecuteKipReadonlyInput,
     ) -> Result<CallToolResult, ErrorData> {
         let request = input.into_request()?;
-        let space = self.load_authorized_space(TokenScope::Read, access).await?;
+        let space = self.load_lenient_space(access).await?;
         let response = space
             .execute_kip_readonly(request)
             .await

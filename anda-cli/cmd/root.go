@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ldclabs/anda-brain/anda-cli/api"
@@ -70,6 +71,30 @@ func envOrDefault(key, defaultVal string) string {
 		return v
 	}
 	return defaultVal
+}
+
+// resolveSecretInput resolves a secret flag value: a literal value is
+// returned as-is, while an "@path/to/file" input is replaced by the trimmed
+// contents of that file. This keeps secrets out of shell history and process
+// listings (same pattern as the cwt command's --key flag).
+func resolveSecretInput(input string) (string, error) {
+	input = strings.TrimSpace(input)
+	if !strings.HasPrefix(input, "@") {
+		return input, nil
+	}
+	path := strings.TrimSpace(strings.TrimPrefix(input, "@"))
+	if path == "" {
+		return "", fmt.Errorf("empty file path after '@'")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read secret file %q: %w", path, err)
+	}
+	value := strings.TrimSpace(string(data))
+	if value == "" {
+		return "", fmt.Errorf("secret file %q is empty", path)
+	}
+	return value, nil
 }
 
 func envOrDefaultInt(key string, defaultVal int) int {
