@@ -438,6 +438,7 @@ fn default_db_config() -> DBConfig {
         description: "Anda Brain database".to_string(),
         storage: StorageConfig {
             cache_max_capacity: 100000,
+            cache_max_bytes: None,
             compress_level: 3,
             object_chunk_size: 256 * 1024,
             bucket_overload_size: 1024 * 1024,

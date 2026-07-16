@@ -8,7 +8,8 @@ use rmcp::{
     ErrorData, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolResult, Content, Implementation, InitializeResult, ServerCapabilities, ServerInfo,
+        CallToolResult, ContentBlock, Implementation, InitializeResult, ServerCapabilities,
+        ServerInfo,
     },
     schemars::JsonSchema,
     service::RequestContext,
@@ -1286,7 +1287,7 @@ fn agent_output_result(output: anda_core::AgentOutput) -> Result<CallToolResult,
     };
     let value = serde_json::to_value(output).map_err(internal_error)?;
     let mut result = CallToolResult::structured(value);
-    result.content = vec![Content::text(text)];
+    result.content = vec![ContentBlock::text(text)];
     result.is_error = Some(is_error);
     Ok(result)
 }

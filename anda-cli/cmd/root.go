@@ -20,7 +20,7 @@ var (
 	timeoutSec int
 )
 
-const Version = "0.9.0"
+const Version = "0.10.0"
 
 func newClient() *api.Client {
 	client := api.NewClient(baseURL, spaceID, token)
