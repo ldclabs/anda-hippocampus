@@ -1449,7 +1449,7 @@ impl Space {
             concepts: formation.concepts as u64,
             propositions: formation.propositions as u64,
             unsorted: assess::kip_count(self, assess::UNSORTED_COUNT_KQL).await,
-            orphans: assess::kip_count(self, assess::ORPHAN_COUNT_KQL).await,
+            orphans: assess::orphan_count(self).await,
             predicate_types: assess::kip_count(self, assess::PREDICATE_TYPES_COUNT_KQL).await,
             as_of: Some(now_ms),
         }
@@ -3346,7 +3346,9 @@ const DECAY_MIN_INTERVAL_MS: u64 = 7 * 24 * 3_600 * 1_000;
 const SELF_TEST_RETEST_MS: u64 = 30 * 24 * 3_600 * 1_000;
 
 /// Renders a KIP string literal with backslashes and quotes escaped.
-fn kip_string_literal(value: &str) -> String {
+/// The crate's single escaping implementation — reuse it instead of
+/// inlining `.replace()` chains that can drift apart.
+pub(crate) fn kip_string_literal(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 

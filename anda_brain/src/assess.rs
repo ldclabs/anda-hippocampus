@@ -30,12 +30,15 @@ pub(crate) const MAX_EVIDENCE_CHARS: usize = 6_000;
 pub const UNSORTED_COUNT_KQL: &str =
     "FIND(COUNT(?n)) WHERE { (?n, \"belongs_to_domain\", {type: \"Domain\", name: \"Unsorted\"}) }";
 
-/// Concepts without any `belongs_to_domain` proposition. Intentionally
-/// matches every concept type: the Maintenance prompt requires schema/meta
-/// concepts to be attached to the CoreSchema domain on creation, so a fully
-/// maintained graph reaches zero orphans.
-pub const ORPHAN_COUNT_KQL: &str =
-    "FIND(COUNT(?n)) WHERE { ?n {} NOT { (?n, \"belongs_to_domain\", ?d) } }";
+/// Concept-type inventory driving the per-type orphan sweep
+/// ([`orphan_count`]); paginated via `CURSOR :cursor` when needed.
+const CONCEPT_TYPES_KQL: &str = "FIND(?t.name) WHERE { ?t {type: \"$ConceptType\"} } LIMIT 500";
+
+/// Per-type orphan probe: concepts of `:type` without any
+/// `belongs_to_domain` proposition. `:type` is substituted via request
+/// parameters.
+const ORPHAN_COUNT_BY_TYPE_KQL: &str =
+    "FIND(COUNT(?n)) WHERE { ?n {type: :type} NOT { (?n, \"belongs_to_domain\", ?d) } }";
 
 /// Registered `$PropositionType` count — the schema-sprawl indicator
 /// (plan module M8).
@@ -232,13 +235,13 @@ where
     })
 }
 
-/// Builds the semantic search command for an assertion probe. The search text
-/// is embedded in a KQL string literal, so backslashes must be escaped before
-/// quotes to keep the command parseable for any input.
+/// Builds the semantic search command for an assertion probe. The search
+/// text is embedded in a KQL string literal via the crate's shared escaping
+/// helper ([`crate::space::kip_string_literal`]).
 pub fn assertion_search_command(search: &str, threshold: f64, limit: usize) -> String {
     format!(
-        "SEARCH CONCEPT \"{}\" MODE \"semantic\" THRESHOLD {threshold} LIMIT {limit}",
-        search.replace('\\', "\\\\").replace('"', "\\\"")
+        "SEARCH CONCEPT {} MODE \"semantic\" THRESHOLD {threshold} LIMIT {limit}",
+        crate::space::kip_string_literal(search)
     )
 }
 
@@ -461,7 +464,9 @@ pub fn split_recall_meta(content: &str) -> (String, Option<RecallMeta>) {
 }
 
 /// Runs a read-only KIP count query and digs out the first integer in the
-/// result. Returns `None` on error so callers degrade gracefully.
+/// result. Returns `None` on error so callers degrade gracefully — but the
+/// failure is always logged: a silently swallowed probe error once hid a
+/// health metric that had never worked at all.
 pub async fn kip_count<C>(ctx: &C, command: &str) -> Option<u64>
 where
     C: AssessContext + ?Sized,
@@ -472,9 +477,114 @@ where
         ..Default::default()
     };
     match ctx.execute_kip_readonly(request).await {
-        Ok(Response::Ok { result, .. }) => first_integer(&result),
-        _ => None,
+        Ok(Response::Ok { result, .. }) => {
+            let count = first_integer(&result);
+            if count.is_none() {
+                log::warn!(target: "brain", command = command; "kip_count: no integer in result");
+            }
+            count
+        }
+        Ok(Response::Err { error, .. }) => {
+            log::warn!(target: "brain", command = command, error:% = error; "kip_count: KIP error");
+            None
+        }
+        Err(err) => {
+            log::warn!(target: "brain", command = command, error:% = err; "kip_count: request failed");
+            None
+        }
     }
+}
+
+/// Counts concepts without any `belongs_to_domain` proposition, across every
+/// registered concept type (the Maintenance prompt requires schema/meta
+/// concepts to be attached to CoreSchema on creation, so a fully maintained
+/// graph reaches zero orphans).
+///
+/// KIP has no "any node" clause (`?n {}` is a syntax error — an RC11
+/// proposal), so the sweep iterates the `$ConceptType` inventory and sums one
+/// bounded count per type. Heavy — callers run it at settlement time only.
+/// Returns `None` (with the failure logged) when any leg fails, so a partial
+/// sum is never mistaken for a real census.
+pub async fn orphan_count<C>(ctx: &C) -> Option<u64>
+where
+    C: AssessContext + ?Sized,
+{
+    // Inventory of concept types, following pagination if the schema has
+    // sprawled past one page.
+    let mut type_names: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let (command, parameters) = match &cursor {
+            None => (CONCEPT_TYPES_KQL.to_string(), serde_json::Map::new()),
+            Some(token) => (
+                format!("{CONCEPT_TYPES_KQL} CURSOR :cursor"),
+                serde_json::Map::from_iter([("cursor".to_string(), Json::from(token.clone()))]),
+            ),
+        };
+        let request = Request {
+            command,
+            parameters,
+            readonly: true,
+            ..Default::default()
+        };
+        match ctx.execute_kip_readonly(request).await {
+            Ok(Response::Ok {
+                result,
+                next_cursor,
+            }) => {
+                match serde_json::from_value::<Vec<String>>(result) {
+                    Ok(names) => type_names.extend(names),
+                    Err(err) => {
+                        log::warn!(target: "brain", error:% = err; "orphan_count: unexpected type inventory shape");
+                        return None;
+                    }
+                }
+                match next_cursor {
+                    Some(token) => cursor = Some(token),
+                    None => break,
+                }
+            }
+            Ok(Response::Err { error, .. }) => {
+                log::warn!(target: "brain", error:% = error; "orphan_count: type inventory failed");
+                return None;
+            }
+            Err(err) => {
+                log::warn!(target: "brain", error:% = err; "orphan_count: type inventory request failed");
+                return None;
+            }
+        }
+    }
+
+    let mut total: u64 = 0;
+    for type_name in type_names {
+        let request = Request {
+            command: ORPHAN_COUNT_BY_TYPE_KQL.to_string(),
+            parameters: serde_json::Map::from_iter([(
+                "type".to_string(),
+                Json::from(type_name.clone()),
+            )]),
+            readonly: true,
+            ..Default::default()
+        };
+        match ctx.execute_kip_readonly(request).await {
+            Ok(Response::Ok { result, .. }) => match first_integer(&result) {
+                Some(count) => total = total.saturating_add(count),
+                None => {
+                    log::warn!(target: "brain", concept_type = type_name; "orphan_count: no integer in per-type result");
+                    return None;
+                }
+            },
+            Ok(Response::Err { error, .. }) => {
+                log::warn!(target: "brain", concept_type = type_name, error:% = error; "orphan_count: per-type probe failed");
+                return None;
+            }
+            Err(err) => {
+                log::warn!(target: "brain", concept_type = type_name, error:% = err; "orphan_count: per-type request failed");
+                return None;
+            }
+        }
+    }
+    Some(total)
 }
 
 pub fn first_integer(value: &Json) -> Option<u64> {

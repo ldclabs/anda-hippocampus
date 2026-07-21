@@ -2,7 +2,22 @@
 
 All notable changes to the Anda Brain project.
 
-## [Unreleased] — 2026-07-10
+## [Unreleased]
+
+## [0.10.1] — 2026-07-21
+
+### Fixed
+- **Wiki extraction now normalizes schema identifiers.** Extracted concept types are converted to `UpperCamelCase` and predicates to `snake_case` before KML is rendered, preventing malformed or duplicate KIP schema entries.
+- **Orphan metrics now use a valid per-type census.** The graph-health sweep inventories registered concept types and totals their unassigned concepts instead of issuing an unsupported all-concepts query; failed legs return an unknown metric rather than a partial count.
+- **KIP metric failures are visible.** Read-only count and orphan-census failures now emit warnings, and KIP string-literal escaping is centralized so search commands cannot drift.
+
+### Changed
+- **Release version advanced to `0.10.1`.** `anda_brain` now reports `0.10.1`, and the lockfile was refreshed for the release.
+
+## [0.10.0] — 2026-07-16
+
+### Changed
+- **Release version advanced to `0.10.0`.** Upgraded `anda_db`, `anda_db_tfs`, `anda_object_store`, `anda_cognitive_nexus`, and `anda_kip` to `0.10`; migrated the MCP integration to `rmcp` 2.2 (`ContentBlock`); and refreshed the lockfile.
 
 ### Fixed (full-crate review, 8 P1 + 15 P2 + 30 P3 — see CODE_REVIEW.md)
 - **Label ACL closed on the conversations channel.** `get/list_conversation` (HTTP and MCP) reject label-restricted tokens with 403 via a shared guard — recall conversations persist the unrestricted runner history, which bypassed the token's wiki ACL.

@@ -1607,7 +1607,7 @@ impl EvalDriver for Space {
         // Three independent read-only counts; run them concurrently.
         let (unsorted, orphans, predicate_types) = tokio::join!(
             assess::kip_count(self, assess::UNSORTED_COUNT_KQL),
-            assess::kip_count(self, assess::ORPHAN_COUNT_KQL),
+            assess::orphan_count(self),
             assess::kip_count(self, assess::PREDICATE_TYPES_COUNT_KQL),
         );
         stats.unsorted = unsorted;

@@ -1114,6 +1114,64 @@ fn clean_ident(value: &str) -> Option<String> {
     Some(value.to_string())
 }
 
+/// Cleans an extracted concept-type name and normalizes it to the
+/// UpperCamelCase KIP requires (KIP §2.8.2) — extraction models emit
+/// `"drug"`, `"medical device"`, or `"works_at"`-style variants that would
+/// otherwise register as distinct (and `KIP_2001`-prone) schema entries.
+fn clean_type_ident(value: &str) -> Option<String> {
+    let value = clean_ident(value)?;
+    if value.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        && value.chars().all(|c| c.is_ascii_alphanumeric())
+    {
+        return Some(value);
+    }
+    let mut out = String::with_capacity(value.len());
+    for word in value.split(|c: char| !c.is_ascii_alphanumeric()) {
+        let mut chars = word.chars();
+        if let Some(first) = chars.next() {
+            out.extend(first.to_uppercase());
+            out.push_str(chars.as_str());
+        }
+    }
+    (out.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && out.chars().count() <= MAX_IDENT_CHARS)
+        .then_some(out)
+}
+
+/// Cleans an extracted predicate name and normalizes it to the snake_case
+/// KIP requires (KIP §2.8.2): camelCase boundaries become underscores and
+/// non-alphanumeric runs collapse to a single `_`.
+fn clean_predicate_ident(value: &str) -> Option<String> {
+    let value = clean_ident(value)?;
+    if value.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+        && value
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    {
+        return Some(value);
+    }
+    let mut out = String::with_capacity(value.len() + 4);
+    let mut prev_lower_or_digit = false;
+    for c in value.chars() {
+        if c.is_ascii_alphanumeric() {
+            if c.is_ascii_uppercase() && prev_lower_or_digit {
+                out.push('_');
+            }
+            out.extend(c.to_lowercase());
+            prev_lower_or_digit = c.is_ascii_lowercase() || c.is_ascii_digit();
+        } else {
+            if !out.ends_with('_') && !out.is_empty() {
+                out.push('_');
+            }
+            prev_lower_or_digit = false;
+        }
+    }
+    let out = out.trim_matches('_').to_string();
+    (out.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && out.chars().count() <= MAX_IDENT_CHARS)
+        .then_some(out)
+}
+
 /// Validates extracted facts and resolves each anchor to its chunk's byte
 /// range and checksum; facts with unknown anchors cite the whole version.
 /// Returns the persisted facts (capped at [`MAX_FACTS_PER_VERSION`]) plus
@@ -1144,10 +1202,10 @@ fn normalize_facts(
     let mut facts = Vec::new();
     for fact in &extraction.facts {
         let (Some(s_type), Some(s_name), Some(predicate), Some(o_type), Some(o_name)) = (
-            clean_ident(&fact.subject.r#type),
+            clean_type_ident(&fact.subject.r#type),
             clean_ident(&fact.subject.name),
-            clean_ident(&fact.predicate),
-            clean_ident(&fact.object.r#type),
+            clean_predicate_ident(&fact.predicate),
+            clean_type_ident(&fact.object.r#type),
             clean_ident(&fact.object.name),
         ) else {
             continue;
@@ -1240,7 +1298,10 @@ fn render_digest_kml(
     // Optional descriptions from the extraction, only for endpoints in use.
     let mut attributes: BTreeMap<(String, String), serde_json::Map<String, Json>> = BTreeMap::new();
     for concept in extraction.concepts.iter().take(MAX_EXTRA_CONCEPTS) {
-        let (Some(t), Some(n)) = (clean_ident(&concept.r#type), clean_ident(&concept.name)) else {
+        let (Some(t), Some(n)) = (
+            clean_type_ident(&concept.r#type),
+            clean_ident(&concept.name),
+        ) else {
             continue;
         };
         if !concept.attributes.is_empty() {
@@ -1372,6 +1433,51 @@ mod tests {
         assert!(clean_ident("_hidden").is_none());
         assert!(clean_ident("").is_none());
         assert!(clean_ident(&"x".repeat(200)).is_none());
+    }
+
+    #[test]
+    fn clean_type_ident_normalizes_to_upper_camel_case() {
+        assert_eq!(clean_type_ident("Drug"), Some("Drug".to_string()));
+        assert_eq!(clean_type_ident("drug"), Some("Drug".to_string()));
+        assert_eq!(
+            clean_type_ident("medical device"),
+            Some("MedicalDevice".to_string())
+        );
+        assert_eq!(
+            clean_type_ident("clinical-trial"),
+            Some("ClinicalTrial".to_string())
+        );
+        assert_eq!(clean_type_ident("works_at"), Some("WorksAt".to_string()));
+        assert!(clean_type_ident("$ConceptType").is_none());
+        assert!(clean_type_ident("3d printer").is_none());
+        assert!(clean_type_ident("工作").is_none());
+    }
+
+    #[test]
+    fn clean_predicate_ident_normalizes_to_snake_case() {
+        assert_eq!(
+            clean_predicate_ident("works_at"),
+            Some("works_at".to_string())
+        );
+        assert_eq!(
+            clean_predicate_ident("worksAt"),
+            Some("works_at".to_string())
+        );
+        assert_eq!(
+            clean_predicate_ident("WorksAt"),
+            Some("works_at".to_string())
+        );
+        assert_eq!(
+            clean_predicate_ident("works at"),
+            Some("works_at".to_string())
+        );
+        assert_eq!(clean_predicate_ident("treats"), Some("treats".to_string()));
+        assert_eq!(
+            clean_predicate_ident("has  side-effect"),
+            Some("has_side_effect".to_string())
+        );
+        assert!(clean_predicate_ident("_hidden").is_none());
+        assert!(clean_predicate_ident("···").is_none());
     }
 
     #[test]
