@@ -37,11 +37,11 @@ anda_core = { version = "0.14" }
 anda_engine = { version = "0.14" }
 anda_engine_server = { version = "0.14" }
 anda_web3_client = { version = "0.14" }
-anda_object_store = "0.10"
-anda_db = { version = "0.10", features = ["full"] }
-anda_db_tfs = { version = "0.10", features = ["full"] }
-anda_cognitive_nexus = "0.10"
-anda_kip = "0.10"
+anda_object_store = "0.11"
+anda_db = { version = "0.11", features = ["full"] }
+anda_db_tfs = { version = "0.11", features = ["full"] }
+anda_cognitive_nexus = "0.11"
+anda_kip = "0.11"
 base64 = "0.22"
 cbor2 = "1"
 cose2 = "0.3"
@@ -64,11 +64,11 @@ structured-logger = "1"
 log = { version = "0.4", features = ["kv_serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 tower = { version = "0.5", features = ["limit", "load-shed", "util"] }
-tower-http = { version = "0.6", features = ["compression-gzip", "cors"] }
+tower-http = { version = "0.7", features = ["compression-gzip", "cors"] }
 markdown = "1"
 mimalloc = { version = "0.1", features = ["v3"] }
 rand = "0.10"
-rmcp = { version = "2.2", features = [
+rmcp = { version = "3.0", features = [
   "macros",
   "schemars",
   "server",

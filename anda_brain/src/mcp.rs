@@ -222,10 +222,10 @@ impl From<McpKipCommandItem> for anda_kip::CommandItem {
             McpKipCommandItem::WithParams {
                 command,
                 parameters,
-            } => Self::WithParams {
+            } => Self::WithParams(anda_kip::ParameterizedCommand {
                 command,
                 parameters,
-            },
+            }),
         }
     }
 }
@@ -1239,7 +1239,7 @@ pub fn build_streamable_http_service(
     let service_app = app.clone();
     let mut transport_config = StreamableHttpServerConfig::default()
         .with_cancellation_token(cancellation_token)
-        .with_stateful_mode(config.stateful_mode)
+        .with_legacy_session_mode(config.stateful_mode)
         .with_json_response(config.json_response)
         .with_sse_keep_alive(config.sse_keep_alive_secs.map(Duration::from_secs));
 

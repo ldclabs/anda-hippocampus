@@ -4,6 +4,18 @@ All notable changes to the Anda Brain project.
 
 ## [Unreleased]
 
+## [0.10.2] — 2026-07-31
+
+### Changed
+- **Release version advanced to `0.10.2`.** `anda_brain` now reports `0.10.2`, and the lockfile was refreshed for the release.
+- **AndaDB and Cognitive Nexus dependencies upgraded to `0.11`.** `anda_object_store`, `anda_db`, `anda_db_tfs`, `anda_cognitive_nexus`, and `anda_kip` now use the new release line.
+- **MCP and HTTP dependencies upgraded.** The service now uses `rmcp` 3.0 and `tower-http` 0.7.
+
+### Fixed
+- **Database pagination now follows the AndaDB 0.11 query API.** Conversation and wiki listing, housekeeping, and ledger scans use ordered ID queries followed by targeted record reads, retaining bounded pages and stable cursors under the new API semantics.
+- **Graph statistics remain compatible with Cognitive Nexus 0.11.** Space status and graph-counter fallbacks now use the public concept and proposition accessors.
+- **Streamable MCP HTTP retains configured session behavior.** The migration maps the existing stateful-session setting to rmcp 3.0's legacy session mode, and KIP parameterized commands use the updated protocol representation.
+
 ## [0.10.1] — 2026-07-21
 
 ### Fixed

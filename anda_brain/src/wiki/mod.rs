@@ -1073,14 +1073,8 @@ impl WikiService {
             filters.push(Box::new(acl_filter(labels)));
         }
 
-        let rows: Vec<WikiDocRecord> = self
-            .docs
-            .search_as(Query {
-                search: None,
-                filter: Some(Filter::And(filters)),
-                limit: Some(limit),
-            })
-            .await?;
+        let rows: Vec<WikiDocRecord> =
+            query_last_as(&self.docs, Filter::And(filters), limit).await?;
         let next_cursor = page_cursor(&rows, limit, |doc| doc._id);
         Ok(WikiDocListOutput {
             docs: rows.into_iter().map(Into::into).collect(),
@@ -1097,28 +1091,26 @@ impl WikiService {
         let doc = self.doc_record(doc_id).await?;
         let limit = limit.unwrap_or(20).clamp(1, 100);
         let cursor = self.cursor_or_max(&self.versions, &cursor)?;
-        let rows: Vec<WikiVersionRecord> = self
-            .versions
-            .search_as(Query {
-                search: None,
-                filter: Some(Filter::And(vec![
-                    Box::new(Filter::Field((
-                        "doc_id".to_string(),
-                        RangeQuery::Eq(Fv::U64(doc._id)),
-                    ))),
-                    Box::new(Filter::Field((
-                        "_id".to_string(),
-                        RangeQuery::Lt(Fv::U64(cursor)),
-                    ))),
-                    // Orphans from crashed commits are not history.
-                    Box::new(Filter::Field((
-                        "_id".to_string(),
-                        RangeQuery::Le(Fv::U64(doc.current_version)),
-                    ))),
-                ])),
-                limit: Some(limit),
-            })
-            .await?;
+        let rows: Vec<WikiVersionRecord> = query_last_as(
+            &self.versions,
+            Filter::And(vec![
+                Box::new(Filter::Field((
+                    "doc_id".to_string(),
+                    RangeQuery::Eq(Fv::U64(doc._id)),
+                ))),
+                Box::new(Filter::Field((
+                    "_id".to_string(),
+                    RangeQuery::Lt(Fv::U64(cursor)),
+                ))),
+                // Orphans from crashed commits are not history.
+                Box::new(Filter::Field((
+                    "_id".to_string(),
+                    RangeQuery::Le(Fv::U64(doc.current_version)),
+                ))),
+            ]),
+            limit,
+        )
+        .await?;
         let next_cursor = page_cursor(&rows, limit, |v| v._id);
         Ok(WikiVersionListOutput {
             versions: rows.iter().map(|v| version_info(v, v._id)).collect(),
@@ -1151,14 +1143,8 @@ impl WikiService {
                 RangeQuery::Eq(Fv::U64(doc_id)),
             ))));
         }
-        let rows: Vec<WikiEventRecord> = self
-            .events
-            .search_as(Query {
-                search: None,
-                filter: Some(Filter::And(filters)),
-                limit: Some(limit),
-            })
-            .await?;
+        let rows: Vec<WikiEventRecord> =
+            query_last_as(&self.events, Filter::And(filters), limit).await?;
         let next_cursor = page_cursor(&rows, limit, |e| e._id);
         Ok(WikiEventListOutput {
             events: rows
@@ -1409,23 +1395,21 @@ impl WikiService {
         let mut newest: BTreeMap<u64, u64> = BTreeMap::new(); // doc_id → event id
         let mut cursor = self.events.max_document_id() + 1;
         loop {
-            let rows: Vec<WikiEventRecord> = self
-                .events
-                .search_as(Query {
-                    search: None,
-                    filter: Some(Filter::And(vec![
-                        Box::new(Filter::Field((
-                            "kind".to_string(),
-                            RangeQuery::Eq(Fv::Text(EVENT_DIGEST_EXTRACTED.to_string())),
-                        ))),
-                        Box::new(Filter::Field((
-                            "_id".to_string(),
-                            RangeQuery::Lt(Fv::U64(cursor)),
-                        ))),
-                    ])),
-                    limit: Some(Collection::MAX_SEARCH_LIMIT),
-                })
-                .await?;
+            let rows: Vec<WikiEventRecord> = query_last_as(
+                &self.events,
+                Filter::And(vec![
+                    Box::new(Filter::Field((
+                        "kind".to_string(),
+                        RangeQuery::Eq(Fv::Text(EVENT_DIGEST_EXTRACTED.to_string())),
+                    ))),
+                    Box::new(Filter::Field((
+                        "_id".to_string(),
+                        RangeQuery::Lt(Fv::U64(cursor)),
+                    ))),
+                ]),
+                Collection::MAX_SEARCH_LIMIT,
+            )
+            .await?;
             let Some(min_id) = rows.iter().map(|r| r._id).min() else {
                 break;
             };
@@ -1461,27 +1445,25 @@ impl WikiService {
 
         let mut cursor = self.docs.max_document_id() + 1;
         loop {
-            let docs: Vec<WikiDocRecord> = self
-                .docs
-                .search_as(Query {
-                    search: None,
-                    filter: Some(Filter::And(vec![
-                        Box::new(Filter::Field((
-                            "_id".to_string(),
-                            RangeQuery::Lt(Fv::U64(cursor)),
-                        ))),
-                        Box::new(Filter::Field((
-                            "current_version".to_string(),
-                            RangeQuery::Gt(Fv::U64(0)),
-                        ))),
-                        Box::new(Filter::Field((
-                            "status".to_string(),
-                            RangeQuery::Eq(Fv::Text(DOC_STATUS_ACTIVE.to_string())),
-                        ))),
-                    ])),
-                    limit: Some(SCAN_PAGE),
-                })
-                .await?;
+            let docs: Vec<WikiDocRecord> = query_last_as(
+                &self.docs,
+                Filter::And(vec![
+                    Box::new(Filter::Field((
+                        "_id".to_string(),
+                        RangeQuery::Lt(Fv::U64(cursor)),
+                    ))),
+                    Box::new(Filter::Field((
+                        "current_version".to_string(),
+                        RangeQuery::Gt(Fv::U64(0)),
+                    ))),
+                    Box::new(Filter::Field((
+                        "status".to_string(),
+                        RangeQuery::Eq(Fv::Text(DOC_STATUS_ACTIVE.to_string())),
+                    ))),
+                ]),
+                SCAN_PAGE,
+            )
+            .await?;
             let Some(min_id) = docs.iter().map(|d| d._id).min() else {
                 break;
             };
@@ -1545,17 +1527,12 @@ impl WikiService {
 
         let mut cursor = self.docs.max_document_id() + 1;
         loop {
-            let docs: Vec<WikiDocRecord> = self
-                .docs
-                .search_as(Query {
-                    search: None,
-                    filter: Some(Filter::Field((
-                        "_id".to_string(),
-                        RangeQuery::Lt(Fv::U64(cursor)),
-                    ))),
-                    limit: Some(SCAN_PAGE),
-                })
-                .await?;
+            let docs: Vec<WikiDocRecord> = query_last_as(
+                &self.docs,
+                Filter::Field(("_id".to_string(), RangeQuery::Lt(Fv::U64(cursor)))),
+                SCAN_PAGE,
+            )
+            .await?;
             let Some(min_id) = docs.iter().map(|d| d._id).min() else {
                 break;
             };
@@ -1865,17 +1842,16 @@ impl WikiService {
         let mut cursor = collection.max_document_id() + 1;
         loop {
             let ids = collection
-                .search_ids(Query {
-                    search: None,
-                    filter: Some(Filter::And(vec![
+                .query_last_ids(
+                    Filter::And(vec![
                         Box::new(base.clone()),
                         Box::new(Filter::Field((
                             "_id".to_string(),
                             RangeQuery::Lt(Fv::U64(cursor)),
                         ))),
-                    ])),
-                    limit: Some(Collection::MAX_SEARCH_LIMIT),
-                })
+                    ]),
+                    Some(Collection::MAX_SEARCH_LIMIT),
+                )
                 .await?;
             let Some(min_id) = ids.iter().copied().min() else {
                 break;
@@ -2123,6 +2099,22 @@ fn page_cursor<T>(rows: &[T], limit: usize, id_of: impl Fn(&T) -> u64) -> Option
     } else {
         None
     }
+}
+
+async fn query_last_as<T>(
+    collection: &Collection,
+    filter: Filter,
+    limit: usize,
+) -> Result<Vec<T>, WikiError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let ids = collection.query_last_ids(filter, Some(limit)).await?;
+    let mut rows = Vec::with_capacity(ids.len());
+    for id in ids {
+        rows.push(collection.get_as(id).await?);
+    }
+    Ok(rows)
 }
 
 async fn init_wiki_docs(collection: &mut Collection) -> Result<(), DBError> {

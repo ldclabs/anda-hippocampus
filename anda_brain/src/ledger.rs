@@ -204,10 +204,9 @@ impl UsageLedger {
     ///
     /// Pages by `_id > after_id` so a prefix of persistently-failing rows
     /// cannot occupy every batch window and starve the dirty rows behind
-    /// them. The id-set intersection is index-only; ids are sorted here
-    /// because `Filter::And` yields an unordered set, and only the page's
-    /// documents are fetched. Returns the page plus `Some(last_scanned_id)`
-    /// when more dirty rows remain past it (`None` = scan exhausted).
+    /// them. The id-set intersection is index-only; only the page's documents
+    /// are fetched. Returns the page plus `Some(last_scanned_id)` when more
+    /// dirty rows remain past it (`None` = scan exhausted).
     pub async fn unflushed_recalls(
         &self,
         after_id: u64,
@@ -215,19 +214,16 @@ impl UsageLedger {
     ) -> Result<(Vec<MemoryUsage>, Option<u64>), DBError> {
         let mut ids = self
             .collection
-            .query_ids(
-                Filter::And(vec![
-                    Box::new(Filter::Field((
-                        "dirty".to_string(),
-                        RangeQuery::Eq(Fv::U64(1)),
-                    ))),
-                    Box::new(Filter::Field((
-                        "_id".to_string(),
-                        RangeQuery::Gt(Fv::U64(after_id)),
-                    ))),
-                ]),
-                None,
-            )
+            .query_all_ids(Filter::And(vec![
+                Box::new(Filter::Field((
+                    "dirty".to_string(),
+                    RangeQuery::Eq(Fv::U64(1)),
+                ))),
+                Box::new(Filter::Field((
+                    "_id".to_string(),
+                    RangeQuery::Gt(Fv::U64(after_id)),
+                ))),
+            ]))
             .await?;
         ids.sort_unstable();
         let next_cursor = if ids.len() > limit {

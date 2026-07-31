@@ -1002,8 +1002,8 @@ impl Space {
         let mut info = SpaceInfo {
             id: self.id.clone(),
             db_stats: self.db.stats(),
-            concepts: self.memory.nexus.concepts.len(),
-            propositions: self.memory.nexus.propositions.len(),
+            concepts: self.memory.nexus.concepts().len(),
+            propositions: self.memory.nexus.propositions().len(),
             conversations: self.memory.conversations.len(),
             formation_processed_id: self.formation.get_processed().unwrap_or_default(),
             maintenance_processed_id: self.maintenance.get_processed().unwrap_or_default(),
@@ -1055,8 +1055,8 @@ impl Space {
     pub fn formation_status(&self) -> FormationStatus {
         FormationStatus {
             id: self.id.clone(),
-            concepts: self.memory.nexus.concepts.len(),
-            propositions: self.memory.nexus.propositions.len(),
+            concepts: self.memory.nexus.concepts().len(),
+            propositions: self.memory.nexus.propositions().len(),
             conversations: self.memory.conversations.len(),
             formation_processing: self.formation.is_processing(),
             maintenance_processing: self.maintenance.is_processing(),
@@ -1094,7 +1094,7 @@ impl Space {
         let nodes = self
             .memory
             .nexus
-            .concepts
+            .concepts()
             .len()
             .max(self.memory.conversations.len()) as u64;
         let tier = self.get_tier();
@@ -1410,8 +1410,8 @@ impl Space {
             .db
             .get_extension_as::<MemoryGraphCounters>("memory_graph_counters")
             .unwrap_or_else(|| MemoryGraphCounters {
-                concepts: self.memory.nexus.concepts.len() as u64,
-                propositions: self.memory.nexus.propositions.len() as u64,
+                concepts: self.memory.nexus.concepts().len() as u64,
+                propositions: self.memory.nexus.propositions().len() as u64,
                 ..Default::default()
             });
         let maintenance_usage: Usage = self
@@ -2754,7 +2754,7 @@ impl Space {
         cursor: Option<String>,
         limit: Option<usize>,
     ) -> Result<(Vec<Conversation>, Option<String>), BoxError> {
-        use anda_db::query::{Filter, Query, RangeQuery};
+        use anda_db::query::{Filter, RangeQuery};
 
         let collection = match collection.as_deref() {
             Some("recall") => self.recall.conversations.conversations.clone(),
@@ -2769,26 +2769,21 @@ impl Space {
                 .into());
             }
         };
-        // 0 means "no limit" to the database (an unbounded scan), and an empty
-        // page would panic on `rt.first().unwrap()` below; clamp instead.
+        // AndaDB 0.11 treats 0 as an empty page, which would panic on
+        // `rt.first().unwrap()` below; clamp instead.
         let limit = limit.unwrap_or(10).clamp(1, 100);
         let cursor = match BTree::from_cursor::<u64>(&cursor)? {
             Some(cursor) => cursor,
             None => collection.max_document_id() + 1,
         };
 
-        let filter = Some(Filter::Field((
-            "_id".to_string(),
-            RangeQuery::Lt(Fv::U64(cursor)),
-        )));
+        let filter = Filter::Field(("_id".to_string(), RangeQuery::Lt(Fv::U64(cursor))));
 
-        let rt: Vec<Conversation> = collection
-            .search_as(Query {
-                search: None,
-                filter,
-                limit: Some(limit),
-            })
-            .await?;
+        let ids = collection.query_last_ids(filter, Some(limit)).await?;
+        let mut rt = Vec::with_capacity(ids.len());
+        for id in ids {
+            rt.push(collection.get_as::<Conversation>(id).await?);
+        }
         let cursor = if rt.len() >= limit {
             BTree::to_cursor(&rt.first().unwrap()._id)
         } else {
@@ -2838,8 +2833,8 @@ impl Space {
             description: None,
             owner: owner.to_string(),
             db_stats: db.stats(),
-            concepts: nexus.concepts.len(),
-            propositions: nexus.propositions.len(),
+            concepts: nexus.concepts().len(),
+            propositions: nexus.propositions().len(),
             conversations: memory.conversations.len(),
             public: false,
             tier,
