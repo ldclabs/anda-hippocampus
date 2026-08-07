@@ -5,15 +5,17 @@ use std::str::FromStr;
 
 pub mod agents;
 pub mod assess;
-pub mod authz;
+pub(crate) mod authz;
 pub mod eval;
 pub mod handler;
-pub mod ledger;
+pub(crate) mod ledger;
 pub mod mcp;
 pub mod payload;
 pub mod space;
+#[cfg(test)]
+pub(crate) mod testkit;
 pub mod types;
-pub mod wiki;
+pub(crate) mod wiki;
 
 pub fn parse_ed25519_pubkeys(input: &str) -> Result<Vec<VerifyingKey>, BoxError> {
     if input.is_empty() {

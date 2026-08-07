@@ -75,6 +75,18 @@ impl Caller {
         label_restricted(self.st.as_ref())
     }
 
+    /// Agentic-recall guard: RecallAgent's wiki tools span all labels, so a
+    /// label-restricted token cannot use recall (mirrors the /wiki/events
+    /// guard). Single source for HTTP `/recall{,_structured}` and the MCP
+    /// recall tool, so the denial reason cannot drift between channels.
+    pub fn recall_forbidden(&self) -> Option<&'static str> {
+        if self.label_restricted() {
+            Some("recall requires an unrestricted token")
+        } else {
+            None
+        }
+    }
+
     /// Conversation-read guard; see [`conversation_read_forbidden`].
     pub fn conversation_read_forbidden(&self, collection: Option<&str>) -> Option<&'static str> {
         conversation_read_forbidden(&self.cwt, self.st.as_ref(), collection)

@@ -8,6 +8,7 @@
 pub mod judge;
 pub mod mine;
 pub mod optimize;
+pub mod run;
 
 use anda_core::{AgentOutput, BoxError, CompletionRequest, ContentPart, Json, Message, Usage};
 use anda_engine::rfc3339_datetime_now;

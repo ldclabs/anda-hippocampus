@@ -8,16 +8,18 @@
 
 mod chunk;
 mod digest;
-pub mod evalset;
+/// Retrieval-quality baseline harness; exercised only by its own tests
+/// (the hit-rate test *is* the harness runner).
+#[cfg(test)]
+mod evalset;
 mod model;
 mod okf;
 mod tool;
 mod types;
 
 pub use chunk::{CHUNKER_VERSION, chunk_markdown, normalize_content, slugify, slugify_path};
-pub use digest::{DigestedFact, WIKI_DIGEST_EXTRACTOR, WikiDigest, WikiDigestReport};
+pub use digest::{WikiDigest, WikiDigestReport};
 pub use model::*;
-pub use okf::OKF_VERSION;
 pub use tool::{WikiCommitTool, WikiReadTool, WikiSearchTool, WikiToolScope};
 pub use types::*;
 
@@ -524,7 +526,10 @@ impl WikiService {
     /// version, namespace, archive state) is entirely in the filter, which
     /// AndaDB applies in the same query while preserving relevance order.
     /// Unrestricted view: agent tools and internal callers.
-    pub async fn search(&self, input: WikiSearchInput) -> Result<WikiSearchOutput, WikiError> {
+    /// Unscoped, unevented search; production paths go through
+    /// `search_scoped` (HTTP/MCP) and `search_view` (agent tool).
+    #[cfg(test)]
+    async fn search(&self, input: WikiSearchInput) -> Result<WikiSearchOutput, WikiError> {
         self.bump_query_count();
         self.search_inner(input, None).await
     }
@@ -686,7 +691,7 @@ impl WikiService {
             // Production spaces hold no eval chunks (zero loss); inside
             // dedicated eval spaces this degrades to fewer hits, never
             // wrong ones.
-            rows.retain(|row| row.namespace != evalset::EVAL_NAMESPACE);
+            rows.retain(|row| row.namespace != EVAL_NAMESPACE);
         }
 
         let mut seen_docs = std::collections::BTreeSet::new();
@@ -1021,7 +1026,9 @@ impl WikiService {
         })
     }
 
-    pub async fn get_doc(&self, doc_id: u64) -> Result<WikiDocInfo, WikiError> {
+    /// Unscoped doc lookup; production paths go through `get_doc_scoped`.
+    #[cfg(test)]
+    pub(crate) async fn get_doc(&self, doc_id: u64) -> Result<WikiDocInfo, WikiError> {
         Ok(self.doc_record(doc_id).await?.into())
     }
 
@@ -1470,7 +1477,7 @@ impl WikiService {
             cursor = min_id;
             let page_len = docs.len();
             for doc in docs {
-                if doc.namespace == evalset::EVAL_NAMESPACE {
+                if doc.namespace == EVAL_NAMESPACE {
                     continue;
                 }
                 report.checked_docs += 1;
@@ -2779,7 +2786,7 @@ mod tests {
     async fn eval_namespace_is_excluded_from_default_search() {
         let wiki = test_wiki("wiki_eval_excluded").await;
         let mut eval_doc = commit_input("评测文档", "# 评测文档\n\n评测探针：孤峰栈道。\n");
-        eval_doc.namespace = Some(evalset::EVAL_NAMESPACE.to_string());
+        eval_doc.namespace = Some(EVAL_NAMESPACE.to_string());
         wiki.commit("eval".to_string(), eval_doc, 1000)
             .await
             .unwrap();
@@ -2791,7 +2798,7 @@ mod tests {
         assert!(default.hits.is_empty());
 
         let mut explicit = WikiSearchInput::from_query("孤峰栈道".to_string());
-        explicit.namespaces = vec![evalset::EVAL_NAMESPACE.to_string()];
+        explicit.namespaces = vec![EVAL_NAMESPACE.to_string()];
         let explicit = wiki.search(explicit).await.unwrap();
         assert_eq!(explicit.hits.len(), 1);
     }
@@ -3647,7 +3654,10 @@ mod m4_tests {
             )
             .await
             .unwrap();
-        let access = WikiAccess::unrestricted("auditor");
+        let access = WikiAccess {
+            actor: "auditor".to_string(),
+            labels: None,
+        };
 
         // Disabled (default): scoped reads leave no events.
         wiki.search_scoped(

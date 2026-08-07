@@ -23,11 +23,6 @@ use std::{
 use super::{BrainHook, RunnerFlow, RunnerHost, SELF_USER_ID, drive_runner_loop};
 use crate::types::{MaintenanceAt, MaintenanceInput, MaintenanceScope};
 
-// Kept for reference; the runtime prompt comes from `prompts::active_prompt`
-// so the eval optimizer can install candidate prompts.
-#[allow(dead_code)]
-const SELF_INSTRUCTIONS: &str = include_str!("../../assets/BrainMaintenance.md");
-
 /// Resets the AtomicBool to false on drop (panic guard for processing flag).
 struct ProcessingGuard(Arc<AtomicBool>);
 impl Drop for ProcessingGuard {
@@ -448,23 +443,19 @@ mod tests {
     use crate::{
         agents::SELF_USER_ID,
         space::AppState,
+        testkit::{app_state_core, create_loaded_space, models_with_completer},
         types::{MaintenanceInput, MaintenanceScope},
     };
     use anda_core::{
-        Agent, AgentOutput, BoxError, BoxPinFut, CompletionRequest, Message, Principal, ToolCall,
-        Usage,
+        Agent, AgentOutput, BoxError, BoxPinFut, CompletionRequest, Message, ToolCall, Usage,
     };
-    use anda_db::{database::DBConfig, storage::StorageConfig};
     use anda_engine::{
         context::AgentCtx,
-        management::{BaseManagement, Visibility},
         memory::{Conversation, ConversationRef, ConversationStatus},
-        model::{CompletionFeaturesDyn, Model, Models, reqwest},
+        model::CompletionFeaturesDyn,
         unix_ms,
     };
-    use object_store::memory::InMemory;
     use serde_json::json;
-    use std::collections::BTreeSet;
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -650,53 +641,11 @@ mod tests {
         }
     }
 
-    fn test_db_config(name: &str) -> DBConfig {
-        DBConfig {
-            name: name.to_string(),
-            description: "test database".to_string(),
-            storage: StorageConfig::default(),
-            lock: None,
-        }
-    }
-
     fn test_app_state_with_completer<C>(name: &str, completer: C) -> AppState
     where
         C: CompletionFeaturesDyn,
     {
-        let models = Models::default();
-        models.set_model(Model::with_completer(Arc::new(completer)));
-        let management = Arc::new(BaseManagement {
-            controller: SELF_USER_ID,
-            managers: BTreeSet::new(),
-            visibility: Visibility::Public,
-        });
-        let http_client = reqwest::Client::builder().build().unwrap();
-
-        AppState::new(
-            Arc::new(InMemory::new()),
-            Arc::new(test_db_config(name)),
-            management,
-            http_client,
-            Arc::new(models),
-            Arc::new(vec![]),
-            "anda_brain".to_string(),
-            "test".to_string(),
-            0,
-        )
-    }
-
-    async fn create_loaded_space(app: &AppState, id: &str) -> Arc<crate::space::Space> {
-        app.admin_create_space(
-            Principal::from_slice(&[1]),
-            Principal::from_slice(&[2]),
-            id.to_string(),
-            1,
-            123,
-        )
-        .await
-        .unwrap();
-
-        app.load_space(id, false).await.unwrap()
+        app_state_core(name, models_with_completer(completer), vec![], "test", 0)
     }
 
     fn maintenance_prompt(scope: MaintenanceScope) -> String {

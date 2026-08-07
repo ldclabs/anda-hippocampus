@@ -30,9 +30,9 @@ use std::{
 };
 
 use super::{
-    Collection, EVENT_DIGEST_EXTRACTED, EVENT_DIGEST_FAILED, WikiChunkRecord, WikiDocRecord,
-    WikiError, WikiService, WikiVerifyInput, WikiVerifyStatus, WikiVersionRecord,
-    chunk::chunk_checksum, citation_uri, evalset::EVAL_NAMESPACE,
+    Collection, EVAL_NAMESPACE, EVENT_DIGEST_EXTRACTED, EVENT_DIGEST_FAILED, WikiChunkRecord,
+    WikiDocRecord, WikiError, WikiService, WikiVerifyInput, WikiVerifyStatus, WikiVersionRecord,
+    chunk::chunk_checksum, citation_uri,
 };
 
 /// Extractor fingerprint prefix written into proposition metadata; bump on
@@ -1733,7 +1733,6 @@ mod tests {
         assert!(kql_has_rows(&json!([{"id": "P1"}])));
     }
 
-    use super::super::EVENT_CITATION_VERIFY_FAILED;
     use super::super::tests::{commit_input, test_wiki};
 
     #[tokio::test]
@@ -1869,7 +1868,7 @@ mod tests {
         // reference error, not corruption — no audit event.
         let events = wiki
             .list_events(
-                Some(EVENT_CITATION_VERIFY_FAILED.to_string()),
+                Some("CitationVerifyFailed".to_string()),
                 None,
                 None,
                 Some(10),

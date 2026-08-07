@@ -66,7 +66,7 @@ use crate::{
     },
 };
 
-pub static FUNCTION_DEFINITION: LazyLock<FunctionDefinition> = LazyLock::new(|| {
+static FUNCTION_DEFINITION: LazyLock<FunctionDefinition> = LazyLock::new(|| {
     serde_json::from_value(json!({
         "name": "execute_kip",
         "description": "Executes one or more KIP (Knowledge Interaction Protocol) commands against the Cognitive Nexus to interact with your persistent memory.",
@@ -97,7 +97,7 @@ pub static FUNCTION_DEFINITION: LazyLock<FunctionDefinition> = LazyLock::new(|| 
 /// budget.
 const DEFAULT_LLM_MAX_CONCURRENCY: usize = 64;
 
-pub struct SpaceEntry {
+struct SpaceEntry {
     cell: OnceCell<Arc<Space>>,
     last_access_ms: AtomicU64,
 }
@@ -194,19 +194,22 @@ impl AppState {
         &self.llm_semaphore
     }
 
-    pub fn cwt_auth_enabled(&self) -> bool {
+    pub(crate) fn cwt_auth_enabled(&self) -> bool {
         !self.ed25519_pubkeys.is_empty()
     }
 
     /// The object store backing this state's spaces.
-    pub fn object_store(&self) -> Arc<dyn ObjectStore> {
+    fn object_store(&self) -> Arc<dyn ObjectStore> {
         self.object_store.clone()
     }
 
     /// Forks a space into its own in-memory store, optionally installing a
     /// candidate memory policy. Forks are fully isolated: nothing they do
-    /// can reach the source space's graph, ledger, or metrics.
-    async fn fork_space_for_shadow(
+    /// can reach the source space's graph, ledger, or metrics. This is the
+    /// only supported way to open a throwaway copy of a space (shadow eval,
+    /// shared-formation eval forks): it owns the whole protocol — copy the
+    /// objects, fork the state, and load without background autostart.
+    pub async fn fork_space(
         &self,
         space_id: &str,
         policy: Option<MemoryPolicy>,
@@ -234,7 +237,7 @@ impl AppState {
     /// so they can never pollute its conversations, usage ledger, or
     /// metrics (plan guardrail 4). Promotion stays human: read the report,
     /// then `update_space` with the candidate policy if it won.
-    pub async fn run_shadow_eval(
+    pub(crate) async fn run_shadow_eval(
         &self,
         space_id: &str,
         input: ShadowEvalInput,
@@ -268,10 +271,10 @@ impl AppState {
         // same queries, so drift shows up as a tie, not a false win.
         // Settling both makes the comparison fair — same metabolism pass,
         // different knobs.
-        space.db.flush().await.ok();
+        space.flush().await.ok();
         let (baseline, candidate) = tokio::try_join!(
-            self.fork_space_for_shadow(space_id, None),
-            self.fork_space_for_shadow(space_id, Some(input.policy.clone())),
+            self.fork_space(space_id, None),
+            self.fork_space(space_id, Some(input.policy.clone())),
         )?;
         // Interval 0 bypasses the weekly decay gate: the forks inherit the
         // live space's `decay_applied_at` stamps, and under the gate both
@@ -374,8 +377,8 @@ impl AppState {
         }
 
         // Forks live in memory and vanish on drop; closing is best-effort.
-        let _ = baseline.db.close().await;
-        let _ = candidate.db.close().await;
+        let _ = baseline.close().await;
+        let _ = candidate.close().await;
 
         space
             .db
@@ -429,7 +432,7 @@ impl AppState {
     }
 
     // 用户权限
-    pub fn check_auth_if(
+    pub(crate) fn check_auth_if(
         &self,
         token: &str,
         audience: &str,
@@ -525,7 +528,7 @@ impl AppState {
     /// Note: `pinned` and `autostart` take effect only on the load that
     /// actually initializes the space; a cache hit returns the space as it
     /// was first opened and ignores both parameters.
-    pub async fn load_space_with(
+    async fn load_space_with(
         &self,
         space_id: &str,
         pinned: bool,
@@ -600,7 +603,7 @@ impl AppState {
                     for (id, entry) in entries {
                         if let Some(space) = entry.cell.get().cloned() {
                             tasks.spawn(async move {
-                                if let Err(err) = space.db.close().await {
+                                if let Err(err) = space.close().await {
                                     log::error!(target: "brain", space_id = id; "close on shutdown failed: {err:?}");
                                 }
                             });
@@ -725,12 +728,12 @@ pub struct Space {
     /// Independent judge model for eval runs (plan M9); unset means judge
     /// completions share the space's default model (documented caveat).
     judge_model: std::sync::RwLock<Option<Arc<Model>>>,
-    pub formation: Arc<FormationAgent>,
-    pub recall: Arc<RecallAgent>,
-    pub db: Arc<AndaDB>,
-    pub memory: Arc<MemoryManagement>,
-    pub wiki: Arc<WikiService>,
-    pub wiki_digest: Arc<WikiDigest>,
+    pub(crate) formation: Arc<FormationAgent>,
+    pub(crate) recall: Arc<RecallAgent>,
+    pub(crate) db: Arc<AndaDB>,
+    pub(crate) memory: Arc<MemoryManagement>,
+    pub(crate) wiki: Arc<WikiService>,
+    pub(crate) wiki_digest: Arc<WikiDigest>,
 }
 
 impl Space {
@@ -738,7 +741,7 @@ impl Space {
         self.formation.is_processing() || self.maintenance.is_processing()
     }
 
-    pub fn get_tier(&self) -> SpaceTier {
+    fn get_tier(&self) -> SpaceTier {
         self.db.get_extension_as("tier").unwrap_or_default()
     }
 
@@ -973,7 +976,7 @@ impl Space {
     /// The space's memory policy; absent means the process-wide eval
     /// override (optimizer runs, plan M10) or [`MemoryPolicy::default`],
     /// which reproduces the compiled-in behavior (plan module M-P).
-    pub fn memory_policy(&self) -> MemoryPolicy {
+    fn memory_policy(&self) -> MemoryPolicy {
         self.db
             .get_extension_as(MemoryPolicy::EXTENSION_KEY)
             .or_else(MemoryPolicy::eval_override)
@@ -1234,10 +1237,7 @@ impl Space {
 
     /// The user queries of the most recent completed recall conversations,
     /// newest first — the shadow evaluation's replay corpus (plan M11).
-    pub(crate) async fn recent_recall_queries(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<String>, BoxError> {
+    async fn recent_recall_queries(&self, limit: usize) -> Result<Vec<String>, BoxError> {
         let (conversations, _) = self
             .recall
             .conversations
@@ -1280,10 +1280,7 @@ impl Space {
 
     /// Records which graph entities a completed recall surfaced
     /// (plan M1). Called from the conversation-end hook, off the hot path.
-    pub(crate) async fn record_recall_usage(
-        &self,
-        messages: &[serde_json::Value],
-    ) -> Result<u64, BoxError> {
+    async fn record_recall_usage(&self, messages: &[serde_json::Value]) -> Result<u64, BoxError> {
         let messages: Vec<Message> = messages
             .iter()
             .filter_map(|message| serde_json::from_value::<Message>(message.clone()).ok())
@@ -1370,7 +1367,7 @@ impl Space {
     }
 
     /// The last memory-metabolism settlement report, when one has run.
-    pub fn memory_settlement(&self) -> Option<MemorySettlementReport> {
+    fn memory_settlement(&self) -> Option<MemorySettlementReport> {
         self.db.get_extension_as("memory_settlement")
     }
 
@@ -1513,7 +1510,8 @@ impl Space {
     }
 
     /// The last per-predicate schema census, when one has run.
-    pub fn schema_audit(&self) -> Option<SchemaAudit> {
+    #[cfg(test)]
+    fn schema_audit(&self) -> Option<SchemaAudit> {
         self.db.get_extension_as("schema_audit")
     }
 
@@ -1594,7 +1592,7 @@ impl Space {
     /// 3. **Correction discovery** (every scope): newly superseded links are
     ///    recorded in the ledger and aggregated per `metadata.source` into
     ///    the `source_reliability` extension.
-    pub async fn settle_memory_metabolism(
+    async fn settle_memory_metabolism(
         &self,
         scope: MaintenanceScope,
         now_ms: u64,
@@ -1608,7 +1606,7 @@ impl Space {
     /// `decay_applied_at` stamps, and under the weekly gate both forks would
     /// settle identically whenever the live space decayed within the window
     /// — every comparison of decay knobs would be a systematic tie.
-    pub(crate) async fn settle_memory_metabolism_with(
+    async fn settle_memory_metabolism_with(
         &self,
         scope: MaintenanceScope,
         now_ms: u64,
@@ -2140,7 +2138,7 @@ impl Space {
     /// Fires the dream self-test in the background (plan M7); called after a
     /// maintenance cycle completes. Skipped when disabled by policy or when
     /// a pass is already running.
-    pub fn kick_memory_self_test(self: &Arc<Self>) {
+    fn kick_memory_self_test(self: &Arc<Self>) {
         if self.memory_policy().self_test_queries_per_cycle == 0 {
             return;
         }
@@ -2174,10 +2172,7 @@ impl Space {
     /// count only into `self_test_count` — never into usage reinforcement.
     ///
     /// Returns `None` when disabled, already running, or nothing qualifies.
-    pub async fn run_memory_self_test(
-        &self,
-        now_ms: u64,
-    ) -> Result<Option<SelfTestReport>, BoxError> {
+    async fn run_memory_self_test(&self, now_ms: u64) -> Result<Option<SelfTestReport>, BoxError> {
         let Ok(_guard) = self.self_test_lock.try_lock() else {
             return Ok(None);
         };
@@ -2577,7 +2572,7 @@ impl Space {
 
     /// WikiDigest is off by default (PRD §13): extraction writes to the
     /// graph, so spaces opt in explicitly via `update_space { wiki_digest }`.
-    pub fn wiki_digest_enabled(&self) -> bool {
+    fn wiki_digest_enabled(&self) -> bool {
         self.db.get_extension_as("wiki_digest").unwrap_or(false)
     }
 
@@ -2627,7 +2622,7 @@ impl Space {
     /// too), audit-log retention pruning, the stale-document report, and the
     /// citation sample check (independent of the digest switch). Cheap enough
     /// to run alongside every digest kick.
-    pub fn kick_wiki_housekeeping(self: &Arc<Self>) {
+    fn kick_wiki_housekeeping(self: &Arc<Self>) {
         let space = self.clone();
         tokio::spawn(async move {
             let now_ms = unix_ms();
@@ -2668,7 +2663,7 @@ impl Space {
 
     /// Fire-and-forget digest kick used by startup and post-maintenance
     /// hooks; a no-op when disabled or already running.
-    pub fn kick_wiki_digest(self: &Arc<Self>) {
+    fn kick_wiki_digest(self: &Arc<Self>) {
         if !self.wiki_digest_enabled() || self.wiki_digest.is_processing() {
             return;
         }
@@ -2797,7 +2792,10 @@ impl Space {
         Ok(())
     }
 
-    async fn close(&self) -> Result<(), BoxError> {
+    /// Closes the space's database so AndaDB flushes collections and
+    /// metadata. Callers that open throwaway spaces (eval runs, forks) must
+    /// close them through this method instead of reaching into the DB handle.
+    pub async fn close(&self) -> Result<(), BoxError> {
         self.db.close().await?;
         Ok(())
     }
@@ -3546,7 +3544,7 @@ LIMIT {limit}"#,
 /// another, preserving paths. This is the eval fork primitive: AndaDB
 /// metadata embeds its own base path, so a space must keep its id and be
 /// forked into a *different* store — never renamed inside the same store.
-pub async fn copy_space_objects(
+async fn copy_space_objects(
     src: &Arc<dyn ObjectStore>,
     dst: &Arc<dyn ObjectStore>,
     space_id: &str,
@@ -3576,6 +3574,7 @@ mod tests {
     use crate::{
         agents::{BrainHook, SELF_USER_ID, TimedMemoryReadonly},
         payload::StringOr,
+        testkit::{app_state_core, create_loaded_space},
         types::{
             AddSpaceTokenInput, FormationInput, InputContext, MaintenanceInput,
             MaintenanceParameters, MaintenanceScope, MemoryPolicy, ModelConfig, RecallInput,
@@ -3586,12 +3585,11 @@ mod tests {
         AgentOutput, BoxError, BoxPinFut, CompletionRequest, Message, Principal, Resource, Tool,
         Usage,
     };
-    use anda_db::{collection::CollectionConfig, database::DBConfig, storage::StorageConfig};
+    use anda_db::collection::CollectionConfig;
     use anda_engine::{
         context::BaseCtx,
-        management::{BaseManagement, Visibility},
         memory::{Conversation, ConversationRef, ConversationStatus, MemoryReadonly},
-        model::{CompletionFeaturesDyn, Model, Models, reqwest},
+        model::{CompletionFeaturesDyn, Model, Models},
         unix_ms,
     };
     use cose2::{CoseMap, Label, Sign1Message, Value, cwt::Claims, iana};
@@ -3707,15 +3705,6 @@ mod tests {
         }
     }
 
-    fn test_db_config(name: &str) -> DBConfig {
-        DBConfig {
-            name: name.to_string(),
-            description: "test database".to_string(),
-            storage: StorageConfig::default(),
-            lock: None,
-        }
-    }
-
     fn test_app_state(name: &str) -> AppState {
         test_app_state_with_models(name, Arc::new(Models::default()))
     }
@@ -3736,9 +3725,7 @@ mod tests {
         let mut bytes = [0x66; 32];
         bytes[0] = 0x58;
         let key = VerifyingKey::from_bytes(&bytes).unwrap();
-        let mut app = test_app_state_with_models(name, Arc::new(Models::default()));
-        app.ed25519_pubkeys = Arc::new(vec![key]);
-        app
+        app_state_core(name, Arc::new(Models::default()), vec![key], "test", 0)
     }
 
     fn test_signing_key() -> SigningKey {
@@ -3746,9 +3733,13 @@ mod tests {
     }
 
     fn test_app_state_with_signing_key(name: &str, signing_key: &SigningKey) -> AppState {
-        let mut app = test_app_state_with_models(name, Arc::new(Models::default()));
-        app.ed25519_pubkeys = Arc::new(vec![signing_key.verifying_key()]);
-        app
+        app_state_core(
+            name,
+            Arc::new(Models::default()),
+            vec![signing_key.verifying_key()],
+            "test",
+            0,
+        )
     }
 
     fn signed_token(
@@ -3778,24 +3769,7 @@ mod tests {
     }
 
     fn test_app_state_with_models(name: &str, models: Arc<Models>) -> AppState {
-        let management = Arc::new(BaseManagement {
-            controller: SELF_USER_ID,
-            managers: BTreeSet::new(),
-            visibility: Visibility::Public,
-        });
-        let http_client = reqwest::Client::builder().build().unwrap();
-
-        AppState::new(
-            Arc::new(InMemory::new()),
-            Arc::new(test_db_config(name)),
-            management,
-            http_client,
-            models,
-            Arc::new(vec![]),
-            "anda_brain".to_string(),
-            "test".to_string(),
-            0,
-        )
+        app_state_core(name, models, vec![], "test", 0)
     }
 
     async fn wait_until_idle(space: &Space) {
@@ -3806,20 +3780,6 @@ mod tests {
             sleep(Duration::from_millis(10)).await;
         }
         panic!("space did not become idle");
-    }
-
-    async fn create_loaded_space(app: &AppState, id: &str) -> Arc<Space> {
-        app.admin_create_space(
-            Principal::from_slice(&[1]),
-            Principal::from_slice(&[2]),
-            id.to_string(),
-            1,
-            123,
-        )
-        .await
-        .unwrap();
-
-        app.load_space(id, false).await.unwrap()
     }
 
     #[tokio::test]
@@ -3903,7 +3863,7 @@ mod tests {
     #[tokio::test]
     async fn create_space_persists_metadata_before_returning() {
         let object_store = Arc::new(InMemory::new());
-        let db_config = test_db_config("create_space_persists_metadata");
+        let db_config = crate::testkit::db_config("create_space_persists_metadata");
         let creator = Principal::from_slice(&[1]);
         let owner = Principal::from_slice(&[2]);
 
@@ -3936,7 +3896,7 @@ mod tests {
     #[tokio::test]
     async fn collection_bootstrap_helpers_create_and_prune_indexes() {
         let object_store = Arc::new(InMemory::new());
-        let db_config = test_db_config("collection_bootstrap_helpers");
+        let db_config = crate::testkit::db_config("collection_bootstrap_helpers");
         let db = anda_db::database::AndaDB::create(object_store, db_config)
             .await
             .unwrap();

@@ -522,7 +522,7 @@ impl AndaBrainMcpServer {
         let output = space
             .ingest(SELF_USER_ID, StringOr::Value(input))
             .await
-            .map_err(internal_error)?;
+            .map_err(invalid_params)?;
         agent_output_result(output)
     }
 
@@ -535,13 +535,10 @@ impl AndaBrainMcpServer {
         let (space, caller) = self
             .load_authorized_space_with_token(TokenScope::Read, access)
             .await?;
-        if caller.label_restricted() {
-            // RecallAgent's wiki tools span all labels; a label-restricted
-            // token cannot use agentic recall (same guard as HTTP /recall).
-            return Err(ErrorData::invalid_request(
-                "recall requires an unrestricted token",
-                None,
-            ));
+        if let Some(reason) = caller.recall_forbidden() {
+            // Same guard as HTTP /recall, surfaced through the shared authz
+            // error mapping.
+            return Err(authz_error_data(AuthzError::Forbidden(reason)));
         }
         // Same budget as HTTP /recall's 429 cap: without it, anonymous
         // callers on public spaces could run up to the global HTTP cap of
@@ -550,7 +547,7 @@ impl AndaBrainMcpServer {
         let output = space
             .query(SELF_USER_ID, StringOr::Value(input))
             .await
-            .map_err(internal_error)?;
+            .map_err(invalid_params)?;
         agent_output_result(output)
     }
 
@@ -574,7 +571,7 @@ impl AndaBrainMcpServer {
         let output = space
             .maintenance(SELF_USER_ID, MaintenanceInput::from(input))
             .await
-            .map_err(internal_error)?;
+            .map_err(invalid_params)?;
         agent_output_result(output)
     }
 
@@ -588,7 +585,7 @@ impl AndaBrainMcpServer {
         let response = space
             .execute_kip_readonly(request)
             .await
-            .map_err(internal_error)?;
+            .map_err(invalid_params)?;
         structured_result(response)
     }
 
@@ -604,7 +601,7 @@ impl AndaBrainMcpServer {
             .formation
             .get_or_init_counterparty(input.user, input.name)
             .await
-            .map_err(internal_error)?;
+            .map_err(invalid_params)?;
         structured_result(concept)
     }
 
@@ -620,12 +617,12 @@ impl AndaBrainMcpServer {
         // outright, and anonymous public readers cannot touch recall
         // conversations (private-era runs may embed labeled wiki output).
         if let Some(reason) = caller.conversation_read_forbidden(input.collection.as_deref()) {
-            return Err(ErrorData::invalid_request(reason, None));
+            return Err(authz_error_data(AuthzError::Forbidden(reason)));
         }
         let (conversations, next_cursor) = space
             .list_conversations(input.collection, input.cursor, input.limit)
             .await
-            .map_err(internal_error)?;
+            .map_err(invalid_params)?;
         structured_result(json!({
             "conversations": conversations,
             "next_cursor": next_cursor,
@@ -642,12 +639,12 @@ impl AndaBrainMcpServer {
             .await?;
         // Same guard as list_conversations_for / the HTTP channel.
         if let Some(reason) = caller.conversation_read_forbidden(input.collection.as_deref()) {
-            return Err(ErrorData::invalid_request(reason, None));
+            return Err(authz_error_data(AuthzError::Forbidden(reason)));
         }
         let conversation = space
             .get_conversation(input.collection, input.conversation_id)
             .await
-            .map_err(internal_error)?;
+            .map_err(invalid_params)?;
 
         if input.delta.unwrap_or(false) {
             structured_result(conversation.into_delta(
@@ -739,10 +736,21 @@ impl AndaBrainMcpServer {
     }
 }
 
+/// Mirrors `handler::wiki_error`'s classification on the MCP side: only
+/// `Db` failures are internal; everything else is caller-fixable. A CAS
+/// conflict carries `WikiError::retry_data` so tool callers get the same
+/// re-read → merge → retry payload the HTTP channel returns.
 fn wiki_tool_error(err: WikiError) -> ErrorData {
-    match err {
+    match &err {
         WikiError::Db(_) => internal_error(err),
-        err => ErrorData::invalid_request(err.to_string(), None),
+        WikiError::Conflict { .. } => {
+            let data = err.retry_data();
+            ErrorData::invalid_request(err.to_string(), data)
+        }
+        WikiError::NotFound(_) => ErrorData::invalid_request(err.to_string(), None),
+        WikiError::TooLarge { .. } | WikiError::Invalid(_) => {
+            ErrorData::invalid_params(err.to_string(), None)
+        }
     }
 }
 
@@ -1365,18 +1373,13 @@ fn space_id_from_mcp_path(path: &str, prefix: &str) -> Result<String, ErrorData>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::{app_state_core, models_with_completer};
     use anda_core::{AgentOutput, BoxPinFut, CompletionRequest};
-    use anda_db::{database::DBConfig, storage::StorageConfig};
-    use anda_engine::{
-        management::{BaseManagement, Visibility},
-        model::{CompletionFeaturesDyn, Model, Models, reqwest},
-    };
+    use anda_engine::model::{CompletionFeaturesDyn, reqwest};
     use cose2::{CoseMap, Label, Sign1Message, Value as CoseValue, cwt::Claims, iana};
     use http::{HeaderMap, header};
     use ic_auth_types::ByteBufB64;
     use ic_cose_types::cose::ed25519::{SigningKey, VerifyingKey, ed25519_sign};
-    use object_store::memory::InMemory;
-    use std::collections::BTreeSet;
 
     #[derive(Debug)]
     struct FinalCompleter;
@@ -1396,34 +1399,12 @@ mod tests {
         }
     }
 
-    fn test_db_config(name: &str) -> DBConfig {
-        DBConfig {
-            name: name.to_string(),
-            description: "test database".to_string(),
-            storage: StorageConfig::default(),
-            lock: None,
-        }
-    }
-
     fn test_app_state(name: &str, pubkeys: Vec<VerifyingKey>) -> AppState {
-        let management = Arc::new(BaseManagement {
-            controller: SELF_USER_ID,
-            managers: BTreeSet::new(),
-            visibility: Visibility::Public,
-        });
-        let http_client = reqwest::Client::builder().build().unwrap();
-        let models = Models::default();
-        models.set_model(Model::with_completer(Arc::new(FinalCompleter)));
-
-        AppState::new(
-            Arc::new(InMemory::new()),
-            Arc::new(test_db_config(name)),
-            management,
-            http_client,
-            Arc::new(models),
-            Arc::new(pubkeys),
-            "anda_brain".to_string(),
-            "test-version".to_string(),
+        app_state_core(
+            name,
+            models_with_completer(FinalCompleter),
+            pubkeys,
+            "test-version",
             0,
         )
     }
@@ -1661,6 +1642,72 @@ mod tests {
         assert!(result.content[0].as_text().is_some());
         let value = result.structured_content.as_ref().unwrap();
         assert!(value["conversation"].is_number());
+    }
+
+    #[tokio::test]
+    async fn input_errors_surface_as_invalid_params() {
+        let server = create_server("mcp_invalid_params").await;
+
+        // Same failure over HTTP is a 400: an empty conversation is rejected
+        // by `Space::ingest`, so the MCP channel must not report it as an
+        // internal error.
+        let err = server
+            .remember_conversation_for(
+                &test_access("mcp_invalid_params"),
+                RememberConversationInput {
+                    messages: vec![],
+                    context: None,
+                    timestamp: None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn wiki_commit_conflict_carries_retry_data() {
+        let server = create_server("mcp_wiki_conflict").await;
+        let access = test_access("mcp_wiki_conflict");
+
+        let committed = server
+            .wiki_commit_for(
+                &access,
+                WikiCommitToolInput {
+                    title: "冲突文档".to_string(),
+                    content: "# 冲突文档\n\n第一版。\n".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let value = committed.structured_content.unwrap();
+        let doc_id = value["doc"]["id"].as_u64().unwrap();
+        let current_version = value["doc"]["current_version"].as_u64().unwrap();
+
+        // A stale CAS token must fail with the retry payload the tool
+        // description promises (re-read, merge, retry with current_version).
+        let err = server
+            .wiki_commit_for(
+                &access,
+                WikiCommitToolInput {
+                    doc_id: Some(doc_id),
+                    parent_version: Some(current_version + 1),
+                    title: "冲突文档".to_string(),
+                    content: "# 冲突文档\n\n第二版。\n".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_REQUEST);
+        let data = err.data.expect("conflict error must carry retry data");
+        assert_eq!(data["current_version"].as_u64(), Some(current_version));
+        assert!(data["current_checksum"].is_string());
+        assert!(data["updated_by"].is_string());
+        assert!(data["updated_at"].is_number());
     }
 
     #[tokio::test]

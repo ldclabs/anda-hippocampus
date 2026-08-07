@@ -4,6 +4,21 @@ All notable changes to the Anda Brain project.
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-08-07
+
+### Changed
+- **Release version advanced to `0.11.0`.** This release narrows the crate's public Rust API (breaking for library consumers); the HTTP and MCP wire contracts are unchanged except for the error-semantics fixes below.
+- **Crate interface narrowed to what callers actually use.** The `wiki`, `ledger`, and `authz` modules are now crate-internal; `Space`'s handles (`db`, `formation`, `recall`, `memory`, `wiki`, `wiki_digest`) and 15 internal-only methods are no longer public; `payload` drops its unused RPC-request type and internal helpers; dead constants and the unwired retrieval-eval fixtures (now test-only) were removed or gated.
+- **Space forking has a single entry point.** `AppState::fork_space` owns the whole fork protocol (object copy, state fork, load without background autostart), and `Space::close` is the public way to close throwaway spaces — the eval CLI no longer reaches into the DB handle.
+- **Eval orchestration moved into the library (`eval::run`).** `EvalRunEnv`, run-scoped space hosting, suite and shared-formation runs, and the zero-score failure boundary now live in `eval/run.rs` with tests; `bin/main.rs` only parses flags and writes reports. The three hand-copied load→run→close sequences were unified behind one `with_eval_space` helper.
+- **Shared test fixtures.** A `testkit` module replaces six verbatim copies of the test `AppState` wiring and space bootstrap across the unit-test suites.
+
+### Fixed
+- **Shared-formation eval forks no longer resume background work.** Profile forks previously loaded with background autostart, letting the inherited formation cursor and wiki-digest backlog burn model tokens and mutate forks mid-replay; forks now load through `fork_space` (autostart off), keeping A/B comparisons reproducible.
+- **MCP errors mirror HTTP classification.** Caller-fixable failures (invalid input, guard rejections) now surface as JSON-RPC `invalid_params`/`invalid_request` instead of internal errors, and a wiki commit conflict carries the same `current_version`/`current_checksum` retry payload as the HTTP `409` body, so MCP agents can follow the documented re-read → merge → retry protocol.
+- **`update_space_tier` reports an unknown space as `404`** (previously `400`), matching every other space endpoint.
+- **Recall conversation snapshots no longer swallow serialization failures silently**; they are logged like the formation and maintenance paths.
+
 ## [0.10.2] — 2026-07-31
 
 ### Changed

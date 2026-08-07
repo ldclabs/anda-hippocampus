@@ -9,6 +9,11 @@ use super::model::WikiDocRecord;
 /// Default namespace for documents committed without one.
 pub const DEFAULT_NAMESPACE: &str = "default";
 
+/// Namespace the retrieval-eval fixture corpus is imported into, keeping
+/// eval documents isolated from real space content (digest and listings
+/// exclude it).
+pub const EVAL_NAMESPACE: &str = "wiki_eval";
+
 /// Caps enforced by [`WikiCommitInput::validate`] on every write path.
 pub const MAX_TAGS: usize = 64;
 pub const MAX_TAG_CHARS: usize = 120;
@@ -60,6 +65,30 @@ impl std::fmt::Display for WikiError {
             Self::NotFound(msg) => write!(f, "not found: {msg}"),
             Self::Invalid(msg) => write!(f, "invalid: {msg}"),
             Self::Db(msg) => write!(f, "db error: {msg}"),
+        }
+    }
+}
+
+impl WikiError {
+    /// Structured payload a caller needs to recover from this error: `Some`
+    /// only for [`WikiError::Conflict`], carrying the CAS retry protocol
+    /// fields (re-read, merge, retry with `current_version`). Both the HTTP
+    /// and MCP error renderers must attach it, so agents on either channel
+    /// can follow the commit instructions.
+    pub fn retry_data(&self) -> Option<Json> {
+        match self {
+            Self::Conflict {
+                current_version,
+                current_checksum,
+                updated_by,
+                updated_at,
+            } => Some(serde_json::json!({
+                "current_version": current_version,
+                "current_checksum": current_checksum,
+                "updated_by": updated_by,
+                "updated_at": updated_at,
+            })),
+            _ => None,
         }
     }
 }
@@ -558,13 +587,6 @@ pub struct WikiAccess {
 }
 
 impl WikiAccess {
-    pub fn unrestricted(actor: impl Into<String>) -> Self {
-        Self {
-            actor: actor.into(),
-            labels: None,
-        }
-    }
-
     pub fn allows(&self, label: &str) -> bool {
         match &self.labels {
             None => true,

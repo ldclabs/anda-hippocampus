@@ -17,13 +17,14 @@ use crate::{
         Accept, AppBytes, AppError, AppPath, AppQuery, ContentType, HeaderVals, PayloadFormat,
         RpcResponse, StringOr,
     },
-    space::AppState,
+    space::{AppState, Space},
     types::*,
     wiki::{
         WikiCommitInput, WikiError, WikiImportInput, WikiListDocsInput, WikiReadInput,
         WikiSearchInput, WikiSelector, WikiVerifyInput,
     },
 };
+use std::sync::Arc;
 
 const SKILL_MARKDOWN: &str = include_str!("../SKILL.md");
 const FAVICON: &[u8] = include_bytes!("../favicon.ico");
@@ -143,6 +144,38 @@ pub async fn post_formation(
 }
 
 /// POST /v1/{space_id}/recall
+/// Shared prelude for the two recall endpoints: parse, authorize
+/// (PublicRead), and reject label-restricted tokens — RecallAgent's wiki
+/// tools span all labels, so agentic recall needs an unrestricted token
+/// (mirrors the /wiki/events guard).
+async fn recall_prelude(
+    app: &AppState,
+    space_id: &str,
+    token: &str,
+    sharding: u32,
+    ct: &PayloadFormat,
+    body: &[u8],
+) -> Result<(Arc<Space>, StringOr<RecallInput>), AppError> {
+    ensure_sharding(app, sharding)?;
+
+    let input: StringOr<RecallInput> = ct.parse_body(body).map_err(AppError::bad_request)?;
+
+    let (space, caller) = authorize(
+        app,
+        space_id,
+        token,
+        Some(sharding),
+        TokenScope::Read,
+        AuthzMode::PublicRead,
+        unix_ms(),
+    )
+    .await?;
+    if let Some(reason) = caller.recall_forbidden() {
+        return Err(AuthzError::Forbidden(reason).into());
+    }
+    Ok((space, input))
+}
+
 pub async fn post_recall(
     State(app): State<AppState>,
     AppPath(space_id): AppPath<String>,
@@ -150,25 +183,7 @@ pub async fn post_recall(
     HeaderVals(token, sharding): HeaderVals,
     AppBytes(body): AppBytes,
 ) -> Result<impl IntoResponse, AppError> {
-    ensure_sharding(&app, sharding)?;
-
-    let input: StringOr<RecallInput> = ct.parse_body(&body).map_err(AppError::bad_request)?;
-
-    let (space, caller) = authorize(
-        &app,
-        &space_id,
-        &token,
-        Some(sharding),
-        TokenScope::Read,
-        AuthzMode::PublicRead,
-        unix_ms(),
-    )
-    .await?;
-    if caller.label_restricted() {
-        // RecallAgent's wiki tools span all labels; a label-restricted token
-        // cannot use agentic recall (mirrors the /wiki/events guard).
-        return Err(AuthzError::Forbidden("recall requires an unrestricted token").into());
-    }
+    let (space, input) = recall_prelude(&app, &space_id, &token, sharding, &ct, &body).await?;
 
     // 使用固定的 caller 进行 ingestions 和 queries
     let rt = space
@@ -195,24 +210,7 @@ pub async fn post_recall_structured(
     HeaderVals(token, sharding): HeaderVals,
     AppBytes(body): AppBytes,
 ) -> Result<impl IntoResponse, AppError> {
-    ensure_sharding(&app, sharding)?;
-
-    let input: StringOr<RecallInput> = ct.parse_body(&body).map_err(AppError::bad_request)?;
-
-    let (space, caller) = authorize(
-        &app,
-        &space_id,
-        &token,
-        Some(sharding),
-        TokenScope::Read,
-        AuthzMode::PublicRead,
-        unix_ms(),
-    )
-    .await?;
-    if caller.label_restricted() {
-        // Same guard as /recall: the agent's wiki tools span all labels.
-        return Err(AuthzError::Forbidden("recall requires an unrestricted token").into());
-    }
+    let (space, input) = recall_prelude(&app, &space_id, &token, sharding, &ct, &body).await?;
 
     let rt = space
         .query_structured(SELF_USER_ID, input)
@@ -403,20 +401,10 @@ pub async fn post_shadow_eval(
 
 fn wiki_error(err: WikiError) -> AppError {
     match &err {
-        WikiError::Conflict {
-            current_version,
-            current_checksum,
-            updated_by,
-            updated_at,
-        } => AppError {
+        WikiError::Conflict { .. } => AppError {
             status: StatusCode::CONFLICT,
             message: err.to_string(),
-            data: Some(json!({
-                "current_version": current_version,
-                "current_checksum": current_checksum,
-                "updated_by": updated_by,
-                "updated_at": updated_at,
-            })),
+            data: err.retry_data(),
         },
         WikiError::TooLarge { .. } => {
             AppError::with_status(StatusCode::PAYLOAD_TOO_LARGE, err.to_string())
@@ -1215,6 +1203,34 @@ pub async fn add_space_token(
 }
 
 /// POST /v1/{space_id}/management/revoke_space_token
+/// Shared prelude for the CWT-only write-management endpoints
+/// (`revoke_space_token`, `update_space`, `restart_formation`,
+/// `update_byok`). Deliberately `check_cwt` + body parse + `load_space`
+/// instead of `authorize()`: the body parse sits between them historically,
+/// and that error precedence must not change.
+async fn cwt_write_prelude<T: serde::de::DeserializeOwned>(
+    app: &AppState,
+    space_id: &str,
+    token: &str,
+    sharding: u32,
+    ct: &PayloadFormat,
+    body: &[u8],
+    now_ms: u64,
+) -> Result<(Arc<Space>, T), AppError> {
+    ensure_sharding(app, sharding)?;
+
+    let _ = check_cwt(app, space_id, token, TokenScope::Write, now_ms)?;
+
+    let input: T = ct
+        .parse_body(body)
+        .map_err(AppError::bad_request)?
+        .value()
+        .map_err(|_| AppError::bad_request("invalid input"))?;
+
+    let space = load_space(app, space_id).await?;
+    Ok((space, input))
+}
+
 pub async fn revoke_space_token(
     State(app): State<AppState>,
     AppPath(space_id): AppPath<String>,
@@ -1222,19 +1238,8 @@ pub async fn revoke_space_token(
     HeaderVals(token, sharding): HeaderVals,
     AppBytes(body): AppBytes,
 ) -> Result<impl IntoResponse, AppError> {
-    ensure_sharding(&app, sharding)?;
-
-    // `check_cwt` + `load_space` instead of `authorize`: the body parse sits
-    // between them historically, and that error precedence must not change.
-    let _ = check_cwt(&app, &space_id, &token, TokenScope::Write, unix_ms())?;
-
-    let input: RevokeSpaceTokenInput = ct
-        .parse_body(&body)
-        .map_err(AppError::bad_request)?
-        .value()
-        .map_err(|_| AppError::bad_request("invalid input"))?;
-
-    let space = load_space(&app, &space_id).await?;
+    let (space, input): (_, RevokeSpaceTokenInput) =
+        cwt_write_prelude(&app, &space_id, &token, sharding, &ct, &body, unix_ms()).await?;
 
     // Revoke by full token value, or by unique name for managers who did
     // not save the value at mint time (list_space_tokens only shows a
@@ -1260,20 +1265,9 @@ pub async fn update_space(
     HeaderVals(token, sharding): HeaderVals,
     AppBytes(body): AppBytes,
 ) -> Result<impl IntoResponse, AppError> {
-    ensure_sharding(&app, sharding)?;
-
-    // `check_cwt` + `load_space` instead of `authorize`: the body parse sits
-    // between them historically, and that error precedence must not change.
     let now_ms = unix_ms();
-    let _ = check_cwt(&app, &space_id, &token, TokenScope::Write, now_ms)?;
-
-    let input: UpdateSpaceInput = ct
-        .parse_body(&body)
-        .map_err(AppError::bad_request)?
-        .value()
-        .map_err(|_| AppError::bad_request("invalid input"))?;
-
-    let space = load_space(&app, &space_id).await?;
+    let (space, input): (_, UpdateSpaceInput) =
+        cwt_write_prelude(&app, &space_id, &token, sharding, &ct, &body, now_ms).await?;
 
     space
         .update(input, now_ms)
@@ -1290,19 +1284,8 @@ pub async fn restart_formation(
     HeaderVals(token, sharding): HeaderVals,
     AppBytes(body): AppBytes,
 ) -> Result<impl IntoResponse, AppError> {
-    ensure_sharding(&app, sharding)?;
-
-    // `check_cwt` + `load_space` instead of `authorize`: the body parse sits
-    // between them historically, and that error precedence must not change.
-    let _ = check_cwt(&app, &space_id, &token, TokenScope::Write, unix_ms())?;
-
-    let input: FormationRestartInput = ct
-        .parse_body(&body)
-        .map_err(AppError::bad_request)?
-        .value()
-        .map_err(|_| AppError::bad_request("invalid input"))?;
-
-    let space = load_space(&app, &space_id).await?;
+    let (space, input): (_, FormationRestartInput) =
+        cwt_write_prelude(&app, &space_id, &token, sharding, &ct, &body, unix_ms()).await?;
 
     space
         .restart_formation(SELF_USER_ID, input.conversation)
@@ -1341,19 +1324,8 @@ pub async fn update_byok(
     HeaderVals(token, sharding): HeaderVals,
     AppBytes(body): AppBytes,
 ) -> Result<impl IntoResponse, AppError> {
-    ensure_sharding(&app, sharding)?;
-
-    // `check_cwt` + `load_space` instead of `authorize`: the body parse sits
-    // between them historically, and that error precedence must not change.
-    let _ = check_cwt(&app, &space_id, &token, TokenScope::Write, unix_ms())?;
-
-    let input: ModelConfig = ct
-        .parse_body(&body)
-        .map_err(AppError::bad_request)?
-        .value()
-        .map_err(|_| AppError::bad_request("invalid input"))?;
-
-    let space = load_space(&app, &space_id).await?;
+    let (space, input): (_, ModelConfig) =
+        cwt_write_prelude(&app, &space_id, &token, sharding, &ct, &body, unix_ms()).await?;
 
     space
         .update_byok(input)
@@ -1419,10 +1391,9 @@ pub async fn update_space_tier(
         )));
     }
 
-    let space = app
-        .load_space(&input.space_id, false)
-        .await
-        .map_err(AppError::bad_request)?;
+    // `authz::load_space` classifies the failure: unknown space is 404,
+    // anything else 500 — same as every other space endpoint.
+    let space = load_space(&app, &input.space_id).await?;
 
     let rt = space
         .admin_update_tier(input.tier, now_ms)
@@ -1447,7 +1418,8 @@ mod tests {
         agents::SELF_USER_ID,
         authz::wiki_read_access,
         payload::{Accept, AppBytes, AppError, AppPath, AppQuery, HeaderVals, PayloadFormat},
-        space::{AppState, Space},
+        space::AppState,
+        testkit::{app_state_core, create_loaded_space, models_with_completer},
         types::{
             AddSpaceTokenInput, ConversationDeltaQuery, CreateOrUpdateSpaceInput, FormationInput,
             FormationRestartInput, GetOrInitUserInput, InputContext, MaintenanceInput,
@@ -1456,11 +1428,9 @@ mod tests {
         },
     };
     use anda_core::{AgentOutput, BoxError, BoxPinFut, CompletionRequest, Message, Principal};
-    use anda_db::{database::DBConfig, storage::StorageConfig};
     use anda_engine::{
-        management::{BaseManagement, Visibility},
         memory::{Conversation, ConversationRef, ConversationStatus},
-        model::{CompletionFeaturesDyn, Model, Models, reqwest},
+        model::CompletionFeaturesDyn,
         unix_ms,
     };
     use axum::{
@@ -1472,10 +1442,8 @@ mod tests {
     use cose2::{CoseMap, Label, Sign1Message, Value as CoseValue, cwt::Claims, iana};
     use ic_auth_types::ByteBufB64;
     use ic_cose_types::cose::ed25519::{SigningKey, VerifyingKey, ed25519_sign};
-    use object_store::memory::InMemory;
     use serde::Serialize;
     use serde_json::{Value, json};
-    use std::{collections::BTreeSet, sync::Arc};
 
     #[derive(Debug)]
     struct FinalCompleter;
@@ -1497,15 +1465,6 @@ mod tests {
                     ..Default::default()
                 })
             })
-        }
-    }
-
-    fn test_db_config(name: &str) -> DBConfig {
-        DBConfig {
-            name: name.to_string(),
-            description: "test database".to_string(),
-            storage: StorageConfig::default(),
-            lock: None,
         }
     }
 
@@ -1563,40 +1522,13 @@ mod tests {
         sharding: u32,
         pubkeys: Vec<VerifyingKey>,
     ) -> AppState {
-        let management = Arc::new(BaseManagement {
-            controller: SELF_USER_ID,
-            managers: BTreeSet::new(),
-            visibility: Visibility::Public,
-        });
-        let http_client = reqwest::Client::builder().build().unwrap();
-        let models = Models::default();
-        models.set_model(Model::with_completer(Arc::new(FinalCompleter)));
-
-        AppState::new(
-            Arc::new(InMemory::new()),
-            Arc::new(test_db_config(name)),
-            management,
-            http_client,
-            Arc::new(models),
-            Arc::new(pubkeys),
-            "anda_brain".to_string(),
-            "test-version".to_string(),
+        app_state_core(
+            name,
+            models_with_completer(FinalCompleter),
+            pubkeys,
+            "test-version",
             sharding,
         )
-    }
-
-    async fn create_loaded_space(app: &AppState, id: &str) -> Arc<Space> {
-        app.admin_create_space(
-            Principal::from_slice(&[1]),
-            Principal::from_slice(&[2]),
-            id.to_string(),
-            1,
-            unix_ms(),
-        )
-        .await
-        .unwrap();
-
-        app.load_space(id, false).await.unwrap()
     }
 
     fn accept_from_headers(
@@ -2315,6 +2247,28 @@ mod tests {
             )
             .await,
             StatusCode::BAD_REQUEST,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn update_space_tier_reports_unknown_space_as_not_found() {
+        let app = test_app_state("handler_tier_missing", 0);
+
+        let _ = err_json(
+            update_space_tier(
+                State(app.clone()),
+                AppPath("handler_tier_missing_space".to_string()),
+                accept_json(),
+                headers(&app),
+                json_bytes(&CreateOrUpdateSpaceInput {
+                    user: Principal::from_slice(&[11]),
+                    space_id: "handler_tier_missing_space".to_string(),
+                    tier: 2,
+                }),
+            )
+            .await,
+            StatusCode::NOT_FOUND,
         )
         .await;
     }

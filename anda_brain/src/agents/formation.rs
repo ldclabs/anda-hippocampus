@@ -26,10 +26,6 @@ use std::{
 use super::{BrainHook, RunnerFlow, RunnerHost, drive_runner_loop};
 use crate::types::FormationInput;
 
-// Kept for reference; the runtime prompt comes from `prompts::active_prompt`
-// so the eval optimizer can install candidate prompts.
-#[allow(dead_code)]
-const SELF_INSTRUCTIONS: &str = include_str!("../../assets/BrainFormation.md");
 const REVIEW_INSTRUCTIONS: &str = include_str!("../../assets/BrainFormationReview.md");
 
 // The runner guardrails are shared with maintenance; see
@@ -579,27 +575,28 @@ mod tests {
     use crate::{
         agents::SELF_USER_ID,
         space::AppState,
+        testkit::{
+            app_state_core, create_loaded_space, models_with_completer,
+            models_with_configured_completer,
+        },
         types::{FormationInput, InputContext, MaintenanceInput, MaintenanceScope},
     };
     use anda_core::{
-        Agent, AgentOutput, BoxError, BoxPinFut, CompletionRequest, ContentPart, Message,
-        Principal, ToolCall, Usage,
+        Agent, AgentOutput, BoxError, BoxPinFut, CompletionRequest, ContentPart, Message, ToolCall,
+        Usage,
     };
-    use anda_db::{database::DBConfig, storage::StorageConfig};
     use anda_engine::{
         context::{AgentCtx, COMPACTION_PROMPT},
-        management::{BaseManagement, Visibility},
         memory::{Conversation, ConversationRef, ConversationStatus},
-        model::{CompletionFeaturesDyn, Model, Models, reqwest},
+        model::{CompletionFeaturesDyn, Models},
         unix_ms,
     };
-    use object_store::memory::InMemory;
     use serde_json::json;
+    use std::sync::Mutex;
     use std::sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     };
-    use std::{collections::BTreeSet, sync::Mutex};
     use tokio::time::{Duration, sleep};
 
     #[derive(Debug)]
@@ -908,47 +905,15 @@ mod tests {
         text.join("\n")
     }
 
-    fn test_db_config(name: &str) -> DBConfig {
-        DBConfig {
-            name: name.to_string(),
-            description: "test database".to_string(),
-            storage: StorageConfig::default(),
-            lock: None,
-        }
-    }
-
     fn test_app_state(name: &str) -> AppState {
-        test_app_state_with_models(name, Arc::new(Models::default()))
+        app_state_core(name, Arc::new(Models::default()), vec![], "test", 0)
     }
 
     fn test_app_state_with_completer<C>(name: &str, completer: C) -> AppState
     where
         C: CompletionFeaturesDyn,
     {
-        let models = Models::default();
-        models.set_model(Model::with_completer(Arc::new(completer)));
-        test_app_state_with_models(name, Arc::new(models))
-    }
-
-    fn test_app_state_with_models(name: &str, models: Arc<Models>) -> AppState {
-        let management = Arc::new(BaseManagement {
-            controller: SELF_USER_ID,
-            managers: BTreeSet::new(),
-            visibility: Visibility::Public,
-        });
-        let http_client = reqwest::Client::builder().build().unwrap();
-
-        AppState::new(
-            Arc::new(InMemory::new()),
-            Arc::new(test_db_config(name)),
-            management,
-            http_client,
-            models,
-            Arc::new(vec![]),
-            "anda_brain".to_string(),
-            "test".to_string(),
-            0,
-        )
+        app_state_core(name, models_with_completer(completer), vec![], "test", 0)
     }
 
     fn formation_prompt(counterparty: Option<&str>) -> String {
@@ -992,20 +957,6 @@ mod tests {
             .unwrap();
         conversation._id = id;
         conversation
-    }
-
-    async fn create_loaded_space(app: &AppState, id: &str) -> Arc<crate::space::Space> {
-        app.admin_create_space(
-            Principal::from_slice(&[1]),
-            Principal::from_slice(&[2]),
-            id.to_string(),
-            1,
-            unix_ms(),
-        )
-        .await
-        .unwrap();
-
-        app.load_space(id, false).await.unwrap()
     }
 
     #[test]
@@ -1749,13 +1700,19 @@ mod tests {
     #[tokio::test]
     async fn process_one_compacts_before_large_prompt_review_handoff() {
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let models = Models::default();
-        let mut model = Model::with_completer(Arc::new(CompactionCompleter {
-            requests: requests.clone(),
-        }));
-        model.context_window = 1000;
-        models.set_model(model);
-        let app = test_app_state_with_models("formation_compacts_before_review", Arc::new(models));
+        let models = models_with_configured_completer(
+            CompactionCompleter {
+                requests: requests.clone(),
+            },
+            |model| model.context_window = 1000,
+        );
+        let app = app_state_core(
+            "formation_compacts_before_review",
+            models,
+            vec![],
+            "test",
+            0,
+        );
         let space = create_loaded_space(&app, "formation_compacts_before_review").await;
         let ctx = space
             .ctx_for_test(SELF_USER_ID, FormationAgent::NAME)

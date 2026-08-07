@@ -837,3 +837,4 @@ if (recall.error) {
 - 参数错误：HTTP `400`，响应体为 `RpcError`
 - 成功时：HTTP `200`，响应体通常为 `RpcResponse<T>`
 - 错误响应体始终为 JSON，即使请求指定了 `application/cbor` 或 `text/markdown`（包括携带 `error.data.current_version` 的 wiki `409` 冲突响应体）；只有成功响应体遵循 `Accept` 协商
+- MCP 工具沿用同一分类：调用方可修复的失败以 JSON-RPC `invalid_params`/`invalid_request` 返回（wiki 提交冲突携带与 HTTP `409` 相同的 `data.current_version` 重试载荷），只有真正的内部错误才用 `internal_error`

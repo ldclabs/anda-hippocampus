@@ -34,10 +34,6 @@ use crate::{
     wiki::{WikiReadTool, WikiSearchTool},
 };
 
-// Kept for reference; the runtime prompt comes from `prompts::active_prompt`
-// so the eval optimizer can install candidate prompts.
-#[allow(dead_code)]
-const SELF_INSTRUCTIONS: &str = include_str!("../../assets/BrainRecall.md");
 const RECALL_CONTEXT_TIMEOUT: Duration = Duration::from_secs(5);
 const RECALL_TOTAL_TIMEOUT: Duration = Duration::from_secs(180);
 const RECALL_PRIMER_CACHE_TTL_MS: u64 = 300_000;
@@ -307,11 +303,21 @@ impl RecallAgent {
     }
 
     async fn persist_conversation(&self, conversation: &Conversation) {
-        if let Ok(changes) = conversation.to_changes() {
-            let _ = self
-                .conversations
-                .update_conversation(conversation._id, changes)
-                .await;
+        match conversation.to_changes() {
+            Ok(changes) => {
+                let _ = self
+                    .conversations
+                    .update_conversation(conversation._id, changes)
+                    .await;
+            }
+            Err(err) => {
+                log::error!(
+                    target: "brain",
+                    "Failed to serialize recall conversation {} changes: {:?}",
+                    conversation._id,
+                    err
+                );
+            }
         }
     }
 
@@ -623,26 +629,20 @@ mod tests {
     use crate::{
         agents::SELF_USER_ID,
         space::AppState,
+        testkit::{app_state_core, create_loaded_space, models_with_configured_completer},
         types::{InputContext, RecallInput},
     };
     use anda_core::{
-        Agent, AgentOutput, BoxError, BoxPinFut, CompletionRequest, Message, Principal, ToolCall,
-        Usage,
+        Agent, AgentOutput, BoxError, BoxPinFut, CompletionRequest, Message, ToolCall, Usage,
     };
-    use anda_db::{database::DBConfig, storage::StorageConfig};
     use anda_engine::{
         context::AgentCtx,
-        management::{BaseManagement, Visibility},
         memory::ConversationStatus,
-        model::{CompletionFeaturesDyn, Model, Models, reqwest},
+        model::{CompletionFeaturesDyn, Model},
     };
-    use object_store::memory::InMemory;
-    use std::{
-        collections::BTreeSet,
-        sync::{
-            Arc,
-            atomic::{AtomicU64, Ordering},
-        },
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
     };
 
     #[derive(Debug)]
@@ -816,15 +816,6 @@ mod tests {
         }
     }
 
-    fn test_db_config(name: &str) -> DBConfig {
-        DBConfig {
-            name: name.to_string(),
-            description: "test database".to_string(),
-            storage: StorageConfig::default(),
-            lock: None,
-        }
-    }
-
     fn test_app_state_with_completer<C>(name: &str, completer: C) -> AppState
     where
         C: CompletionFeaturesDyn,
@@ -841,42 +832,13 @@ mod tests {
         C: CompletionFeaturesDyn,
         F: FnOnce(&mut Model),
     {
-        let models = Models::default();
-        let mut model = Model::with_completer(Arc::new(completer));
-        configure(&mut model);
-        models.set_model(model);
-        let management = Arc::new(BaseManagement {
-            controller: SELF_USER_ID,
-            managers: BTreeSet::new(),
-            visibility: Visibility::Public,
-        });
-        let http_client = reqwest::Client::builder().build().unwrap();
-
-        AppState::new(
-            Arc::new(InMemory::new()),
-            Arc::new(test_db_config(name)),
-            management,
-            http_client,
-            Arc::new(models),
-            Arc::new(vec![]),
-            "anda_brain".to_string(),
-            "test".to_string(),
+        app_state_core(
+            name,
+            models_with_configured_completer(completer, configure),
+            vec![],
+            "test",
             0,
         )
-    }
-
-    async fn create_loaded_space(app: &AppState, id: &str) -> Arc<crate::space::Space> {
-        app.admin_create_space(
-            Principal::from_slice(&[1]),
-            Principal::from_slice(&[2]),
-            id.to_string(),
-            1,
-            123,
-        )
-        .await
-        .unwrap();
-
-        app.load_space(id, false).await.unwrap()
     }
 
     fn recall_prompt(query: &str, counterparty: Option<&str>) -> String {

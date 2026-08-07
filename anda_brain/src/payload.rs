@@ -35,14 +35,15 @@ pub struct PayloadFormat {
 }
 
 impl PayloadFormat {
-    pub fn from_headers(headers: &HeaderMap) -> Self {
+    pub(crate) fn from_headers(headers: &HeaderMap) -> Self {
         Self {
             request: ContentType::from_header(headers),
             response: ContentType::from_accept(headers),
         }
     }
 
-    pub fn request_type(&self) -> ContentType {
+    #[cfg(test)]
+    fn request_type(&self) -> ContentType {
         self.request
     }
 
@@ -102,7 +103,7 @@ impl ContentType {
     /// — regardless of the order media types are listed in or their
     /// q-values. Kept for wire compatibility; clients that want markdown
     /// must not also list `application/json` in the same header.
-    pub fn from_header(headers: &HeaderMap) -> Self {
+    fn from_header(headers: &HeaderMap) -> Self {
         match headers
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
@@ -126,7 +127,7 @@ impl ContentType {
     ///
     /// Same fixed keyword precedence as [`ContentType::from_header`]:
     /// `cbor` > `json` > `markdown`, ignoring listing order and q-values.
-    pub fn from_accept(headers: &HeaderMap) -> Self {
+    fn from_accept(headers: &HeaderMap) -> Self {
         headers
             .get(header::ACCEPT)
             .and_then(|v| v.to_str().ok())
@@ -145,7 +146,7 @@ impl ContentType {
     }
 
     /// Get the corresponding HTTP Content-Type header value.
-    pub fn header_value(&self) -> HeaderValue {
+    fn header_value(&self) -> HeaderValue {
         match self {
             ContentType::Json => HeaderValue::from_static("application/json"),
             ContentType::Cbor => HeaderValue::from_static("application/cbor"),
@@ -219,14 +220,6 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for Accept {
 
 // ─── RPC Types ────────────────────────────────────────────────────────────────
 
-/// RPC request object.
-#[allow(unused)]
-#[derive(Debug, Deserialize)]
-pub struct RpcRequest<T> {
-    pub method: String,
-    pub params: Option<T>,
-}
-
 /// RPC response object.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct RpcResponse<T> {
@@ -251,8 +244,7 @@ impl<T> RpcResponse<T> {
     }
 
     /// Create an error RPC response.
-    #[allow(unused)]
-    pub fn error(error: RpcError) -> Self {
+    fn error(error: RpcError) -> Self {
         Self {
             result: None,
             error: Some(error),
@@ -271,14 +263,14 @@ pub struct RpcError {
 
 impl RpcError {
     /// Create a new RPC error with the given code and message.
-    pub fn new(message: impl Into<String>) -> Self {
+    fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             data: None,
         }
     }
 
-    pub fn into_response(self, code: Option<StatusCode>) -> Response {
+    fn into_response(self, code: Option<StatusCode>) -> Response {
         (
             code.unwrap_or(StatusCode::OK),
             Json(RpcResponse::<()>::error(self)),
@@ -463,7 +455,7 @@ pub struct AppResponse<T: Serialize> {
 }
 
 impl<T: Serialize> AppResponse<T> {
-    pub fn new(data: T, ct: ContentType) -> Self {
+    fn new(data: T, ct: ContentType) -> Self {
         Self {
             data,
             content_type: ct,

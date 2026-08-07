@@ -834,3 +834,4 @@ if (recall.error) {
 - Invalid request/parameters: HTTP `400`, response body is `RpcError`
 - Success: HTTP `200`, response body is usually `RpcResponse<T>`
 - Error response bodies are always JSON, even when the request asked for `application/cbor` or `text/markdown` (this includes the wiki `409` conflict body carrying `error.data.current_version`); only success bodies follow the `Accept` header
+- MCP tools mirror this classification: caller-fixable failures surface as JSON-RPC `invalid_params`/`invalid_request` (a wiki commit conflict carries the same `data.current_version` retry payload as the HTTP `409` body), and only true internal failures use `internal_error`

@@ -30,18 +30,20 @@ use tower_http::{
 use anda_brain::{
     agents::{SELF_USER_ID, prompts, prompts::PromptTarget},
     eval::{
-        EvalExperimentReport, EvalFinding, EvalFindingKind, EvalGate, EvalGateReport, EvalProfile,
-        EvalReport, EvalScenario, EvalScore, EvalSuiteReport, EvalTurnReport, EvalValidationReport,
-        EvalValidationSeverity,
+        EvalExperimentReport, EvalGate, EvalGateReport, EvalProfile, EvalReport, EvalScenario,
+        EvalScore, EvalSuiteReport, EvalValidationReport, EvalValidationSeverity,
         mine::{MineConfig, mine_scenarios},
         optimize::{BoxedFitness, GenomeKind, OptimizeConfig, OptimizeReport, run_optimize},
-        run_formation_phase, run_policy_phase, run_scenario, shared_formation_issues,
-        validate_eval_plan,
+        run::{
+            EvalRunEnv, NamedEvalProfile, load_eval_space, run_eval_suite,
+            run_shared_formation_experiment, sanitize_space_id_part,
+        },
+        shared_formation_issues, validate_eval_plan,
     },
     handler::*,
     mcp::{McpHttpServerConfig, McpServerConfig, build_streamable_http_service, run_stdio_server},
     parse_ed25519_pubkeys,
-    space::{AppState, copy_space_objects},
+    space::AppState,
     types::{MemoryPolicy, ModelConfig as BrainModelConfig},
 };
 
@@ -952,12 +954,6 @@ async fn join_service_tasks(
     Ok(())
 }
 
-#[derive(Clone)]
-struct NamedEvalProfile {
-    id: String,
-    profile: EvalProfile,
-}
-
 struct EvalCommandConfig {
     space_id: String,
     scenario_paths: Vec<String>,
@@ -981,41 +977,6 @@ struct EvalCommandConfig {
     since_days: u32,
     max_scenarios: usize,
     keep_spaces: bool,
-}
-
-/// Shared plumbing every eval run needs; cheap to clone (AppState is
-/// internally shared).
-#[derive(Clone)]
-struct EvalRunEnv {
-    app_state: AppState,
-    auto_create_tier: u32,
-    run_id: u64,
-    keep_spaces: bool,
-    /// Independent judge model (plan M9), installed on every run-scoped
-    /// space (including shared-formation forks).
-    judge_model: Option<BrainModelConfig>,
-}
-
-impl EvalRunEnv {
-    /// Host for one run-scoped eval space. Default: a sibling `AppState`
-    /// over a fresh in-memory store, so the space is fully isolated (no
-    /// leftover memories can leak into scores) and cleanup is simply
-    /// dropping the fork. `--keep-spaces`: the real store, with the run id
-    /// appended so the kept space cannot collide with earlier runs.
-    fn space_host(&self, parts: &[&str]) -> (AppState, String) {
-        if self.keep_spaces {
-            let run_id = self.run_id.to_string();
-            let mut parts = parts.to_vec();
-            parts.push(&run_id);
-            (self.app_state.clone(), compose_space_id(&parts))
-        } else {
-            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-            (
-                self.app_state.fork_with_store(store),
-                compose_space_id(parts),
-            )
-        }
-    }
 }
 
 enum EvalCommandReport {
@@ -1504,101 +1465,6 @@ fn append_gate_summary(out: &mut String, gate_report: &EvalGateReport) {
     }
 }
 
-/// Concurrent-scenario budget for one suite run. Scenarios are fully
-/// isolated (each in its own run-scoped space), so this only bounds how many
-/// model conversations are in flight at once — enough to hide LLM latency
-/// (the optimize loop re-runs the whole suite every generation) without
-/// driving provider rate limits into the zero-score fallback reports.
-const EVAL_SCENARIO_CONCURRENCY: usize = 4;
-
-async fn run_eval_suite(
-    env: &EvalRunEnv,
-    base_space_id: &str,
-    profile: &NamedEvalProfile,
-    scenarios: &[EvalScenario],
-) -> Result<EvalSuiteReport, BoxError> {
-    use futures::StreamExt;
-
-    // Each scenario runs in its own run-scoped space (see `space_host`), so
-    // leftover memories from a previous run can never leak into scores and
-    // scenarios can run concurrently; the default in-memory host vanishes
-    // when `state` drops. `buffered` keeps the reports in scenario order.
-    // The futures are collected eagerly (futures are inert until polled): a
-    // lazy `map` closure inside the stream would poison this function's
-    // future with rustc's "implementation of FnOnce is not general enough"
-    // when it is later boxed 'static (the optimize loop does exactly that).
-    let scenario_futures: Vec<_> = scenarios
-        .iter()
-        .map(|scenario| run_suite_scenario(env, base_space_id, profile, scenario))
-        .collect();
-    let reports: Vec<EvalReport> = futures::stream::iter(scenario_futures)
-        .buffered(EVAL_SCENARIO_CONCURRENCY)
-        .collect()
-        .await;
-
-    Ok(EvalSuiteReport::from_reports(profile.id.clone(), reports))
-}
-
-async fn run_suite_scenario(
-    env: &EvalRunEnv,
-    base_space_id: &str,
-    profile: &NamedEvalProfile,
-    scenario: &EvalScenario,
-) -> EvalReport {
-    let (state, scenario_space_id) = env.space_host(&[base_space_id, &profile.id, &scenario.id]);
-    let result = match load_eval_space(env, &state, &scenario_space_id).await {
-        Ok(space) => {
-            // Close even when the scenario fails so `--keep-spaces` leaves a
-            // flushed, inspectable space. Close failures only warn: on the
-            // default path the store is dropped right after, so there is
-            // nothing durable to lose.
-            let result = run_scenario(space.as_ref(), scenario, &profile.profile).await;
-            if let Err(err) = space.db.close().await {
-                eprintln!("warning: failed to close eval space {scenario_space_id}: {err}");
-            }
-            result
-        }
-        Err(err) => Err(err),
-    };
-    // One scenario's failure must not discard the other (paid) scenario
-    // reports: record it as a zero-score report with a finding so the suite
-    // mean is not silently inflated either, and keep going.
-    match result {
-        Ok(report) => report,
-        Err(err) => {
-            eprintln!("warning: eval scenario `{}` aborted: {err}", scenario.id);
-            failed_scenario_report(scenario, &profile.id, err.as_ref())
-        }
-    }
-}
-
-/// Zero-score stand-in for a scenario that aborted before producing a
-/// report. Dropping the scenario instead would inflate the suite mean —
-/// poisonous when the suite is an optimizer fitness function or gated.
-fn failed_scenario_report(
-    scenario: &EvalScenario,
-    profile_id: &str,
-    err: &(dyn std::error::Error + Send + Sync),
-) -> EvalReport {
-    let mut report = EvalReport {
-        scenario_id: scenario.id.clone(),
-        description: scenario.description.clone(),
-        profile_id: Some(profile_id.to_string()),
-        started_at: Some(anda_engine::rfc3339_datetime_now()),
-        ..Default::default()
-    };
-    report.turns.push(EvalTurnReport {
-        findings: vec![EvalFinding {
-            kind: EvalFindingKind::JudgeError,
-            expectation_id: None,
-            message: format!("scenario aborted before completion: {err}"),
-        }],
-        ..Default::default()
-    });
-    report.attribution.judge_error = 1;
-    report
-}
-
 fn parse_optimize_mode(target: &str) -> Result<(GenomeKind, Option<PromptTarget>), BoxError> {
     match target.trim().to_lowercase().as_str() {
         "auto" => Ok((GenomeKind::Prompt, None)),
@@ -1611,120 +1477,6 @@ fn parse_optimize_mode(target: &str) -> Result<(GenomeKind, Option<PromptTarget>
         )
         .into()),
     }
-}
-
-/// Shared-formation experiment: replay formation once per scenario into a
-/// base space, snapshot its objects, then fork the snapshot into a fresh
-/// in-memory store per profile and run only maintenance + checkpoints there.
-/// Every profile is judged on the identical encoded memory, so differences
-/// between suites measure the policy — not formation's LLM variance — and
-/// the most expensive phase runs once instead of once per profile.
-async fn run_shared_formation_experiment(
-    env: &EvalRunEnv,
-    base_space_id: &str,
-    profiles: &[NamedEvalProfile],
-    scenarios: &[EvalScenario],
-) -> Result<EvalExperimentReport, BoxError> {
-    let mut shared_reports = Vec::with_capacity(scenarios.len());
-    let mut profile_reports: Vec<Vec<EvalReport>> = vec![Vec::new(); profiles.len()];
-
-    for scenario in scenarios {
-        let (base_state, base_id) = env.space_host(&[base_space_id, "form", &scenario.id]);
-        // Scenario-level failure isolation, matching `run_eval_suite`: one
-        // scenario's abort must not discard the other scenarios' already-paid
-        // formation and policy results.
-        let formation_result = match load_eval_space(env, &base_state, &base_id).await {
-            Ok(space) => {
-                // The formation phase only reads timeouts from the profile.
-                // The base snapshot must be flushed and closed before the
-                // profiles fork it; a close failure poisons every fork, so
-                // it fails the scenario rather than the experiment.
-                let formation_result =
-                    run_formation_phase(space.as_ref(), scenario, &profiles[0].profile).await;
-                let close_result = space.db.close().await;
-                match (formation_result, close_result) {
-                    (Ok(report), Ok(())) => Ok(report),
-                    (Err(err), _) => Err(err),
-                    (_, Err(err)) => Err(err.into()),
-                }
-            }
-            Err(err) => Err(err),
-        };
-        match formation_result {
-            Ok(report) => shared_reports.push(report),
-            Err(err) => {
-                eprintln!(
-                    "warning: shared formation for scenario `{}` aborted: {err}",
-                    scenario.id
-                );
-                // No profile can fork a snapshot that never materialized:
-                // every suite gets the zero-score stand-in for this scenario.
-                shared_reports.push(failed_scenario_report(
-                    scenario,
-                    &profiles[0].id,
-                    err.as_ref(),
-                ));
-                for (index, profile) in profiles.iter().enumerate() {
-                    profile_reports[index].push(failed_scenario_report(
-                        scenario,
-                        &profile.id,
-                        err.as_ref(),
-                    ));
-                }
-                continue;
-            }
-        }
-
-        // Forks are fully isolated — each lives in its own in-memory store —
-        // so every profile's policy phase can replay concurrently. Failures
-        // stay per-profile: `join_all` (not `try_join_all`) so one fork's
-        // abort cannot discard its siblings' finished reports.
-        let base_store = base_state.object_store();
-        let fork_results = futures::future::join_all(profiles.iter().map(|profile| {
-            let base_id = base_id.clone();
-            let base_store = base_store.clone();
-            async move {
-                let fork_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-                copy_space_objects(&base_store, &fork_store, &base_id).await?;
-                let fork_state = env.app_state.fork_with_store(fork_store);
-                let fork_space = fork_state.load_space(&base_id, true).await?;
-                if let Some(judge) = &env.judge_model {
-                    fork_space.set_judge_model(judge.clone())?;
-                }
-                let result =
-                    run_policy_phase(fork_space.as_ref(), scenario, &profile.profile).await;
-                let close_result = fork_space.db.close().await;
-                let report = result?;
-                close_result?;
-                Ok::<EvalReport, BoxError>(report)
-            }
-        }))
-        .await;
-        // The base snapshot is only needed until every profile has forked
-        // it: `base_state` (and, unless --keep-spaces, its store) drops at
-        // the end of this iteration.
-        for ((index, profile), result) in profiles.iter().enumerate().zip(fork_results) {
-            profile_reports[index].push(match result {
-                Ok(report) => report,
-                Err(err) => {
-                    eprintln!(
-                        "warning: policy phase for scenario `{}` profile `{}` aborted: {err}",
-                        scenario.id, profile.id
-                    );
-                    failed_scenario_report(scenario, &profile.id, err.as_ref())
-                }
-            });
-        }
-    }
-
-    let suites: Vec<EvalSuiteReport> = profiles
-        .iter()
-        .zip(profile_reports)
-        .map(|(profile, reports)| EvalSuiteReport::from_reports(profile.id.clone(), reports))
-        .collect();
-    let mut experiment = EvalExperimentReport::from_suites(base_space_id.to_string(), suites);
-    experiment.shared_formation = shared_reports;
-    Ok(experiment)
 }
 
 /// The optimize loop: eval suite as fitness, agent prompts as genome. Each
@@ -1797,7 +1549,7 @@ async fn run_optimize_command(
     .await;
     // Leave the process with pristine prompts and policy regardless of the
     // outcome. (`proposer_state` and its throwaway store drop on return.)
-    let close_result = proposer.db.close().await;
+    let close_result = proposer.close().await;
     prompts::clear_overrides();
     MemoryPolicy::set_eval_override(None);
     let report = outcome?;
@@ -1913,7 +1665,7 @@ async fn run_mine_command(
         max_scenarios,
     };
     let result = mine_scenarios(space.as_ref(), &config).await;
-    space.db.close().await?;
+    space.close().await?;
     let (mined, usage) = result?;
 
     std::fs::create_dir_all(mine_out)?;
@@ -1987,33 +1739,6 @@ fn read_eval_profiles(paths: &[String]) -> Result<Vec<NamedEvalProfile>, BoxErro
         .collect()
 }
 
-/// Creates and loads a run-scoped eval space inside `state` (a throwaway
-/// in-memory fork by default, the real store under `--keep-spaces`; see
-/// [`EvalRunEnv::space_host`]). The space id is unique per host, so creation
-/// must succeed. The env's independent judge model, when configured, is
-/// installed on every space this loads.
-async fn load_eval_space(
-    env: &EvalRunEnv,
-    state: &AppState,
-    space_id: &str,
-) -> Result<Arc<anda_brain::space::Space>, BoxError> {
-    state
-        .admin_create_space(
-            SELF_USER_ID,
-            SELF_USER_ID,
-            space_id.to_string(),
-            env.auto_create_tier,
-            anda_engine::unix_ms(),
-        )
-        .await?;
-
-    let space = state.load_space(space_id, true).await?;
-    if let Some(judge) = &env.judge_model {
-        space.set_judge_model(judge.clone())?;
-    }
-    Ok(space)
-}
-
 fn profile_id_from_path(path: &str) -> String {
     Path::new(path)
         .file_stem()
@@ -2021,57 +1746,6 @@ fn profile_id_from_path(path: &str) -> String {
         .map(sanitize_space_id_part)
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "profile".to_string())
-}
-
-/// AndaDB space names must match `[a-z0-9_]` (max 64 chars); anything else
-/// fails at space creation. Lowercase and map every other character to `_`.
-fn sanitize_space_id_part(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for ch in value.chars() {
-        let ch = ch.to_ascii_lowercase();
-        if ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-
-    let out = out.trim_matches('_');
-    if out.is_empty() {
-        "part".to_string()
-    } else {
-        out.to_string()
-    }
-}
-
-/// AndaDB rejects database names longer than 64 characters.
-const MAX_SPACE_ID_LEN: usize = 64;
-
-/// Joins sanitized parts into a space id and caps it at AndaDB's name limit.
-/// Over-long ids keep a readable prefix plus a hash of the full id, so two
-/// distinct long ids can never collide after truncation.
-fn compose_space_id(parts: &[&str]) -> String {
-    let id = parts
-        .iter()
-        .map(|part| sanitize_space_id_part(part))
-        .collect::<Vec<_>>()
-        .join("_");
-    if id.len() <= MAX_SPACE_ID_LEN {
-        return id;
-    }
-    let suffix = format!("_{:016x}", fnv1a(id.as_bytes()));
-    // The sanitized id is pure ASCII, so byte slicing cannot split a char.
-    format!("{}{suffix}", &id[..MAX_SPACE_ID_LEN - suffix.len()])
-}
-
-/// FNV-1a: a tiny stable hash for id truncation; not security-sensitive.
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for &byte in bytes {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }
 
 fn read_json_file<T>(path: &str) -> Result<T, BoxError>
@@ -2249,12 +1923,11 @@ async fn create_reuse_port_listener(addr: SocketAddr) -> Result<tokio::net::TcpL
 #[cfg(test)]
 mod tests {
     use super::{
-        AnyHost, Cli, Commands, EvalCommandConfig, EvalCommandReport, MAX_SPACE_ID_LEN,
-        StorageCommand, build_cors, build_http_client, build_router, build_service_runtime,
-        compose_space_id, create_reuse_port_listener, default_db_config, join_service_tasks,
-        mcp_http_config_from_cli, model_config_from_cli, normalize_http_path_prefix,
-        object_store_from_command, parse_ed25519_pubkeys, parse_managers, read_json_file,
-        run_eval_command, run_service, sanitize_space_id_part, split_csv_values,
+        AnyHost, Cli, Commands, EvalCommandConfig, EvalCommandReport, StorageCommand, build_cors,
+        build_http_client, build_router, build_service_runtime, create_reuse_port_listener,
+        default_db_config, join_service_tasks, mcp_http_config_from_cli, model_config_from_cli,
+        normalize_http_path_prefix, object_store_from_command, parse_ed25519_pubkeys,
+        parse_managers, read_json_file, run_eval_command, run_service, split_csv_values,
         with_concurrency_limit,
     };
     use anda_brain::agents::SELF_USER_ID;
@@ -2649,34 +2322,6 @@ mod tests {
         assert!(summary.contains("planned_runs: 1"));
         assert!(summary.contains("- summary normal=0 checkpoint=1"));
         assert!(summary.contains("- default maintenance=manual"));
-    }
-
-    #[test]
-    fn sanitize_space_id_part_matches_anda_db_charset() {
-        // AndaDB names only allow [a-z0-9_]: lowercase and fold the rest.
-        assert_eq!(
-            sanitize_space_id_part("Style-Preference"),
-            "style_preference"
-        );
-        assert_eq!(sanitize_space_id_part("__mixed 42__"), "mixed_42");
-        assert_eq!(sanitize_space_id_part("汉字"), "part");
-    }
-
-    #[test]
-    fn compose_space_id_caps_length_without_collisions() {
-        let short = compose_space_id(&["eval", "Default-Profile", "scenario", "123"]);
-        assert_eq!(short, "eval_default_profile_scenario_123");
-
-        let long_a = compose_space_id(&["eval", &"a".repeat(80), "scenario", "123"]);
-        let long_b = compose_space_id(&["eval", &"a".repeat(81), "scenario", "123"]);
-        assert_eq!(long_a.len(), MAX_SPACE_ID_LEN);
-        assert_eq!(long_b.len(), MAX_SPACE_ID_LEN);
-        assert_ne!(long_a, long_b, "hash suffix must keep long ids distinct");
-        assert!(
-            long_a
-                .chars()
-                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
-        );
     }
 
     #[test]

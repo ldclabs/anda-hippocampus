@@ -10,11 +10,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use super::{WikiBundleEntry, WikiError, WikiImportInput, WikiSearchInput, WikiService};
+use super::{
+    EVAL_NAMESPACE, WikiBundleEntry, WikiError, WikiImportInput, WikiSearchInput, WikiService,
+};
 
-/// Namespace the fixture corpus is imported into, keeping eval documents
-/// isolated from real space content.
-pub const EVAL_NAMESPACE: &str = "wiki_eval";
 const EVAL_TOP_K: usize = 8;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
