@@ -525,9 +525,9 @@ impl WikiService {
     /// One-call BM25 retrieval over the chunk plane. Visibility (current
     /// version, namespace, archive state) is entirely in the filter, which
     /// AndaDB applies in the same query while preserving relevance order.
-    /// Unrestricted view: agent tools and internal callers.
-    /// Unscoped, unevented search; production paths go through
-    /// `search_scoped` (HTTP/MCP) and `search_view` (agent tool).
+    /// Unscoped, unevented search over the unrestricted view; production
+    /// paths go through `search_scoped` (HTTP/MCP) and `search_view`
+    /// (agent tool), so this stays test-only.
     #[cfg(test)]
     async fn search(&self, input: WikiSearchInput) -> Result<WikiSearchOutput, WikiError> {
         self.bump_query_count();

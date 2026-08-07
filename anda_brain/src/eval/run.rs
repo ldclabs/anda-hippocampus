@@ -247,12 +247,18 @@ fn failed_scenario_report(
 /// Every profile is judged on the identical encoded memory, so differences
 /// between suites measure the policy — not formation's LLM variance — and
 /// the most expensive phase runs once instead of once per profile.
+///
+/// Requires at least one profile: the shared formation phase is replayed
+/// under `profiles[0]`'s timeouts and attributed to its id.
 pub async fn run_shared_formation_experiment(
     env: &EvalRunEnv,
     base_space_id: &str,
     profiles: &[NamedEvalProfile],
     scenarios: &[EvalScenario],
 ) -> Result<EvalExperimentReport, BoxError> {
+    if profiles.is_empty() {
+        return Err("the shared-formation experiment requires at least one profile".into());
+    }
     let mut shared_reports = Vec::with_capacity(scenarios.len());
     let mut profile_reports: Vec<Vec<EvalReport>> = vec![Vec::new(); profiles.len()];
 

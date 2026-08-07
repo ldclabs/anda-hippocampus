@@ -143,7 +143,6 @@ pub async fn post_formation(
     }
 }
 
-/// POST /v1/{space_id}/recall
 /// Shared prelude for the two recall endpoints: parse, authorize
 /// (PublicRead), and reject label-restricted tokens — RecallAgent's wiki
 /// tools span all labels, so agentic recall needs an unrestricted token
@@ -176,6 +175,7 @@ async fn recall_prelude(
     Ok((space, input))
 }
 
+/// POST /v1/{space_id}/recall
 pub async fn post_recall(
     State(app): State<AppState>,
     AppPath(space_id): AppPath<String>,
@@ -1202,7 +1202,6 @@ pub async fn add_space_token(
     Ok(ct.response(RpcResponse::success(rt)))
 }
 
-/// POST /v1/{space_id}/management/revoke_space_token
 /// Shared prelude for the CWT-only write-management endpoints
 /// (`revoke_space_token`, `update_space`, `restart_formation`,
 /// `update_byok`). Deliberately `check_cwt` + body parse + `load_space`
@@ -1231,6 +1230,7 @@ async fn cwt_write_prelude<T: serde::de::DeserializeOwned>(
     Ok((space, input))
 }
 
+/// POST /v1/{space_id}/management/revoke_space_token
 pub async fn revoke_space_token(
     State(app): State<AppState>,
     AppPath(space_id): AppPath<String>,
