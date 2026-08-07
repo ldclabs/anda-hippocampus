@@ -18,11 +18,12 @@
 use http::StatusCode;
 use std::sync::Arc;
 
+#[cfg(feature = "wiki")]
+use crate::wiki::WikiAccess;
 use crate::{
     payload::AppError,
     space::{AppState, Space},
     types::{CWToken, SpaceToken, TokenScope},
-    wiki::WikiAccess,
 };
 
 /// How an endpoint admits callers.
@@ -61,11 +62,13 @@ impl Caller {
     /// with no credential must not be recorded as the space's own identity).
     /// Shared with the MCP channel so both audit trails name identical
     /// subjects.
+    #[cfg(feature = "wiki")]
     pub fn actor(&self) -> String {
         wiki_actor(&self.cwt, self.st.as_ref())
     }
 
     /// The caller's wiki read scope; see [`wiki_read_access`].
+    #[cfg(feature = "wiki")]
     pub fn wiki_access(&self) -> WikiAccess {
         wiki_read_access(&self.cwt, self.st.as_ref())
     }
@@ -270,6 +273,7 @@ pub async fn authorize(
 /// with no credential must not be recorded as the space's own identity).
 /// Shared by the HTTP and MCP channels so both audit trails name identical
 /// subjects.
+#[cfg(feature = "wiki")]
 pub fn wiki_actor(t: &Option<CWToken>, st: Option<&SpaceToken>) -> String {
     if let Some(t) = t {
         return t.user.to_string();
@@ -319,6 +323,7 @@ pub fn conversation_read_forbidden(
 /// labels; anonymous public-space readers see unlabeled content only.
 /// Shared by the HTTP and MCP channels so the two never diverge (the launch
 /// review's P0-1 was exactly such a divergence).
+#[cfg(feature = "wiki")]
 pub fn wiki_read_access(t: &Option<CWToken>, st: Option<&SpaceToken>) -> WikiAccess {
     let labels = if t.is_some() {
         None

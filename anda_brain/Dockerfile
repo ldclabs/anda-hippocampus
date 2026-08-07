@@ -14,7 +14,7 @@ RUN apt-get update \
 WORKDIR /build
 COPY . .
 
-RUN cargo build --release -p anda_brain
+RUN cargo build --release -p anda_brain --features mcp,wiki
 
 FROM debian:bookworm-slim AS runtime
 

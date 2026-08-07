@@ -100,7 +100,7 @@ chmod 600 .env
 
 ```bash
 cd path/to/anda-brain
-cargo build -p anda_brain --release
+cargo build -p anda_brain --release --features mcp,wiki
 mv target/release/anda_brain ../anda-brain/
 cd ../anda-brain/
 

@@ -39,11 +39,11 @@ jobs:
               *) args+=(--scenario "$fixture") ;;
             esac
           done
-          cargo run -p anda_brain -- eval "${args[@]}" --validate-only
+          cargo run -p anda_brain --features mcp,wiki -- eval "${args[@]}" --validate-only
       - name: Run clippy
         run: cargo clippy --all-targets --all-features
       - name: Run tests
-        run: cargo test --workspace -- --nocapture
+        run: cargo test --workspace --all-features -- --nocapture
   test-cli:
     name: Test anda-cli (Go)
     runs-on: ubuntu-latest

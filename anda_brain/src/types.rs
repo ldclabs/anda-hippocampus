@@ -2,6 +2,7 @@ use anda_core::{BoxError, ModelEffort, Principal, Usage, model::Message};
 use anda_db::storage::StorageStats;
 use anda_engine::model::ModelConfig as EngineModelConfig;
 use ic_cose_types::cose::cwt::{ClaimsSet, get_scope};
+#[cfg(feature = "mcp")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, de};
 use std::{collections::BTreeMap, str::FromStr};
@@ -40,18 +41,24 @@ pub struct SpaceInfo {
     pub formation_processed_id: u64,
     pub maintenance_processed_id: u64,
     pub maintenance_at: MaintenanceAt,
+    #[cfg(feature = "wiki")]
     #[serde(default)]
     pub wiki_docs: usize,
+    #[cfg(feature = "wiki")]
     #[serde(default)]
     pub wiki_chunks: usize,
+    #[cfg(feature = "wiki")]
     #[serde(default)]
     pub wiki_versions: usize,
+    #[cfg(feature = "wiki")]
     #[serde(default)]
     pub wiki_queries: u64,
     /// Digest high-water mark (largest digested wiki version id).
+    #[cfg(feature = "wiki")]
     #[serde(default)]
     pub wiki_digested: u64,
     /// From the last housekeeping stale scan.
+    #[cfg(feature = "wiki")]
     #[serde(default)]
     pub wiki_stale_docs: u64,
 }
@@ -364,14 +371,17 @@ pub struct UpdateSpaceInput {
     pub public: Option<bool>,
     /// Enables/disables the WikiDigest background extraction for this space
     /// (PRD §7.3; disabled by default).
+    #[cfg(feature = "wiki")]
     #[serde(default)]
     pub wiki_digest: Option<bool>,
     /// Enables/disables read auditing for external wiki reads (PRD §3.4;
     /// disabled by default — agent reads are covered by recall logs).
+    #[cfg(feature = "wiki")]
     #[serde(default)]
     pub wiki_audit_reads: Option<bool>,
     /// Namespace → default ACL label map applied to newly created wiki
     /// documents (replaces the whole map when present).
+    #[cfg(feature = "wiki")]
     #[serde(default)]
     pub wiki_acl_defaults: Option<BTreeMap<String, String>>,
     /// Replaces the space's memory policy (validated before applying).
@@ -384,7 +394,8 @@ pub struct UpdateSpaceInput {
 // `JsonSchema` (MCP tool schemas) documents the object form only; the custom
 // `Deserialize` below additionally accepts a JSON-string body on both the
 // HTTP and MCP channels (LLM callers frequently double-encode `context`).
-#[derive(Debug, Default, Serialize, Clone, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Default, Serialize, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "mcp", derive(JsonSchema))]
 pub struct InputContext {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub counterparty: Option<String>,
@@ -526,7 +537,8 @@ pub struct FormationRestartInput {
     pub conversation: u64,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "mcp", derive(JsonSchema))]
 pub enum MaintenanceScope {
     #[serde(rename = "daydream")]
     #[default]
@@ -596,7 +608,8 @@ fn default_trigger() -> String {
     "on_demand".to_string()
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[cfg_attr(feature = "mcp", derive(JsonSchema))]
 pub struct MaintenanceParameters {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stale_event_threshold_days: Option<u32>,

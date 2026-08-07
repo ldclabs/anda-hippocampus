@@ -16,6 +16,19 @@ doctest = false
 [[bin]]
 name = "anda_brain"
 path = "src/bin/main.rs"
+# The service binary is the full product: it serves the wiki routes and the
+# MCP endpoint, so it cannot be built from the lean default library.
+required-features = ["mcp", "wiki"]
+
+[features]
+default = []
+# Structured wiki: documents, versions, ACL-scoped reads, OKF import/export,
+# the wiki agent tools, and the WikiDigest graph extraction, plus their HTTP
+# routes and `SpaceInfo`/`UpdateSpaceInput` fields.
+wiki = ["dep:sha3", "dep:unicode-normalization"]
+# The MCP channel: stdio and Streamable HTTP servers exposing the memory
+# tools. With `wiki` also on, the wiki tools join the same tool router.
+mcp = ["dep:rmcp", "dep:schemars"]
 
 [dependencies]
 async-trait = { workspace = true }
@@ -46,10 +59,10 @@ tower = { workspace = true }
 tower-http = { workspace = true }
 mimalloc = { workspace = true }
 rand = { workspace = true }
-rmcp = { workspace = true }
-schemars = { workspace = true }
-sha3 = { workspace = true }
-unicode-normalization = { workspace = true }
+rmcp = { workspace = true, optional = true }
+schemars = { workspace = true, optional = true }
+sha3 = { workspace = true, optional = true }
+unicode-normalization = { workspace = true, optional = true }
 
 [dev-dependencies]
 cose2 = { workspace = true }

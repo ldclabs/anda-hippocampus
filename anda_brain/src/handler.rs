@@ -4,12 +4,19 @@ use axum::{
     extract::State,
     response::{IntoResponse, Response},
 };
+#[cfg(feature = "wiki")]
 use http::StatusCode;
 use ic_auth_types::ByteArrayB64;
 use rand::Rng;
+#[cfg(feature = "wiki")]
 use serde::Deserialize;
 use serde_json::json;
 
+#[cfg(feature = "wiki")]
+use crate::wiki::{
+    WikiCommitInput, WikiError, WikiImportInput, WikiListDocsInput, WikiReadInput, WikiSearchInput,
+    WikiSelector, WikiVerifyInput,
+};
 use crate::{
     agents::SELF_USER_ID,
     authz::{AuthzError, AuthzMode, authorize, check_cwt, ensure_sharding, load_space},
@@ -19,10 +26,6 @@ use crate::{
     },
     space::{AppState, Space},
     types::*,
-    wiki::{
-        WikiCommitInput, WikiError, WikiImportInput, WikiListDocsInput, WikiReadInput,
-        WikiSearchInput, WikiSelector, WikiVerifyInput,
-    },
 };
 use std::sync::Arc;
 
@@ -399,6 +402,7 @@ pub async fn post_shadow_eval(
 
 // ─── Wiki ─────────────────────────────────────────────────────────────────────
 
+#[cfg(feature = "wiki")]
 fn wiki_error(err: WikiError) -> AppError {
     match &err {
         WikiError::Conflict { .. } => AppError {
@@ -417,12 +421,14 @@ fn wiki_error(err: WikiError) -> AppError {
     }
 }
 
+#[cfg(feature = "wiki")]
 #[derive(Debug, Default, Deserialize)]
 pub struct WikiPageQuery {
     pub cursor: Option<String>,
     pub limit: Option<usize>,
 }
 
+#[cfg(feature = "wiki")]
 #[derive(Debug, Default, Deserialize)]
 pub struct WikiDocsQuery {
     pub namespace: Option<String>,
@@ -432,6 +438,7 @@ pub struct WikiDocsQuery {
     pub limit: Option<usize>,
 }
 
+#[cfg(feature = "wiki")]
 #[derive(Debug, Default, Deserialize)]
 pub struct WikiContentQuery {
     pub version: Option<u64>,
@@ -440,6 +447,7 @@ pub struct WikiContentQuery {
     pub end: Option<u64>,
 }
 
+#[cfg(feature = "wiki")]
 #[derive(Debug, Default, Deserialize)]
 pub struct WikiEventsQuery {
     pub kind: Option<String>,
@@ -449,6 +457,7 @@ pub struct WikiEventsQuery {
 }
 
 /// POST /v1/{space_id}/wiki/docs — commit (create or CAS update)
+#[cfg(feature = "wiki")]
 pub async fn post_wiki_commit(
     State(app): State<AppState>,
     AppPath(space_id): AppPath<String>,
@@ -486,6 +495,7 @@ pub async fn post_wiki_commit(
 }
 
 /// GET /v1/{space_id}/wiki/docs
+#[cfg(feature = "wiki")]
 pub async fn list_wiki_docs(
     State(app): State<AppState>,
     AppPath(space_id): AppPath<String>,
@@ -527,6 +537,7 @@ pub async fn list_wiki_docs(
 }
 
 /// GET /v1/{space_id}/wiki/docs/{doc_id} — metadata + TOC
+#[cfg(feature = "wiki")]
 pub async fn get_wiki_doc(
     State(app): State<AppState>,
     AppPath((space_id, doc_id)): AppPath<(String, u64)>,
@@ -569,6 +580,7 @@ pub async fn get_wiki_doc(
 ///
 /// `?anchor=` reads one section, `?start=&end=` a byte range, neither reads
 /// the bounded full text; `?version=` time-travels.
+#[cfg(feature = "wiki")]
 pub async fn get_wiki_content(
     State(app): State<AppState>,
     AppPath((space_id, doc_id)): AppPath<(String, u64)>,
@@ -613,6 +625,7 @@ pub async fn get_wiki_content(
 }
 
 /// GET /v1/{space_id}/wiki/docs/{doc_id}/versions
+#[cfg(feature = "wiki")]
 pub async fn list_wiki_versions(
     State(app): State<AppState>,
     AppPath((space_id, doc_id)): AppPath<(String, u64)>,
@@ -645,6 +658,7 @@ pub async fn list_wiki_versions(
 }
 
 /// POST /v1/{space_id}/wiki/docs/{doc_id}/archive
+#[cfg(feature = "wiki")]
 pub async fn post_wiki_archive(
     State(app): State<AppState>,
     AppPath((space_id, doc_id)): AppPath<(String, u64)>,
@@ -655,6 +669,7 @@ pub async fn post_wiki_archive(
 }
 
 /// POST /v1/{space_id}/wiki/docs/{doc_id}/restore
+#[cfg(feature = "wiki")]
 pub async fn post_wiki_restore(
     State(app): State<AppState>,
     AppPath((space_id, doc_id)): AppPath<(String, u64)>,
@@ -664,6 +679,7 @@ pub async fn post_wiki_restore(
     wiki_set_archived(app, space_id, doc_id, ct, token, sharding, false).await
 }
 
+#[cfg(feature = "wiki")]
 async fn wiki_set_archived(
     app: AppState,
     space_id: String,
@@ -696,6 +712,7 @@ async fn wiki_set_archived(
 }
 
 /// POST /v1/{space_id}/wiki/search
+#[cfg(feature = "wiki")]
 pub async fn post_wiki_search(
     State(app): State<AppState>,
     AppPath(space_id): AppPath<String>,
@@ -733,6 +750,7 @@ pub async fn post_wiki_search(
 }
 
 /// POST /v1/{space_id}/wiki/verify — citation verification
+#[cfg(feature = "wiki")]
 pub async fn post_wiki_verify(
     State(app): State<AppState>,
     AppPath(space_id): AppPath<String>,
@@ -772,6 +790,7 @@ pub async fn post_wiki_verify(
 }
 
 /// GET /v1/{space_id}/wiki/events
+#[cfg(feature = "wiki")]
 pub async fn list_wiki_events(
     State(app): State<AppState>,
     AppPath(space_id): AppPath<String>,
@@ -807,12 +826,14 @@ pub async fn list_wiki_events(
     }))
 }
 
+#[cfg(feature = "wiki")]
 #[derive(Debug, Default, Deserialize)]
 pub struct WikiExportQuery {
     pub namespace: Option<String>,
 }
 
 /// POST /v1/{space_id}/wiki/import — OKF bundle import (requires All scope)
+#[cfg(feature = "wiki")]
 pub async fn post_wiki_import(
     State(app): State<AppState>,
     AppPath(space_id): AppPath<String>,
@@ -851,6 +872,7 @@ pub async fn post_wiki_import(
 }
 
 /// GET /v1/{space_id}/wiki/export?namespace= — OKF bundle export (requires All scope)
+#[cfg(feature = "wiki")]
 pub async fn get_wiki_export(
     State(app): State<AppState>,
     AppPath(space_id): AppPath<String>,
@@ -881,6 +903,7 @@ pub async fn get_wiki_export(
 
 /// POST /v1/{space_id}/wiki/digest — distill pending wiki versions into the
 /// Cognitive Nexus (requires the space to have wiki_digest enabled)
+#[cfg(feature = "wiki")]
 pub async fn post_wiki_digest(
     State(app): State<AppState>,
     AppPath(space_id): AppPath<String>,
@@ -1404,19 +1427,24 @@ pub async fn update_space_tier(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "wiki")]
     use super::{
-        WikiContentQuery, WikiEventsQuery, WikiExportQuery, add_space_token, apple_touch_icon,
-        create_space, execute_kip_readonly, favicon, get_byok, get_conversation,
-        get_conversation_delta, get_formation_status, get_info, get_information, get_memory_status,
-        get_or_init_user, get_skill, get_wiki_content, get_wiki_doc, get_wiki_export,
-        list_conversations, list_space_tokens, list_wiki_events, post_formation, post_maintenance,
-        post_memory_forget, post_memory_pin, post_probe, post_recall, post_recall_structured,
-        post_shadow_eval, post_wiki_commit, post_wiki_import, post_wiki_search, post_wiki_verify,
-        restart_formation, revoke_space_token, update_byok, update_space, update_space_tier,
+        WikiContentQuery, WikiEventsQuery, WikiExportQuery, get_wiki_content, get_wiki_doc,
+        get_wiki_export, list_wiki_events, post_wiki_commit, post_wiki_import, post_wiki_search,
+        post_wiki_verify,
     };
+    use super::{
+        add_space_token, apple_touch_icon, create_space, execute_kip_readonly, favicon, get_byok,
+        get_conversation, get_conversation_delta, get_formation_status, get_info, get_information,
+        get_memory_status, get_or_init_user, get_skill, list_conversations, list_space_tokens,
+        post_formation, post_maintenance, post_memory_forget, post_memory_pin, post_probe,
+        post_recall, post_recall_structured, post_shadow_eval, restart_formation,
+        revoke_space_token, update_byok, update_space, update_space_tier,
+    };
+    #[cfg(feature = "wiki")]
+    use crate::authz::wiki_read_access;
     use crate::{
         agents::SELF_USER_ID,
-        authz::wiki_read_access,
         payload::{Accept, AppBytes, AppError, AppPath, AppQuery, HeaderVals, PayloadFormat},
         space::AppState,
         testkit::{app_state_core, create_loaded_space, models_with_completer},
@@ -1512,7 +1540,11 @@ mod tests {
             .prepare_signature(Some(Label::Int(iana::AlgorithmEdDSA)), None, None)
             .unwrap();
         sign1
-            .set_signature(ed25519_sign(signing_key.as_bytes(), &tbs_data).to_vec())
+            .set_signature(
+                ed25519_sign(signing_key.as_bytes(), &tbs_data)
+                    .to_bytes()
+                    .to_vec(),
+            )
             .unwrap();
         ByteBufB64(sign1.to_vec().unwrap()).to_string()
     }
@@ -1597,6 +1629,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "wiki")]
     #[test]
     fn wiki_read_access_resolves_the_three_caller_states() {
         use crate::types::{CWToken, SpaceToken};
@@ -3224,6 +3257,7 @@ mod tests {
         assert!(maintenance["result"]["conversation"].is_number());
     }
 
+    #[cfg(feature = "wiki")]
     #[tokio::test]
     async fn wiki_handlers_commit_search_read_and_conflict_mapping() {
         let app = test_app_state("handler_wiki", 0);
@@ -3364,6 +3398,7 @@ mod tests {
     /// M4 acceptance over HTTP: a space token restricted to other labels
     /// cannot retrieve a labeled probe document; a token granted the label
     /// can. The filter runs inside the retrieval query itself.
+    #[cfg(feature = "wiki")]
     #[tokio::test]
     async fn wiki_restricted_token_cannot_see_labeled_probe() {
         let app = test_app_state_with_auth_enabled("handler_wiki_acl", 0);
@@ -3475,6 +3510,7 @@ mod tests {
         .await;
     }
 
+    #[cfg(feature = "wiki")]
     #[tokio::test]
     async fn wiki_import_export_round_trip_over_http() {
         let app = test_app_state("handler_wiki_okf", 0);

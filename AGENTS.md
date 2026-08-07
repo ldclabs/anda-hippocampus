@@ -43,23 +43,54 @@ Run these from the repository root:
 
 ```bash
 cargo fmt --check
-cargo clippy -p anda_brain --tests -- -D warnings
-cargo test -p anda_brain
+cargo clippy -p anda_brain --all-targets --all-features -- -D warnings
+cargo test -p anda_brain --all-features
 ```
 
-`cargo test -p anda_brain` includes a bin test that binds an ephemeral localhost
-port. In restricted sandboxes it may fail with `PermissionDenied`; rerun it with
-the required permission rather than treating that as a code failure.
+`cargo test -p anda_brain --all-features` includes a bin test that binds an
+ephemeral localhost port. In restricted sandboxes it may fail with
+`PermissionDenied`; rerun it with the required permission rather than treating
+that as a code failure.
+
+The library is feature-gated (see "Cargo Features" below), so also check that
+the lean build still compiles when you touch `space.rs`, `handler.rs`,
+`authz.rs`, or `types.rs`:
+
+```bash
+cargo test -p anda_brain --lib
+cargo test -p anda_brain --lib --features wiki
+cargo test -p anda_brain --lib --features mcp
+```
 
 For local manual testing:
 
 ```bash
-cargo run -p anda_brain
-cargo run -p anda_brain -- local --db ./db
+cargo run -p anda_brain --features mcp,wiki
+cargo run -p anda_brain --features mcp,wiki -- local --db ./db
 ```
 
 Authentication is disabled when `ED25519_PUBKEYS` is empty. Do not assume this
 is safe for production.
+
+## Cargo Features
+
+The `anda_brain` library defaults to memory only — formation, recall,
+maintenance, and their HTTP routes. Two optional features add the rest:
+
+- `wiki`: the structured wiki (documents, versions, ACL-scoped reads, OKF
+  import/export), its agent tools, the WikiDigest graph extraction, the
+  `/v1/{space_id}/wiki/*` routes, and the `wiki_*` fields of `SpaceInfo` and
+  `UpdateSpaceInput`.
+- `mcp`: the MCP channel (stdio and Streamable HTTP). With `wiki` also on, the
+  wiki tools join the MCP tool router.
+
+The `anda_brain` binary declares `required-features = ["mcp", "wiki"]`: it is
+the full product, so every build of it must pass `--features mcp,wiki`. Cargo
+silently skips the binary when they are absent.
+
+When adding code that touches the wiki or MCP, gate it with
+`#[cfg(feature = "…")]` rather than widening the default surface, and keep the
+lean build compiling.
 
 ## Coding Conventions
 

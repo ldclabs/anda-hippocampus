@@ -673,8 +673,8 @@ The service is configured via CLI arguments and environment variables:
 
 | Backend | Command | Key Config |
 |---------|---------|------------|
-| In-memory (dev) | `cargo run -p anda_brain` | — |
-| Local filesystem | `cargo run -p anda_brain -- local` | `LOCAL_DB_PATH` (default `./db`) |
-| AWS S3 | `cargo run -p anda_brain -- aws` | `AWS_BUCKET`, `AWS_REGION` |
-| MCP HTTP | `cargo run -p anda_brain -- local` then connect `/mcp/{space_id}` | `MCP_HTTP_ALLOWED_HOSTS`, bearer token |
-| MCP stdio | `cargo run -p anda_brain -- mcp --space-id my_space_001 local` | `MCP_AUTH_TOKEN`, `LOCAL_DB_PATH` |
+| In-memory (dev) | `cargo run -p anda_brain --features mcp,wiki` | — |
+| Local filesystem | `cargo run -p anda_brain --features mcp,wiki -- local` | `LOCAL_DB_PATH` (default `./db`) |
+| AWS S3 | `cargo run -p anda_brain --features mcp,wiki -- aws` | `AWS_BUCKET`, `AWS_REGION` |
+| MCP HTTP | `cargo run -p anda_brain --features mcp,wiki -- local` then connect `/mcp/{space_id}` | `MCP_HTTP_ALLOWED_HOSTS`, bearer token |
+| MCP stdio | `cargo run -p anda_brain --features mcp,wiki -- mcp --space-id my_space_001 local` | `MCP_AUTH_TOKEN`, `LOCAL_DB_PATH` |

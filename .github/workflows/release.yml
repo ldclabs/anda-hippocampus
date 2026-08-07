@@ -59,7 +59,7 @@ jobs:
 
       - name: Build Rust binary
         run: |
-          cargo build --release --locked -p anda_brain --target ${{ matrix.rust_target }}
+          cargo build --release --locked -p anda_brain --features mcp,wiki --target ${{ matrix.rust_target }}
 
       - name: Build Go binary
         working-directory: anda-cli

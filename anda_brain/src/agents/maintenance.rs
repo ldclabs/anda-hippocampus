@@ -2,7 +2,7 @@ use anda_core::{
     Agent, AgentContext, AgentOutput, BoxError, CompletionRequest, Document, Documents, Message,
     Resource, StateFeatures,
 };
-use anda_db::schema::DocumentId;
+use anda_db::{collection::Collection, schema::DocumentId};
 use anda_engine::{
     context::{AgentCtx, CompletionRunner},
     extension::note::{NoteTool, load_notes, load_notes_from_legacy},
@@ -51,6 +51,10 @@ impl Drop for MaintenanceClaim {
 #[derive(Clone)]
 pub struct MaintenanceAgent {
     pub conversations: Conversations,
+    /// The collection backing `conversations`. `Conversations` wraps document
+    /// access only, so the maintenance watermarks — collection extensions —
+    /// are read and written through this handle.
+    pub conversations_collection: Arc<Collection>,
     memory: Arc<MemoryManagement>,
     processing: Arc<AtomicBool>,
     /// True while a [`MaintenanceClaim`] holds `processing` on behalf of
@@ -65,11 +69,13 @@ impl MaintenanceAgent {
     pub fn new(
         memory: Arc<MemoryManagement>,
         conversations: Conversations,
+        conversations_collection: Arc<Collection>,
         hook: Arc<dyn BrainHook>,
     ) -> Self {
         Self {
             memory,
             conversations,
+            conversations_collection,
             processing: Arc::new(AtomicBool::new(false)),
             external_claim: Arc::new(AtomicBool::new(false)),
             hook,
@@ -122,7 +128,7 @@ impl MaintenanceAgent {
     }
 
     pub fn get_processed(&self) -> Option<DocumentId> {
-        match self.conversations.conversations.max_document_id() {
+        match self.conversations_collection.max_document_id() {
             0 => None,
             id => Some(id),
         }
@@ -130,7 +136,7 @@ impl MaintenanceAgent {
 
     pub fn get_processed_at(&self) -> MaintenanceAt {
         let mut rt = MaintenanceAt::default();
-        self.conversations.conversations.extensions_with(|kv| {
+        self.conversations_collection.extensions_with(|kv| {
             if let Some(v) = kv.get("full")
                 && let Ok(id) = v.try_into()
             {
@@ -157,8 +163,7 @@ impl MaintenanceAgent {
 
     /// Persists the start time of the latest maintenance task.
     pub async fn set_start_at(&self, now_ms: u64) -> Result<(), BoxError> {
-        self.conversations
-            .conversations
+        self.conversations_collection
             .save_extension_from("start_at".to_string(), &now_ms)
             .await?;
         Ok(())
@@ -169,8 +174,7 @@ impl MaintenanceAgent {
         scope: MaintenanceScope,
         formation_id: DocumentId,
     ) -> Result<(), BoxError> {
-        self.conversations
-            .conversations
+        self.conversations_collection
             .save_extension_from(scope.to_string(), &formation_id)
             .await?;
         Ok(())
@@ -773,7 +777,7 @@ mod tests {
 
         assert!(err.to_string().contains("invalid MaintenanceInput"));
         assert!(!maintenance.is_processing());
-        assert_eq!(maintenance.conversations.conversations.len(), 0);
+        assert_eq!(maintenance.conversations_collection.len(), 0);
     }
 
     #[tokio::test]
@@ -935,9 +939,9 @@ mod tests {
         )
         .await;
 
-        let updates_before = maintenance.conversations.conversations.stats().update_count;
+        let updates_before = maintenance.conversations_collection.stats().update_count;
         maintenance.process_one(&ctx, &mut conversation).await;
-        let updates_after = maintenance.conversations.conversations.stats().update_count;
+        let updates_after = maintenance.conversations_collection.stats().update_count;
 
         assert_eq!(conversation.status, ConversationStatus::Failed);
         assert!(

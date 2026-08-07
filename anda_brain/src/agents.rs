@@ -3,7 +3,7 @@ mod maintenance;
 pub mod prompts;
 mod recall;
 
-use anda_core::{BoxError, ContentPart, Document, Message, Principal, Usage};
+use anda_core::{BoxError, ContentPart, Document, FunctionDefinition, Message, Principal, Usage};
 use anda_db::schema::DocumentId;
 use anda_engine::{
     context::CompletionRunner,
@@ -11,11 +11,42 @@ use anda_engine::{
     unix_ms,
 };
 use parking_lot::RwLock;
-use std::collections::VecDeque;
+use serde_json::json;
+use std::{collections::VecDeque, sync::LazyLock};
 
 pub use formation::*;
 pub use maintenance::*;
 pub use recall::*;
+
+/// The KIP tool contract the brain exposes, replacing
+/// `anda_engine::memory::FUNCTION_DEFINITION` on both the writable
+/// `execute_kip` tool (via `MemoryManagement::with_kip_function_definitions`)
+/// and the read-only [`TimedMemoryReadonly`]. It keeps `parameters` optional
+/// where the engine's default requires it.
+pub(crate) static KIP_FUNCTION_DEFINITION: LazyLock<FunctionDefinition> = LazyLock::new(|| {
+    serde_json::from_value(json!({
+        "name": "execute_kip",
+        "description": "Executes one or more KIP (Knowledge Interaction Protocol) commands against the Cognitive Nexus to interact with your persistent memory.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "commands": {
+                    "type": "array",
+                    "description": "An array of KIP commands for batch execution (reduces round-trips). Commands are executed sequentially; execution stops on first KML error.",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "parameters": {
+                    "type": "object",
+                    "description": "An optional JSON object of key-value pairs used for safe substitution of placeholders in the command string(s). Placeholders should start with ':' (e.g., :name, :limit). IMPORTANT: A placeholder must represent a complete JSON value token (e.g., name: :name). Do not embed placeholders inside quoted strings (e.g., \"Hello :name\"), because substitution uses JSON serialization."
+                },
+            },
+            "required": ["commands"]
+        },
+        "strict": true
+    })).unwrap()
+});
 
 #[async_trait::async_trait]
 pub trait BrainHook: Send + Sync {

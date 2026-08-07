@@ -9,12 +9,14 @@ pub(crate) mod authz;
 pub mod eval;
 pub mod handler;
 pub(crate) mod ledger;
+#[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod payload;
 pub mod space;
 #[cfg(test)]
 pub(crate) mod testkit;
 pub mod types;
+#[cfg(feature = "wiki")]
 pub(crate) mod wiki;
 
 pub fn parse_ed25519_pubkeys(input: &str) -> Result<Vec<VerifyingKey>, BoxError> {

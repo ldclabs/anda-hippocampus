@@ -1,7 +1,6 @@
 use anda_cognitive_nexus::{CognitiveNexus, ConceptPK};
 use anda_core::{
-    AgentInput, AgentOutput, BoxError, ContentPart, FunctionDefinition, Message, Principal,
-    Resource, Usage,
+    AgentInput, AgentOutput, BoxError, ContentPart, Message, Principal, Resource, Usage,
 };
 use anda_db::{
     collection::{Collection, CollectionConfig},
@@ -29,12 +28,11 @@ use ic_cose_types::cose::{
     SIGN1_TAG, cwt::cwt_from, ed25519::VerifyingKey, sign1::cose_sign1_from, skip_prefix,
 };
 use object_store::{ObjectStore, memory::InMemory};
-use serde_json::json;
 use std::{
     collections::{BTreeMap, BTreeSet},
     str::FromStr,
     sync::{
-        Arc, LazyLock, OnceLock, Weak,
+        Arc, OnceLock, Weak,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -45,10 +43,14 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[cfg(feature = "wiki")]
+use crate::wiki::{
+    WikiCommitTool, WikiDigest, WikiDigestReport, WikiReadTool, WikiSearchTool, WikiService,
+};
 use crate::{
     agents::{
-        BrainHook, FormationAgent, MaintenanceAgent, READONLY_KIP_TIMEOUT, RecallAgent,
-        SELF_USER_ID, TimedMemoryReadonly,
+        BrainHook, FormationAgent, KIP_FUNCTION_DEFINITION, MaintenanceAgent, READONLY_KIP_TIMEOUT,
+        RecallAgent, SELF_USER_ID, TimedMemoryReadonly,
     },
     assess,
     ledger::{MissCache, UsageLedger},
@@ -61,35 +63,7 @@ use crate::{
         ShadowEvalInput, ShadowReport, ShadowSample, SourceReliability, SpaceInfo, SpaceTier,
         SpaceToken, TokenScope, UpdateSpaceInput,
     },
-    wiki::{
-        WikiCommitTool, WikiDigest, WikiDigestReport, WikiReadTool, WikiSearchTool, WikiService,
-    },
 };
-
-static FUNCTION_DEFINITION: LazyLock<FunctionDefinition> = LazyLock::new(|| {
-    serde_json::from_value(json!({
-        "name": "execute_kip",
-        "description": "Executes one or more KIP (Knowledge Interaction Protocol) commands against the Cognitive Nexus to interact with your persistent memory.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "commands": {
-                    "type": "array",
-                    "description": "An array of KIP commands for batch execution (reduces round-trips). Commands are executed sequentially; execution stops on first KML error.",
-                    "items": {
-                        "type": "string"
-                    }
-                },
-                "parameters": {
-                    "type": "object",
-                    "description": "An optional JSON object of key-value pairs used for safe substitution of placeholders in the command string(s). Placeholders should start with ':' (e.g., :name, :limit). IMPORTANT: A placeholder must represent a complete JSON value token (e.g., name: :name). Do not embed placeholders inside quoted strings (e.g., \"Hello :name\"), because substitution uses JSON serialization."
-                },
-            },
-            "required": ["commands"]
-        },
-        "strict": true
-    })).unwrap()
-});
 
 /// Default cap on concurrent LLM-billed requests, matching the CLI's
 /// `LLM_MAX_CONCURRENCY` flag default. States built without
@@ -194,6 +168,7 @@ impl AppState {
         &self.llm_semaphore
     }
 
+    #[cfg(feature = "mcp")]
     pub(crate) fn cwt_auth_enabled(&self) -> bool {
         !self.ed25519_pubkeys.is_empty()
     }
@@ -674,7 +649,11 @@ impl AppState {
                 // An in-flight wiki digest holds the DB too (it is kicked
                 // right after maintenance finishes, in the same window this
                 // check races against).
-                if space.pinned || space.is_processing() || space.wiki_digest.is_processing() {
+                #[cfg(feature = "wiki")]
+                if space.wiki_digest.is_processing() {
+                    return false;
+                }
+                if space.pinned || space.is_processing() {
                     return false;
                 }
                 // Map + background snapshot are the only expected SpaceEntry refs here;
@@ -732,7 +711,13 @@ pub struct Space {
     pub(crate) recall: Arc<RecallAgent>,
     pub(crate) db: Arc<AndaDB>,
     pub(crate) memory: Arc<MemoryManagement>,
+    /// The collection backing `memory`'s conversations. `MemoryManagement`
+    /// wraps document access only, so document counts and the cursor paging
+    /// in `list_conversations` go through this handle.
+    pub(crate) conversations: Arc<Collection>,
+    #[cfg(feature = "wiki")]
     pub(crate) wiki: Arc<WikiService>,
+    #[cfg(feature = "wiki")]
     pub(crate) wiki_digest: Arc<WikiDigest>,
 }
 
@@ -929,6 +914,7 @@ impl Space {
         // The ACL-defaults write does real I/O and can fail; run it before
         // any in-memory extension mutation so its failure leaves the update
         // untouched.
+        #[cfg(feature = "wiki")]
         if let Some(defaults) = input.wiki_acl_defaults {
             changed = true;
             self.wiki.set_acl_defaults(defaults).await?;
@@ -947,11 +933,13 @@ impl Space {
             changed = true;
             self.db.set_extension_from("public".to_string(), public);
         }
+        #[cfg(feature = "wiki")]
         if let Some(wiki_digest) = input.wiki_digest {
             changed = true;
             self.db
                 .set_extension_from("wiki_digest".to_string(), wiki_digest);
         }
+        #[cfg(feature = "wiki")]
         if let Some(audit_reads) = input.wiki_audit_reads {
             changed = true;
             self.db
@@ -1005,17 +993,23 @@ impl Space {
         let mut info = SpaceInfo {
             id: self.id.clone(),
             db_stats: self.db.stats(),
-            concepts: self.memory.nexus.concepts().len(),
-            propositions: self.memory.nexus.propositions().len(),
-            conversations: self.memory.conversations.len(),
+            concepts: self.memory.nexus().concepts().len(),
+            propositions: self.memory.nexus().propositions().len(),
+            conversations: self.conversations.len(),
             formation_processed_id: self.formation.get_processed().unwrap_or_default(),
             maintenance_processed_id: self.maintenance.get_processed().unwrap_or_default(),
             maintenance_at: self.maintenance.get_processed_at(),
+            #[cfg(feature = "wiki")]
             wiki_docs: self.wiki.docs_count(),
+            #[cfg(feature = "wiki")]
             wiki_chunks: self.wiki.chunks_count(),
+            #[cfg(feature = "wiki")]
             wiki_versions: self.wiki.versions_count(),
+            #[cfg(feature = "wiki")]
             wiki_queries: self.wiki.queries_count(),
+            #[cfg(feature = "wiki")]
             wiki_digested: self.wiki_digest.cursor(),
+            #[cfg(feature = "wiki")]
             wiki_stale_docs: self.wiki.stale_report_cached().stale_docs,
             ..Default::default()
         };
@@ -1058,9 +1052,9 @@ impl Space {
     pub fn formation_status(&self) -> FormationStatus {
         FormationStatus {
             id: self.id.clone(),
-            concepts: self.memory.nexus.concepts().len(),
-            propositions: self.memory.nexus.propositions().len(),
-            conversations: self.memory.conversations.len(),
+            concepts: self.memory.nexus().concepts().len(),
+            propositions: self.memory.nexus().propositions().len(),
+            conversations: self.conversations.len(),
             formation_processing: self.formation.is_processing(),
             maintenance_processing: self.maintenance.is_processing(),
             formation_processed_id: self.formation.get_processed().unwrap_or_default(),
@@ -1096,10 +1090,10 @@ impl Space {
         }
         let nodes = self
             .memory
-            .nexus
+            .nexus()
             .concepts()
             .len()
-            .max(self.memory.conversations.len()) as u64;
+            .max(self.conversations.len()) as u64;
         let tier = self.get_tier();
         if tier.allow_nodes() < nodes {
             return Err(format!(
@@ -1407,8 +1401,8 @@ impl Space {
             .db
             .get_extension_as::<MemoryGraphCounters>("memory_graph_counters")
             .unwrap_or_else(|| MemoryGraphCounters {
-                concepts: self.memory.nexus.concepts().len() as u64,
-                propositions: self.memory.nexus.propositions().len() as u64,
+                concepts: self.memory.nexus().concepts().len() as u64,
+                propositions: self.memory.nexus().propositions().len() as u64,
                 ..Default::default()
             });
         let maintenance_usage: Usage = self
@@ -1563,12 +1557,8 @@ impl Space {
         &self,
         request: anda_kip::Request,
     ) -> Result<anda_kip::Response, BoxError> {
-        match timeout(
-            SETTLEMENT_KIP_TIMEOUT,
-            request.execute(self.memory.nexus.as_ref()),
-        )
-        .await
-        {
+        let nexus = self.memory.nexus();
+        match timeout(SETTLEMENT_KIP_TIMEOUT, request.execute(nexus.as_ref())).await {
             Ok((_, res)) => Ok(res),
             Err(_) => Err(format!(
                 "settlement KIP execution timed out after {} seconds",
@@ -2549,7 +2539,7 @@ impl Space {
     async fn ensure_sleep_task_schema(&self) -> Result<(), BoxError> {
         if self
             .memory
-            .nexus
+            .nexus()
             .has_concept(&ConceptPK::Object {
                 r#type: "$ConceptType".to_string(),
                 name: "SleepTask".to_string(),
@@ -2572,6 +2562,7 @@ impl Space {
 
     /// WikiDigest is off by default (PRD §13): extraction writes to the
     /// graph, so spaces opt in explicitly via `update_space { wiki_digest }`.
+    #[cfg(feature = "wiki")]
     fn wiki_digest_enabled(&self) -> bool {
         self.db.get_extension_as("wiki_digest").unwrap_or(false)
     }
@@ -2579,6 +2570,7 @@ impl Space {
     /// Runs the wiki digest synchronously: distills pending wiki versions
     /// into the Cognitive Nexus with citation provenance, supersedes stale
     /// facts, and re-verifies a citation sample.
+    #[cfg(feature = "wiki")]
     pub async fn run_wiki_digest(&self, user: Principal) -> Result<WikiDigestReport, BoxError> {
         if !self.wiki_digest_enabled() {
             return Err(
@@ -2622,6 +2614,7 @@ impl Space {
     /// too), audit-log retention pruning, the stale-document report, and the
     /// citation sample check (independent of the digest switch). Cheap enough
     /// to run alongside every digest kick.
+    #[cfg(feature = "wiki")]
     fn kick_wiki_housekeeping(self: &Arc<Self>) {
         let space = self.clone();
         tokio::spawn(async move {
@@ -2663,6 +2656,7 @@ impl Space {
 
     /// Fire-and-forget digest kick used by startup and post-maintenance
     /// hooks; a no-op when disabled or already running.
+    #[cfg(feature = "wiki")]
     fn kick_wiki_digest(self: &Arc<Self>) {
         if !self.wiki_digest_enabled() || self.wiki_digest.is_processing() {
             return;
@@ -2700,12 +2694,8 @@ impl Space {
         mut req: anda_kip::Request,
     ) -> Result<anda_kip::Response, BoxError> {
         req.readonly = true;
-        match timeout(
-            READONLY_KIP_TIMEOUT,
-            req.execute(self.memory.nexus.as_ref()),
-        )
-        .await
-        {
+        let nexus = self.memory.nexus();
+        match timeout(READONLY_KIP_TIMEOUT, req.execute(nexus.as_ref())).await {
             Ok((_, res)) => Ok(res),
             Err(_) => Ok(anda_kip::Response::err(KipError::new(
                 KipErrorCode::ExecutionTimeout,
@@ -2752,9 +2742,9 @@ impl Space {
         use anda_db::query::{Filter, RangeQuery};
 
         let collection = match collection.as_deref() {
-            Some("recall") => self.recall.conversations.conversations.clone(),
-            Some("maintenance") => self.maintenance.conversations.conversations.clone(),
-            None | Some("formation") => self.memory.conversations.clone(),
+            Some("recall") => self.recall.conversations_collection.clone(),
+            Some("maintenance") => self.maintenance.conversations_collection.clone(),
+            None | Some("formation") => self.conversations.clone(),
             // Same strictness as `get_conversation`: unknown names error
             // instead of silently listing the formation collection.
             Some(other) => {
@@ -2824,7 +2814,9 @@ impl Space {
             CognitiveNexus::connect(db.clone(), async |nexus| init_nexus_kip(nexus).await).await?;
 
         let nexus = Arc::new(nexus);
-        let memory = MemoryManagement::connect(db.clone(), nexus.clone()).await?;
+        // Creates the conversation and resource collections; `connect` below
+        // reopens them with the brain's leaner index layout.
+        MemoryManagement::connect(db.clone(), nexus.clone()).await?;
         let info = SpaceInfo {
             id: id.clone(),
             name: None,
@@ -2833,7 +2825,9 @@ impl Space {
             db_stats: db.stats(),
             concepts: nexus.concepts().len(),
             propositions: nexus.propositions().len(),
-            conversations: memory.conversations.len(),
+            // The space was just created, so its conversation collection is
+            // necessarily empty.
+            conversations: 0,
             public: false,
             tier,
             ..Default::default()
@@ -2891,38 +2885,46 @@ impl Space {
             )
             .await?;
 
-        let resources = db
-            .open_or_create_collection(
-                Resource::schema()?,
-                CollectionConfig {
-                    name: "resources".to_string(),
-                    description: "Resources collection".to_string(),
-                },
-                async |collection| init_resource_collection(collection).await,
-            )
-            .await?;
+        db.open_or_create_collection(
+            Resource::schema()?,
+            CollectionConfig {
+                name: "resources".to_string(),
+                description: "Resources collection".to_string(),
+            },
+            async |collection| init_resource_collection(collection).await,
+        )
+        .await?;
 
-        let memory = MemoryManagement {
-            nexus: Arc::new(nexus),
-            conversations,
-            resources,
-            kip_function_definitions: FUNCTION_DEFINITION.clone(),
-        };
+        // The engine wrappers below open the same collections by name, and
+        // `open_or_create_collection` hands back the already-open handle, so
+        // they adopt the leaner index layout applied above instead of
+        // recreating the indexes `init_*_collection` just dropped.
+        let memory = Arc::new(
+            MemoryManagement::connect(db.clone(), Arc::new(nexus))
+                .await?
+                .with_kip_function_definitions(KIP_FUNCTION_DEFINITION.clone()),
+        );
+        let recall_store = Conversations::connect(db.clone(), "recall".to_string()).await?;
+        let maintenance_store =
+            Conversations::connect(db.clone(), "maintenance".to_string()).await?;
+        #[cfg(feature = "wiki")]
         let wiki = Arc::new(WikiService::connect(id.clone(), db.clone()).await?);
 
         // create a new models instance for each space to allow per-space customization in the future (e.g., different model providers or credentials)
         let models = Arc::new(Models::from_clone(models.as_ref()));
-        let memory = Arc::new(memory);
+        #[cfg(feature = "wiki")]
         let wiki_digest = Arc::new(WikiDigest::new(
             wiki.clone(),
             memory.clone(),
             models.clone(),
         ));
+        #[cfg(feature = "wiki")]
         wiki.set_audit_reads(db.get_extension_as("wiki_audit_reads").unwrap_or(false));
         // Agent wiki tools see only unlabeled content when the space is
         // public: recall there is world-reachable, so its evidence pool must
         // match the anonymous reader's view (PRD §8.2). Evaluated per call —
         // toggling `public` applies immediately.
+        #[cfg(feature = "wiki")]
         let wiki_tool_scope: crate::wiki::WikiToolScope = {
             let db = db.clone();
             Arc::new(move || {
@@ -2938,48 +2940,59 @@ impl Space {
         let note_tool = NoteTool::new();
 
         let hooks = Arc::new(Hooks::new(db.clone()));
-        let formation = Arc::new(FormationAgent::new(memory.clone(), hooks.clone(), 100000));
+        let formation = Arc::new(FormationAgent::new(
+            memory.clone(),
+            conversations.clone(),
+            hooks.clone(),
+            100000,
+        ));
         let recall = Arc::new(RecallAgent::new(
             memory.clone(),
-            Conversations {
-                conversations: recall_conversations,
-            },
+            recall_store,
+            recall_conversations,
             hooks.clone(),
             65535,
         ));
         let maintenance = Arc::new(MaintenanceAgent::new(
             memory.clone(),
-            Conversations {
-                conversations: maintenance_conversations,
-            },
+            maintenance_store,
+            maintenance_conversations,
             hooks.clone(),
         ));
         // Build agent engine with all configured components
-        let engine = Engine::builder()
+        #[allow(unused_mut)]
+        let mut engine = Engine::builder()
             .with_management(management)
             .with_models(models.clone())
             .register_tool(memory.clone())?
             .register_tool(Arc::new(memory_r))?
             .register_tool(Arc::new(memory_tool))?
-            .register_tool(Arc::new(note_tool))?
-            .register_tool(Arc::new(WikiSearchTool::new(
-                wiki.clone(),
-                wiki_tool_scope.clone(),
-            )))?
-            .register_tool(Arc::new(WikiReadTool::new(
-                wiki.clone(),
-                wiki_tool_scope.clone(),
-            )))?
-            .register_tool(Arc::new(WikiCommitTool::new(wiki.clone())))?
-            .register_agent(formation.clone(), None)?
-            .register_agent(recall.clone(), None)?
-            .register_agent(maintenance.clone(), None)?
-            .export_tools(vec![
-                MemoryTool::NAME.to_string(),
+            .register_tool(Arc::new(note_tool))?;
+        #[allow(unused_mut)]
+        let mut exported_tools = vec![MemoryTool::NAME.to_string()];
+        #[cfg(feature = "wiki")]
+        {
+            engine = engine
+                .register_tool(Arc::new(WikiSearchTool::new(
+                    wiki.clone(),
+                    wiki_tool_scope.clone(),
+                )))?
+                .register_tool(Arc::new(WikiReadTool::new(
+                    wiki.clone(),
+                    wiki_tool_scope.clone(),
+                )))?
+                .register_tool(Arc::new(WikiCommitTool::new(wiki.clone())))?;
+            exported_tools.extend([
                 WikiSearchTool::NAME.to_string(),
                 WikiReadTool::NAME.to_string(),
                 WikiCommitTool::NAME.to_string(),
-            ])
+            ]);
+        }
+        let engine = engine
+            .register_agent(formation.clone(), None)?
+            .register_agent(recall.clone(), None)?
+            .register_agent(maintenance.clone(), None)?
+            .export_tools(exported_tools)
             .export_agents(vec![
                 RecallAgent::NAME.to_string(),
                 FormationAgent::NAME.to_string(),
@@ -3006,7 +3019,10 @@ impl Space {
             token_lock: tokio::sync::Mutex::new(()),
             judge_model: std::sync::RwLock::new(None),
             memory,
+            conversations,
+            #[cfg(feature = "wiki")]
             wiki,
+            #[cfg(feature = "wiki")]
             wiki_digest,
             engine,
             pinned,
@@ -3036,18 +3052,21 @@ impl Space {
                 }
                 // Startup repair: reclaim wiki commit-crash leftovers before the
                 // space serves queries built on them.
-                match this_clone.wiki.orphan_sweep(unix_ms()).await {
-                    Ok(report) if !report.is_empty() => {
-                        log::warn!(target: "brain", space_id = this_clone.id, report:serde = report; "wiki orphan sweep repaired state");
+                #[cfg(feature = "wiki")]
+                {
+                    match this_clone.wiki.orphan_sweep(unix_ms()).await {
+                        Ok(report) if !report.is_empty() => {
+                            log::warn!(target: "brain", space_id = this_clone.id, report:serde = report; "wiki orphan sweep repaired state");
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            log::warn!(target: "brain", space_id = this_clone.id; "wiki orphan sweep failed: {err:?}");
+                        }
                     }
-                    Ok(_) => {}
-                    Err(err) => {
-                        log::warn!(target: "brain", space_id = this_clone.id; "wiki orphan sweep failed: {err:?}");
-                    }
+                    // Resume any wiki digest backlog left from before the restart.
+                    this_clone.kick_wiki_digest();
+                    this_clone.kick_wiki_housekeeping();
                 }
-                // Resume any wiki digest backlog left from before the restart.
-                this_clone.kick_wiki_digest();
-                this_clone.kick_wiki_housekeeping();
                 // Resume formation if it was interrupted before. A missing marker
                 // means nothing was processed yet, so resume from the beginning.
                 let conversation = this_clone.formation.get_processed().unwrap_or_default();
@@ -3206,8 +3225,11 @@ impl BrainHook for Hooks {
         }
         // Post-sleep digest: fold freshly committed wiki knowledge into the
         // graph while formation is quiet (PRD §7.3, Daydream cadence).
-        space.kick_wiki_digest();
-        space.kick_wiki_housekeeping();
+        #[cfg(feature = "wiki")]
+        {
+            space.kick_wiki_digest();
+            space.kick_wiki_housekeeping();
+        }
     }
 
     async fn try_start_maintenance(&self, formation_id: DocumentId) -> Option<DocumentId> {
@@ -3763,7 +3785,11 @@ mod tests {
             .prepare_signature(Some(Label::Int(iana::AlgorithmEdDSA)), None, None)
             .unwrap();
         sign1
-            .set_signature(ed25519_sign(signing_key.as_bytes(), &tbs_data).to_vec())
+            .set_signature(
+                ed25519_sign(signing_key.as_bytes(), &tbs_data)
+                    .to_bytes()
+                    .to_vec(),
+            )
             .unwrap();
         ByteBufB64(sign1.to_vec().unwrap()).to_string()
     }
@@ -3954,6 +3980,33 @@ mod tests {
         assert!(!meta.bm25_indexes.contains_key("name-description-metadata"));
 
         db.close().await.unwrap();
+    }
+
+    /// `Space::connect` opens every conversation collection itself, then hands
+    /// the same names to `MemoryManagement::connect` / `Conversations::connect`
+    /// so the engine wrappers adopt the already-open handles. If they ever
+    /// re-ran their own bootstrap instead, they would recreate exactly the
+    /// indexes `init_conversation_collection` drops.
+    #[tokio::test]
+    async fn connected_space_keeps_the_trimmed_conversation_index_layout() {
+        let app = test_app_state("space_index_layout");
+        let space = create_loaded_space(&app, "space_index_layout").await;
+
+        for collection in [
+            &space.conversations,
+            &space.recall.conversations_collection,
+            &space.maintenance.conversations_collection,
+        ] {
+            let meta = collection.metadata();
+            assert!(meta.btree_indexes.contains_key("user"));
+            assert!(!meta.btree_indexes.contains_key("thread"));
+            assert!(!meta.btree_indexes.contains_key("period"));
+            assert!(
+                !meta
+                    .bm25_indexes
+                    .contains_key("messages-resources-artifacts")
+            );
+        }
     }
 
     #[test]
@@ -5868,7 +5921,6 @@ mod tests {
         hooks.bind_space(Arc::downgrade(&space));
         assert!(!BrainHook::is_maintenance_processing(&hooks));
         space
-            .memory
             .conversations
             .save_extension("brain_processed".to_string(), 7_u64.into())
             .await
@@ -5907,7 +5959,6 @@ mod tests {
         assert!(BrainHook::try_start_maintenance(&hooks, 20).await.is_none());
 
         space
-            .memory
             .conversations
             .save_extension("brain_processed".to_string(), 21_u64.into())
             .await
@@ -5917,7 +5968,6 @@ mod tests {
         assert_eq!(space.maintenance_for_test().get_processed_at().daydream, 21);
 
         space
-            .memory
             .conversations
             .save_extension("brain_processed".to_string(), 42_u64.into())
             .await
@@ -5928,7 +5978,6 @@ mod tests {
         assert_eq!(space.maintenance_for_test().get_processed_at().quick, 42);
 
         space
-            .memory
             .conversations
             .save_extension("brain_processed".to_string(), 168_u64.into())
             .await
@@ -5941,6 +5990,7 @@ mod tests {
 
     /// M4 acceptance: an exported OKF bundle plus its manifest replays into
     /// an empty space with every document checksum intact.
+    #[cfg(feature = "wiki")]
     #[tokio::test]
     async fn wiki_export_bundle_replays_into_empty_space() {
         use crate::wiki::{WikiBundleEntry, WikiCommitInput, WikiImportInput};
@@ -6023,9 +6073,11 @@ mod tests {
 
     /// Replays scripted completion responses in order; used to drive the
     /// wiki digest extraction deterministically.
+    #[cfg(feature = "wiki")]
     #[derive(Debug)]
     struct ScriptedCompleter(std::sync::Mutex<std::collections::VecDeque<String>>);
 
+    #[cfg(feature = "wiki")]
     impl CompletionFeaturesDyn for ScriptedCompleter {
         fn model_name(&self) -> String {
             "scripted-test-model".to_string()
@@ -6047,6 +6099,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "wiki")]
     #[tokio::test]
     async fn wiki_digest_extracts_supersedes_and_verifies() {
         use crate::wiki::WikiCommitInput;
@@ -6151,7 +6204,7 @@ mod tests {
         assert!(
             space
                 .memory
-                .nexus
+                .nexus()
                 .has_concept(&ConceptPK::Object {
                     r#type: "Organization".to_string(),
                     name: "Acme".to_string(),
@@ -6160,7 +6213,7 @@ mod tests {
         );
         let (meta, _) = space
             .memory
-            .nexus
+            .nexus()
             .execute_kql(
                 parse_kql(
                     "FIND(?link.metadata) WHERE { ?link ({type: \"Organization\", name: \"Acme\"}, \"publishes\", {type: \"Policy\", name: \"安全政策\"}) }",
@@ -6216,7 +6269,7 @@ mod tests {
 
         let (stale, _) = space
             .memory
-            .nexus
+            .nexus()
             .execute_kql(
                 parse_kql(
                     "FIND(?link.metadata) WHERE { ?link ({type: \"Policy\", name: \"安全政策\"}, \"requires\", {type: \"Procedure\", name: \"密钥轮换\"}) }",
@@ -6234,7 +6287,7 @@ mod tests {
         );
         let (live, _) = space
             .memory
-            .nexus
+            .nexus()
             .execute_kql(
                 parse_kql(
                     "FIND(?link.metadata) WHERE { ?link ({type: \"Organization\", name: \"Acme\"}, \"publishes\", {type: \"Policy\", name: \"安全政策\"}) }",

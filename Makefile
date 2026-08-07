@@ -22,7 +22,7 @@ EVAL_PROFILES := $(filter %_profile.json,$(EVAL_FIXTURES))
 EVAL_SCENARIOS := $(filter-out %_profile.json,$(EVAL_FIXTURES))
 
 eval-validate:
-	@cargo run -p anda_brain -- eval \
+	@cargo run -p anda_brain --features mcp,wiki -- eval \
 		$(foreach scenario,$(EVAL_SCENARIOS),--scenario $(scenario)) \
 		$(foreach profile,$(EVAL_PROFILES),--profile $(profile)) \
 		--validate-only \

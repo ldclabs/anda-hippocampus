@@ -554,7 +554,7 @@ impl WikiDigest {
             );
             let response = self
                 .memory
-                .nexus
+                .nexus()
                 .execute_kml(parse_kml(&kml)?, false)
                 .await?;
             proposition_ids = response
@@ -780,7 +780,7 @@ impl WikiDigest {
             }
             let kml = render_supersede_kml(fact, superseded_by);
             match parse_kml(&kml) {
-                Ok(cmd) => match self.memory.nexus.execute_kml(cmd, false).await {
+                Ok(cmd) => match self.memory.nexus().execute_kml(cmd, false).await {
                     Ok(_) => superseded += 1,
                     Err(err) => {
                         log::warn!(
@@ -816,7 +816,7 @@ impl WikiDigest {
                 return true;
             }
         };
-        match self.memory.nexus.execute_kql(query).await {
+        match self.memory.nexus().execute_kql(query).await {
             Ok((result, _)) => kql_has_rows(&result),
             Err(err) => {
                 log::warn!(target: "brain", "proposition existence probe failed: {err:?}");
@@ -1922,7 +1922,7 @@ mod tests {
         );
         let (result, _) = digest
             .memory
-            .nexus
+            .nexus()
             .execute_kql(parse_kql(&kql).unwrap())
             .await
             .unwrap();
@@ -1968,7 +1968,7 @@ mod tests {
         );
         digest
             .memory
-            .nexus
+            .nexus()
             .execute_kml(parse_kml(&kml).unwrap(), false)
             .await
             .unwrap();

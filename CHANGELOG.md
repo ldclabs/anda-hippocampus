@@ -2,11 +2,14 @@
 
 All notable changes to the Anda Brain project.
 
-## [Unreleased]
-
 ## [0.11.0] — 2026-08-07
 
 ### Changed
+- **The wiki and MCP surfaces are now optional cargo features, off by default.** The default `anda_brain` library is memory only — formation, recall, maintenance, and their HTTP routes. `wiki` adds the structured wiki (documents, versions, ACL-scoped reads, OKF import/export), the wiki agent tools, WikiDigest extraction, the `/v1/{space_id}/wiki/*` routes, and the `wiki_*` fields of `SpaceInfo`/`UpdateSpaceInput`; `mcp` adds the stdio and Streamable HTTP MCP servers. `sha3` and `unicode-normalization` are now pulled in only by `wiki`, and `rmcp` and `schemars` only by `mcp`. The MCP wiki tools live in their own tool router so `mcp` can be built without `wiki`.
+- **The `anda_brain` binary declares `required-features = ["mcp", "wiki"]`.** It is the full product and its behavior is unchanged, but building or running it now requires `--features mcp,wiki`; Cargo skips the binary target without them. Every in-repo build command, Dockerfile, workflow, and doc was updated.
+- **Anda engine dependencies upgraded to `0.15`,** along with `base64` 0.23, `cose2` 0.4, `http` 1.5, and `clap` 4.6. No HTTP, MCP, or storage contract changes.
+- **Memory collections adapted to the engine's narrowed API.** `anda_engine::memory` no longer exposes the collections behind `MemoryManagement`/`Conversations`, so the space keeps its own handles to the conversation collections for the collection-level state the wrappers do not cover: the `brain_processed` and maintenance watermarks, conversation counts, and cursor paging. The space still opens every collection with its leaner index layout first, and the engine wrappers adopt those handles.
+- **The brain's KIP tool definition moved to `agents::KIP_FUNCTION_DEFINITION`** and is installed on the writable `execute_kip` tool through `MemoryManagement::with_kip_function_definitions`, keeping `parameters` optional as before and keeping the read-only tool's arguments identical to the writable one's.
 - **Release version advanced to `0.11.0`.** This release narrows the crate's public Rust API (breaking for library consumers); the HTTP and MCP wire contracts are unchanged except for the error-semantics fixes below.
 - **Crate interface narrowed to what callers actually use.** The `wiki`, `ledger`, and `authz` modules are now crate-internal; `Space`'s handles (`db`, `formation`, `recall`, `memory`, `wiki`, `wiki_digest`) and 15 internal-only methods are no longer public; `payload` drops its unused RPC-request type and internal helpers; dead constants and the unwired retrieval-eval fixtures (now test-only) were removed or gated.
 - **Space forking has a single entry point.** `AppState::fork_space` owns the whole fork protocol (object copy, state fork, load without background autostart), and `Space::close` is the public way to close throwaway spaces — the eval CLI no longer reaches into the DB handle.

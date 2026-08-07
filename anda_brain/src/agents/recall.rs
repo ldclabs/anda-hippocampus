@@ -4,6 +4,7 @@ use anda_core::{
     FunctionDefinition, Json, Message, ModelEffort, Resource, StateFeatures, Tool, ToolOutput,
     estimate_tokens,
 };
+use anda_db::collection::Collection;
 use anda_engine::{
     context::{AgentCtx, BaseCtx},
     extension::note::{load_notes, load_notes_from_legacy},
@@ -29,10 +30,9 @@ use super::{
     BrainHook, SELF_USER_ID, append_runner_history, compact_runner_if_needed,
     push_completed_history,
 };
-use crate::{
-    types::RecallInput,
-    wiki::{WikiReadTool, WikiSearchTool},
-};
+use crate::types::RecallInput;
+#[cfg(feature = "wiki")]
+use crate::wiki::{WikiReadTool, WikiSearchTool};
 
 const RECALL_CONTEXT_TIMEOUT: Duration = Duration::from_secs(5);
 const RECALL_TOTAL_TIMEOUT: Duration = Duration::from_secs(180);
@@ -144,7 +144,9 @@ impl Tool<BaseCtx> for TimedMemoryReadonly {
         FunctionDefinition {
             name: self.name(),
             description: self.description(),
-            parameters: self.memory.kip_function_definitions.parameters.clone(),
+            // Mirrors the writable `execute_kip` tool's arguments, which the
+            // space installs from the same definition.
+            parameters: super::KIP_FUNCTION_DEFINITION.parameters.clone(),
             strict: Some(true),
         }
     }
@@ -155,12 +157,8 @@ impl Tool<BaseCtx> for TimedMemoryReadonly {
         mut request: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
-        let res = match timeout(
-            self.timeout,
-            request.readonly().execute(self.memory.nexus.as_ref()),
-        )
-        .await
-        {
+        let nexus = self.memory.nexus();
+        let res = match timeout(self.timeout, request.readonly().execute(nexus.as_ref())).await {
             Ok((_, res)) => res,
             Err(_) => Response::err(KipError::new(
                 KipErrorCode::ExecutionTimeout,
@@ -186,6 +184,10 @@ impl Tool<BaseCtx> for TimedMemoryReadonly {
 #[derive(Clone)]
 pub struct RecallAgent {
     pub conversations: Conversations,
+    /// The collection backing `conversations`. `Conversations` wraps document
+    /// access only, so cursor paging in `Space::list_conversations` goes
+    /// through this handle.
+    pub conversations_collection: Arc<Collection>,
     memory: Arc<MemoryManagement>,
     hook: Arc<dyn BrainHook>,
     history: Arc<RwLock<VecDeque<Document>>>,
@@ -198,11 +200,13 @@ impl RecallAgent {
     pub fn new(
         memory: Arc<MemoryManagement>,
         conversations: Conversations,
+        conversations_collection: Arc<Collection>,
         hook: Arc<dyn BrainHook>,
         max_input_tokens: usize,
     ) -> Self {
         Self {
             conversations,
+            conversations_collection,
             memory,
             hook,
             history: Arc::new(RwLock::new(VecDeque::new())),
@@ -233,7 +237,7 @@ impl RecallAgent {
     pub async fn get_counterparty(&self, counterparty: &str) -> Result<Json, BoxError> {
         let user = self
             .memory
-            .nexus
+            .nexus()
             .get_concept(&ConceptPK::Object {
                 r#type: "Person".to_string(),
                 name: counterparty.to_string(),
@@ -376,11 +380,14 @@ impl Agent<AgentCtx> for RecallAgent {
 
     /// Returns a list of tool names that this agent depends on
     fn tool_dependencies(&self) -> Vec<String> {
-        vec![
-            MemoryReadonly::NAME.to_string(),
+        #[allow(unused_mut)]
+        let mut tools = vec![MemoryReadonly::NAME.to_string()];
+        #[cfg(feature = "wiki")]
+        tools.extend([
             WikiSearchTool::NAME.to_string(),
             WikiReadTool::NAME.to_string(),
-        ]
+        ]);
+        tools
     }
 
     async fn run(
@@ -897,6 +904,7 @@ mod tests {
             RecallAgent::NAME
         );
         let tools = Agent::<AgentCtx>::tool_dependencies(space.recall.as_ref());
+        #[cfg(feature = "wiki")]
         assert_eq!(
             tools,
             vec![
@@ -905,6 +913,8 @@ mod tests {
                 "wiki_read".to_string(),
             ]
         );
+        #[cfg(not(feature = "wiki"))]
+        assert_eq!(tools, vec!["execute_kip_readonly".to_string()]);
     }
 
     #[tokio::test]
@@ -1024,7 +1034,7 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("Input too large"));
-        assert_eq!(space.recall.conversations.conversations.len(), 0);
+        assert_eq!(space.recall.conversations_collection.len(), 0);
     }
 
     #[tokio::test]

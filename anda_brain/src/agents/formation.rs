@@ -3,6 +3,7 @@ use anda_core::{
     Resource, StateFeatures, Tool, estimate_tokens,
 };
 use anda_db::{
+    collection::Collection,
     query::Fv,
     schema::{DocumentId, Json, Map},
 };
@@ -44,6 +45,10 @@ impl Drop for ProcessingGuard {
 #[derive(Clone)]
 pub struct FormationAgent {
     memory: Arc<MemoryManagement>,
+    /// The collection backing `memory`'s conversations. `MemoryManagement`
+    /// wraps document access only, so the `brain_processed` watermark — a
+    /// collection extension — is read and written through this handle.
+    conversations: Arc<Collection>,
     processing_conversation: Arc<AtomicU64>,
     hook: Arc<dyn BrainHook>,
     history: Arc<RwLock<VecDeque<Document>>>,
@@ -54,12 +59,14 @@ impl FormationAgent {
     pub const NAME: &'static str = "formation_memory";
     pub fn new(
         memory: Arc<MemoryManagement>,
+        conversations: Arc<Collection>,
         hook: Arc<dyn BrainHook>,
         max_input_tokens: usize,
     ) -> Self {
         Self {
             max_input_tokens,
             memory,
+            conversations,
             processing_conversation: Arc::new(AtomicU64::new(0)),
             history: Arc::new(RwLock::new(VecDeque::new())),
             hook,
@@ -105,8 +112,7 @@ impl FormationAgent {
     }
 
     pub fn get_processed(&self) -> Option<DocumentId> {
-        self.memory
-            .conversations
+        self.conversations
             .get_extension_as::<DocumentId>("brain_processed")
     }
 
@@ -126,7 +132,7 @@ impl FormationAgent {
         metadata.insert("status".to_string(), "active".into());
         let user = self
             .memory
-            .nexus
+            .nexus()
             .get_or_init_concept("Person".to_string(), counterparty, attributes, metadata)
             .await?;
 
@@ -227,8 +233,7 @@ impl FormationAgent {
             // The marker is a high-water mark: reprocessing an older
             // conversation (e.g. via restart_formation) must not rewind it.
             let processed = self.get_processed().unwrap_or_default().max(conv_id);
-            self.memory
-                .conversations
+            self.conversations
                 .save_extension("brain_processed".to_string(), processed.into())
                 .await
                 .ok();
@@ -1193,7 +1198,6 @@ mod tests {
             .ctx_for_test(SELF_USER_ID, FormationAgent::NAME)
             .unwrap();
         space
-            .memory
             .conversations
             .save_extension("brain_processed".to_string(), 0_u64.into())
             .await
@@ -1442,9 +1446,9 @@ mod tests {
         )
         .await;
 
-        let updates_before = space.memory.conversations.stats().update_count;
+        let updates_before = space.conversations.stats().update_count;
         space.formation.process_one(&ctx, &mut conversation).await;
-        let updates_after = space.memory.conversations.stats().update_count;
+        let updates_after = space.conversations.stats().update_count;
 
         assert_eq!(conversation.status, ConversationStatus::Completed);
         // 4 model turns total: 3 intermediate Working turns are throttled and
@@ -1476,7 +1480,7 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("Input too large"));
-        assert_eq!(space.memory.conversations.len(), 0);
+        assert_eq!(space.conversations.len(), 0);
     }
 
     #[tokio::test]
@@ -1590,7 +1594,6 @@ mod tests {
         )
         .await;
         space
-            .memory
             .conversations
             .save_extension("brain_processed".to_string(), 9_u64.into())
             .await

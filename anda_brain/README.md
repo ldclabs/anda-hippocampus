@@ -299,7 +299,7 @@ instead of silently weakening the rubric.
 Validate scenario/profile inputs without running models:
 
 ```bash
-cargo run -p anda_brain -- \
+cargo run -p anda_brain --features mcp,wiki -- \
   eval \
   --scenario anda_brain/evals/style_preference.json \
   --scenario anda_brain/evals/project_budget.json \
@@ -311,7 +311,7 @@ cargo run -p anda_brain -- \
 Run a scenario locally:
 
 ```bash
-cargo run -p anda_brain -- \
+cargo run -p anda_brain --features mcp,wiki -- \
   --model-api-key "$MODEL_API_KEY" \
   eval \
   --space-id style_eval \
@@ -326,7 +326,7 @@ Run a small suite by repeating `--scenario`. The suite writes one
 failure attribution:
 
 ```bash
-cargo run -p anda_brain -- \
+cargo run -p anda_brain --features mcp,wiki -- \
   --model-api-key "$MODEL_API_KEY" \
   eval \
   --space-id memory_suite \
@@ -344,7 +344,7 @@ ranked `comparisons`, so profiles can be compared by quality, findings, and
 token cost:
 
 ```bash
-cargo run -p anda_brain -- \
+cargo run -p anda_brain --features mcp,wiki -- \
   --model-api-key "$MODEL_API_KEY" \
   eval \
   --space-id memory_experiment \
@@ -367,7 +367,7 @@ is written before the command exits non-zero, and gated runs include a top-level
 `gate` object with the criteria, pass/fail state, and failure messages:
 
 ```bash
-cargo run -p anda_brain -- \
+cargo run -p anda_brain --features mcp,wiki -- \
   --model-api-key "$MODEL_API_KEY" \
   eval \
   --space-id memory_ci \
@@ -461,7 +461,7 @@ For local desktop or development clients, Anda Brain can also run as a stdio MCP
 
 ```bash
 MCP_AUTH_TOKEN="$SPACE_TOKEN" \
-  cargo run -p anda_brain -- mcp --space-id my_space_001 local --db ./data
+  cargo run -p anda_brain --features mcp,wiki -- mcp --space-id my_space_001 local --db ./data
 ```
 
 Both MCP modes use the same storage/model configuration as the HTTP service and expose these tools:
@@ -744,25 +744,47 @@ The schema is self-describing — all type definitions are stored as nodes withi
 | `local`    | Local filesystem storage        | `LOCAL_DB_PATH` (default `./db`)                                         |
 | `aws`      | AWS S3 storage                  | `AWS_BUCKET`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` |
 
+## Cargo Features
+
+The library ships memory only by default — formation, recall, maintenance, and
+their HTTP routes. Everything else is opt-in:
+
+| Feature | Adds                                                                                                                                                                                    |
+| ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `wiki`  | The structured wiki (documents, versions, ACL-scoped reads, OKF import/export), the `wiki_search`/`wiki_read`/`wiki_commit` agent tools, WikiDigest graph extraction, and the `/v1/{space_id}/wiki/*` routes. Also adds the `wiki_*` fields of `SpaceInfo` and `UpdateSpaceInput`. |
+| `mcp`   | The MCP channel: the stdio server and the Streamable HTTP service. With `wiki` on as well, the wiki tools join the MCP tool router.                                                        |
+
+```toml
+# Embedding the library: memory only
+anda_brain = "0.11"
+
+# …or the full surface
+anda_brain = { version = "0.11", features = ["mcp", "wiki"] }
+```
+
+The `anda_brain` **binary** is the full product and declares
+`required-features = ["mcp", "wiki"]`, so every command below passes
+`--features mcp,wiki`. Without them Cargo skips the binary target.
+
 ## Running
 
 ```bash
 # Development (in-memory storage)
-cargo run -p anda_brain
+cargo run -p anda_brain --features mcp,wiki
 
 # Local filesystem storage
-cargo run -p anda_brain -- local --db ./data
+cargo run -p anda_brain --features mcp,wiki -- local --db ./data
 
 # HTTP service also serves remote MCP at /mcp/{space_id}
 MCP_HTTP_ALLOWED_HOSTS="brain.example.com" \
-  cargo run -p anda_brain -- local --db ./data
+  cargo run -p anda_brain --features mcp,wiki -- local --db ./data
 
 # AWS S3 storage
-cargo run -p anda_brain -- aws --bucket my-bucket --region us-east-1
+cargo run -p anda_brain --features mcp,wiki -- aws --bucket my-bucket --region us-east-1
 
 # MCP stdio server for local MCP clients
 MCP_AUTH_TOKEN="$SPACE_TOKEN" \
-  cargo run -p anda_brain -- mcp --space-id my_space_001 local --db ./data
+  cargo run -p anda_brain --features mcp,wiki -- mcp --space-id my_space_001 local --db ./data
 ```
 
 ### Run with Docker image

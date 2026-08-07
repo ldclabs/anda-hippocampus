@@ -26,6 +26,11 @@ use serde_json::{Map, Value, json};
 use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(feature = "wiki")]
+use crate::wiki::{
+    WikiCommitInput, WikiError, WikiReadInput, WikiSearchInput, WikiSearchMode, WikiSelector,
+    WikiVerifyInput,
+};
 use crate::{
     agents::SELF_USER_ID,
     authz::{self, AuthzError, AuthzMode, Caller},
@@ -34,10 +39,6 @@ use crate::{
     types::{
         FormationInput, InputContext, MaintenanceInput, MaintenanceParameters, MaintenanceScope,
         RecallInput, TokenScope,
-    },
-    wiki::{
-        WikiCommitInput, WikiError, WikiReadInput, WikiSearchInput, WikiSearchMode, WikiSelector,
-        WikiVerifyInput,
     },
 };
 
@@ -288,10 +289,14 @@ pub struct GetConversationInput {
 
 impl AndaBrainMcpServer {
     pub fn new(app: AppState, config: McpServerConfig) -> Self {
+        #[allow(unused_mut)]
+        let mut tool_router = Self::tool_router();
+        #[cfg(feature = "wiki")]
+        tool_router.merge(Self::wiki_tool_router());
         Self {
             app,
             config,
-            tool_router: Self::tool_router(),
+            tool_router,
         }
     }
 
@@ -655,7 +660,10 @@ impl AndaBrainMcpServer {
             structured_result(conversation)
         }
     }
+}
 
+#[cfg(feature = "wiki")]
+impl AndaBrainMcpServer {
     async fn wiki_commit_for(
         &self,
         access: &McpAccess,
@@ -740,6 +748,7 @@ impl AndaBrainMcpServer {
 /// `Db` failures are internal; everything else is caller-fixable. A CAS
 /// conflict carries `WikiError::retry_data` so tool callers get the same
 /// re-read → merge → retry payload the HTTP channel returns.
+#[cfg(feature = "wiki")]
 fn wiki_tool_error(err: WikiError) -> ErrorData {
     match &err {
         WikiError::Db(_) => internal_error(err),
@@ -755,6 +764,7 @@ fn wiki_tool_error(err: WikiError) -> ErrorData {
 }
 
 /// Flat MCP input for `anda_brain_wiki_commit`.
+#[cfg(feature = "wiki")]
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct WikiCommitToolInput {
     /// Existing document id to update; omit to create a new document.
@@ -779,6 +789,7 @@ pub struct WikiCommitToolInput {
     pub acl_label: Option<String>,
 }
 
+#[cfg(feature = "wiki")]
 impl From<WikiCommitToolInput> for WikiCommitInput {
     fn from(input: WikiCommitToolInput) -> Self {
         Self {
@@ -798,6 +809,7 @@ impl From<WikiCommitToolInput> for WikiCommitInput {
 }
 
 /// Flat MCP input for `anda_brain_wiki_search`.
+#[cfg(feature = "wiki")]
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct WikiSearchToolInput {
     /// Keyword query; BM25 matching favors exact terms, product names and error codes.
@@ -816,6 +828,7 @@ pub struct WikiSearchToolInput {
     pub expand: Option<u8>,
 }
 
+#[cfg(feature = "wiki")]
 impl TryFrom<WikiSearchToolInput> for WikiSearchInput {
     type Error = ErrorData;
 
@@ -845,6 +858,7 @@ impl TryFrom<WikiSearchToolInput> for WikiSearchInput {
 }
 
 /// Flat MCP input for `anda_brain_wiki_read`.
+#[cfg(feature = "wiki")]
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct WikiReadToolInput {
     pub doc_id: u64,
@@ -859,6 +873,7 @@ pub struct WikiReadToolInput {
     pub end: Option<u64>,
 }
 
+#[cfg(feature = "wiki")]
 impl TryFrom<WikiReadToolInput> for WikiReadInput {
     type Error = ErrorData;
 
@@ -903,12 +918,107 @@ impl TryFrom<WikiReadToolInput> for WikiReadInput {
 }
 
 /// Flat MCP input for `anda_brain_wiki_verify`.
+#[cfg(feature = "wiki")]
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct WikiVerifyToolInput {
     /// Citation URI: wiki://{space}/{doc_id}@{version_id}#{start}-{end}
     pub uri: String,
     /// Optional cited checksum to compare against stored content.
     pub checksum: Option<String>,
+}
+
+/// The wiki tool surface. It lives in its own router so the MCP channel
+/// can be built without the `wiki` feature; [`AndaBrainMcpServer::new`]
+/// merges it into the main `tool_router`.
+#[cfg(feature = "wiki")]
+#[tool_router(router = wiki_tool_router)]
+impl AndaBrainMcpServer {
+    /// Search the space wiki (versioned reference documents) with keyword BM25
+    /// and get snippets with verifiable wiki:// citations. Cite the URIs when
+    /// using the evidence; retry with reformulated keywords if results are poor.
+    #[tool(
+        name = "anda_brain_wiki_search",
+        annotations(
+            title = "Search Wiki",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn wiki_search(
+        &self,
+        Parameters(input): Parameters<WikiSearchToolInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let access = self.access_from_context(&context)?;
+        self.wiki_search_for(&access, input).await
+    }
+
+    /// Read a wiki document progressively: TOC first, then one section by
+    /// anchor, a byte range, or the bounded full text. Supports reading
+    /// historical versions.
+    #[tool(
+        name = "anda_brain_wiki_read",
+        annotations(
+            title = "Read Wiki Document",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn wiki_read(
+        &self,
+        Parameters(input): Parameters<WikiReadToolInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let access = self.access_from_context(&context)?;
+        self.wiki_read_for(&access, input).await
+    }
+
+    /// Commit a wiki document as an immutable new version (git-like).
+    /// Create: omit doc_id. Update: pass doc_id and parent_version; on a
+    /// conflict, re-read, merge, and retry. Identical content is a no-op.
+    #[tool(
+        name = "anda_brain_wiki_commit",
+        annotations(
+            title = "Commit Wiki Document",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn wiki_commit(
+        &self,
+        Parameters(input): Parameters<WikiCommitToolInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let access = self.access_from_context(&context)?;
+        self.wiki_commit_for(&access, input).await
+    }
+
+    /// Verify a wiki citation URI against the immutable stored content:
+    /// valid, superseded by a newer version, or invalid.
+    #[tool(
+        name = "anda_brain_wiki_verify",
+        annotations(
+            title = "Verify Wiki Citation",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn wiki_verify(
+        &self,
+        Parameters(input): Parameters<WikiVerifyToolInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let access = self.access_from_context(&context)?;
+        self.wiki_verify_for(&access, input).await
+    }
 }
 
 #[tool_router]
@@ -1095,93 +1205,6 @@ impl AndaBrainMcpServer {
     ) -> Result<CallToolResult, ErrorData> {
         let access = self.access_from_context(&context)?;
         self.get_conversation_for(&access, input).await
-    }
-
-    /// Search the space wiki (versioned reference documents) with keyword BM25
-    /// and get snippets with verifiable wiki:// citations. Cite the URIs when
-    /// using the evidence; retry with reformulated keywords if results are poor.
-    #[tool(
-        name = "anda_brain_wiki_search",
-        annotations(
-            title = "Search Wiki",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    pub async fn wiki_search(
-        &self,
-        Parameters(input): Parameters<WikiSearchToolInput>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let access = self.access_from_context(&context)?;
-        self.wiki_search_for(&access, input).await
-    }
-
-    /// Read a wiki document progressively: TOC first, then one section by
-    /// anchor, a byte range, or the bounded full text. Supports reading
-    /// historical versions.
-    #[tool(
-        name = "anda_brain_wiki_read",
-        annotations(
-            title = "Read Wiki Document",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    pub async fn wiki_read(
-        &self,
-        Parameters(input): Parameters<WikiReadToolInput>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let access = self.access_from_context(&context)?;
-        self.wiki_read_for(&access, input).await
-    }
-
-    /// Commit a wiki document as an immutable new version (git-like).
-    /// Create: omit doc_id. Update: pass doc_id and parent_version; on a
-    /// conflict, re-read, merge, and retry. Identical content is a no-op.
-    #[tool(
-        name = "anda_brain_wiki_commit",
-        annotations(
-            title = "Commit Wiki Document",
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    pub async fn wiki_commit(
-        &self,
-        Parameters(input): Parameters<WikiCommitToolInput>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let access = self.access_from_context(&context)?;
-        self.wiki_commit_for(&access, input).await
-    }
-
-    /// Verify a wiki citation URI against the immutable stored content:
-    /// valid, superseded by a newer version, or invalid.
-    #[tool(
-        name = "anda_brain_wiki_verify",
-        annotations(
-            title = "Verify Wiki Citation",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    pub async fn wiki_verify(
-        &self,
-        Parameters(input): Parameters<WikiVerifyToolInput>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let access = self.access_from_context(&context)?;
-        self.wiki_verify_for(&access, input).await
     }
 }
 
@@ -1466,7 +1489,11 @@ mod tests {
             .prepare_signature(Some(Label::Int(iana::AlgorithmEdDSA)), None, None)
             .unwrap();
         sign1
-            .set_signature(ed25519_sign(signing_key.as_bytes(), &tbs_data).to_vec())
+            .set_signature(
+                ed25519_sign(signing_key.as_bytes(), &tbs_data)
+                    .to_bytes()
+                    .to_vec(),
+            )
             .unwrap();
         ByteBufB64(sign1.to_vec().unwrap()).to_string()
     }
@@ -1510,6 +1537,17 @@ mod tests {
         assert!(names.contains(&"anda_brain_recall_memory"));
         assert!(names.contains(&"anda_brain_run_maintenance"));
         assert!(names.contains(&"anda_brain_execute_kip_readonly"));
+
+        // The wiki tools live in their own `#[tool_router]` block so the MCP
+        // channel builds without the `wiki` feature; `new` merges them in.
+        for wiki_tool in [
+            "anda_brain_wiki_search",
+            "anda_brain_wiki_read",
+            "anda_brain_wiki_commit",
+            "anda_brain_wiki_verify",
+        ] {
+            assert_eq!(names.contains(&wiki_tool), cfg!(feature = "wiki"));
+        }
 
         let recall = tools
             .iter()
@@ -1666,6 +1704,7 @@ mod tests {
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
     }
 
+    #[cfg(feature = "wiki")]
     #[tokio::test]
     async fn wiki_commit_conflict_carries_retry_data() {
         let server = create_server("mcp_wiki_conflict").await;
@@ -1710,6 +1749,7 @@ mod tests {
         assert!(data["updated_at"].is_number());
     }
 
+    #[cfg(feature = "wiki")]
     #[tokio::test]
     async fn wiki_tools_scope_anonymous_and_labeled_callers() {
         use crate::types::{AddSpaceTokenInput, UpdateSpaceInput};
